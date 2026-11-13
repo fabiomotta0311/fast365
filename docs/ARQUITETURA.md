@@ -342,6 +342,11 @@ serde_json.workspace = true
 > keyring; `whoami` correto em processo novo. Confirmados `AUTH-ENTRY-001`, `AUTH-MSAL-CACHE-001`,
 > `AUTH-COOKIES-001`. O RT é do cliente **web** `5e3ce6c0-…` (sem family RT), não do nativo
 > `1fec8e78-…` citado em §2.2 → `AUTH-RT-SPA-001` segue aberto e é o primeiro ponto do #8.
+>
+> **Pós-review (#35).** Sessão só é aceita se lida nas origens HTTPS exatas do Teams e no documento
+> atual (`AUTH-ORIGIN-001`; geração por navegação de topo); a identidade é a **conta ativa** da página
+> (`AUTH-MSAL-ACTIVE-001`), com falha fechada se ambígua; o keyring grava **gerações** completas e só
+> publica o ponteiro após reler — uma regravação interrompida nunca mistura RTs.
 
 > **Transporte interno do executor (lição do `rusty-teams`) — seu seguro contra No-Go.** O executor (§1)
 > escolhe *como* o request sai: (1) **Rust puro** (`reqwest`) — padrão, leve; (2) **in-page fetch** pela WebView
