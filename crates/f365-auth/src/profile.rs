@@ -2,16 +2,18 @@
 //! Mudança da Microsoft que couber aqui é edição de `profile/teams-web.json` (`docs/ARQUITETURA.md`,
 //! "perfil declarativo × adaptador").
 //!
-//! Contratos:
-//! - `TOKEN-ENDPOINT-001` (documentado pela Microsoft): RT → access token no endpoint v2.0 do tenant.
-//! - `TOKEN-SPA-ORIGIN-001` (UNVERIFIED): o RT do cliente web é de SPA e só é resgatado com
-//!   `Origin` igual à origem onde foi emitido (`AADSTS9002327` sem ela). Capturado em
-//!   `teams.cloud.microsoft` (Checkpoint A).
-//! - `TOKEN-SCOPE-001` (UNVERIFIED): `api.spaces.skype.com` é o `aud` do middle tier do Teams (troca
-//!   pelo skype token) e `chatsvcagg.teams.microsoft.com` o do agregador REST. Conferir contra os
-//!   escopos observados na captura (`f365 whoami` lista).
-//! - `TOKEN-AUTHSVC-001` (UNVERIFIED): `POST authsvc/v1.0/authz` com Bearer do escopo `teams`
-//!   devolve `tokens.skypeToken`, `tokens.expiresIn` e `regionGtms.chatService`.
+//! Contratos. Evidência = Checkpoint B na conta do dono, 2026-11-13 (#8), via `RustTransport`:
+//! - `TOKEN-ENDPOINT-001` (documentado + VERIFIED): RT → access token no endpoint v2.0 do tenant;
+//!   cada resgate devolve RT novo (rotação).
+//! - `TOKEN-SPA-ORIGIN-001` (PARCIAL): VERIFIED que o RT do cliente web (`5e3ce6c0-…`) é resgatado
+//!   **com** `Origin: https://teams.cloud.microsoft`. UNVERIFIED que seja obrigatório (não testamos
+//!   sem); sem ele o Entra responderia `AADSTS9002327`, que já é diagnosticado.
+//! - `TOKEN-SCOPE-001` (VERIFIED): `api.spaces.skype.com/.default` → `aud https://api.spaces.skype.com`
+//!   (`scp` Authorization.ReadWrite Region.ReadWrite user_impersonation);
+//!   `chatsvcagg.teams.microsoft.com/.default` → `aud https://chatsvcagg.teams.microsoft.com`.
+//! - `TOKEN-AUTHSVC-001` (VERIFIED): `POST authsvc/v1.0/authz` com Bearer do escopo `teams` devolve
+//!   `tokens.skypeToken`, `tokens.expiresIn` (~2,5 h observado) e `regionGtms.chatService`
+//!   (`https://<região>.ng.msg.teams.microsoft.com`).
 
 use serde::Deserialize;
 
