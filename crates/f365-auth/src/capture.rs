@@ -193,13 +193,15 @@ fn capture_session(
                     .iter()
                     .map(|[k, v]| (k.as_str(), v.as_str()));
                 match session::read_msal_cache(entries) {
-                    MsalProbe::Found(account, refresh_token) => {
+                    MsalProbe::Found(account, refresh_token, observed_scopes) => {
                         let session = webview
                             .cookies_for_url(COOKIE_URL)
                             .map_err(|e| web(&e))
                             .map(|all| CapturedSession {
                                 account,
                                 refresh_token,
+                                observed_scopes,
+                                last_refresh: None,
                                 cookies: all
                                     .into_iter()
                                     .filter(|c| session::is_session_cookie(c.name()))

@@ -29,14 +29,24 @@ pub fn auth() -> anyhow::Result<()> {
     bail!("`f365 auth` precisa da WebView: rode no Windows com `cargo run -p f365-cli --features webview -- auth`")
 }
 
-pub fn whoami() -> anyhow::Result<()> {
-    match Vault::keyring().active_account()? {
-        Some(account) => {
-            print_account(&account, &SystemClock);
-            Ok(())
-        }
-        None => bail!("nenhuma sessão salva neste usuário do Windows — rode `f365 auth`"),
+pub async fn whoami(offline: bool) -> anyhow::Result<()> {
+    let Some(account) = Vault::keyring().active_account()? else {
+        bail!("nenhuma sessão salva neste usuário do Windows — rode `f365 auth`");
+    };
+    print_account(&account, &SystemClock);
+    if offline {
+        return Ok(());
     }
+    // Região só existe online (authsvc); falha aqui não invalida o que o keyring já mostrou.
+    match crate::token_cmd::broker()?.chat_endpoint().await {
+        Ok(ep) => println!(
+            "Região:   {} ({})",
+            ep.region.as_deref().unwrap_or("?"),
+            ep.chat_service
+        ),
+        Err(e) => println!("Região:   indisponível — {e}"),
+    }
+    Ok(())
 }
 
 fn print_account(stored: &StoredAccount, clock: &dyn Clock) {
@@ -53,10 +63,20 @@ fn print_account(stored: &StoredAccount, clock: &dyn Clock) {
     println!("Tenant:   {}", stored.account.tenant_id);
     println!("Cliente:  {}{family}", stored.client_id);
     println!("Sessão:   capturada há {}", human(age));
+    if let Some(r) = stored.last_refresh {
+        let ago = clock.utc_now().duration_since(r).unwrap_or_default();
+        println!("Refresh:  último resgate do RT há {}", human(ago));
+    }
     println!("Cookies:  {} de sessão (ESTSAUTH*)", stored.cookie_count);
+    if !stored.observed_scopes.is_empty() {
+        println!("Escopos vistos na página (TOKEN-SCOPE-001):");
+        for s in &stored.observed_scopes {
+            println!("  - {s}");
+        }
+    }
 }
 
-fn human(d: Duration) -> String {
+pub(crate) fn human(d: Duration) -> String {
     let mins = d.as_secs() / 60;
     match (mins / 60, mins % 60) {
         (0, 0) => "menos de 1 min".into(),

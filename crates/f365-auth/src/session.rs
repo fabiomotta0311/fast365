@@ -65,6 +65,10 @@ pub(crate) struct CapturedSession {
     pub account: AccountInfo,
     pub refresh_token: RefreshToken,
     pub cookies: Vec<SessionCookie>,
+    /// Escopos (`target`) dos access tokens que a própria página pediu — só metadado, sem token.
+    pub observed_scopes: Vec<String>,
+    /// Último resgate bem-sucedido do RT.
+    pub last_refresh: Option<std::time::SystemTime>,
 }
 
 /// O que impede concluir a captura (se persistir, vira erro explícito).
@@ -78,8 +82,8 @@ pub(crate) enum Blocker {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MsalProbe {
-    /// Conta ativa + refresh token dela.
-    Found(AccountInfo, RefreshToken),
+    /// Conta ativa + refresh token dela + escopos observados nos access tokens da página.
+    Found(AccountInfo, RefreshToken, Vec<String>),
     /// Ainda não há sessão utilizável.
     Pending(Option<Blocker>),
 }
@@ -115,6 +119,7 @@ pub(crate) fn read_msal_cache<'a>(
     let mut accounts: Vec<Account> = Vec::new();
     let mut tokens: Vec<(String, String, RefreshToken)> = Vec::new(); // (home, environment, rt)
     let mut hints: Vec<ActiveHint> = Vec::new();
+    let mut targets: Vec<(String, String, String)> = Vec::new(); // (home, environment, escopos)
     let mut encrypted = false;
 
     for (key, raw) in entries {
@@ -146,6 +151,15 @@ pub(crate) fn read_msal_cache<'a>(
                     };
                     tokens.push((home, env, rt));
                 }
+            }
+        } else if text("credentialType")
+            .is_some_and(|t| t.to_ascii_lowercase().starts_with("accesstoken"))
+        {
+            // Só o `target` (escopos): o `secret` do access token nunca é lido.
+            if let (Some(home), Some(env), Some(target)) =
+                (text("homeAccountId"), text("environment"), text("target"))
+            {
+                targets.push((home, env, target));
             }
         } else if text("authorityType").is_some() {
             if let (Some(upn), Some(home), Some(environment), Some(tenant_id)) = (
@@ -185,8 +199,15 @@ pub(crate) fn read_msal_cache<'a>(
     compatible.sort_by(|a, b| {
         (a.family_id.is_none(), &a.client_id).cmp(&(b.family_id.is_none(), &b.client_id))
     });
+    let mut scopes: Vec<String> = targets
+        .into_iter()
+        .filter(|(home, env, _)| *home == account.home_account_id && *env == account.environment)
+        .map(|(_, _, t)| t)
+        .collect();
+    scopes.sort();
+    scopes.dedup();
     match compatible.into_iter().next() {
-        Some(rt) => MsalProbe::Found(account, rt),
+        Some(rt) => MsalProbe::Found(account, rt, scopes),
         None => MsalProbe::Pending(encrypted.then_some(Blocker::Encrypted)),
     }
 }
@@ -327,7 +348,7 @@ mod tests {
 
     fn found_upn(p: MsalProbe) -> (String, String) {
         match p {
-            MsalProbe::Found(a, t) => (a.upn, t.secret.expose().to_owned()),
+            MsalProbe::Found(a, t, _) => (a.upn, t.secret.expose().to_owned()),
             other => panic!("esperava sessão, veio {other:?}"),
         }
     }
@@ -397,7 +418,7 @@ mod tests {
             ("guest", account(HOME_A, "tid-guest", "a@empresa.com")),
             ("rt", rt(HOME_A, "client-web", None, "rt-a")),
         ];
-        let MsalProbe::Found(acc, _) = probe(&base) else {
+        let MsalProbe::Found(acc, _, _) = probe(&base) else {
             panic!()
         };
         assert_eq!(acc.tenant_id, "tid-a");
@@ -405,7 +426,7 @@ mod tests {
         let mut hinted = base.clone();
         let (k, v) = active(HOME_A, Some("tid-guest"));
         hinted.push((k, v));
-        let MsalProbe::Found(acc, _) = probe(&hinted) else {
+        let MsalProbe::Found(acc, _, _) = probe(&hinted) else {
             panic!()
         };
         assert_eq!(acc.tenant_id, "tid-guest");
@@ -462,6 +483,37 @@ mod tests {
             ("a", account(HOME_A, "tid-a", "a@e.com")),
         ]);
         assert_eq!(got, MsalProbe::Pending(Some(Blocker::Encrypted)));
+    }
+
+    #[test]
+    fn records_scopes_of_page_access_tokens_without_reading_them() {
+        let at = |home: &str, target: &str| {
+            json!({"credentialType": "AccessToken", "homeAccountId": home, "environment": ENV,
+                   "clientId": "client-web", "target": target, "secret": "at-segredo"})
+            .to_string()
+        };
+        let got = probe(&[
+            ("a", account(HOME_A, "tid-a", "a@empresa.com")),
+            ("rt", rt(HOME_A, "client-web", None, "rt-a")),
+            ("at1", at(HOME_A, "https://api.spaces.skype.com/.default")),
+            ("at2", at(HOME_A, "https://api.spaces.skype.com/.default")),
+            (
+                "at3",
+                at(HOME_A, "https://chatsvcagg.teams.microsoft.com/.default"),
+            ),
+            ("outra", at(HOME_B, "https://outlook.office.com/.default")),
+        ]);
+        let MsalProbe::Found(_, _, scopes) = got else {
+            panic!("{got:?}")
+        };
+        assert_eq!(
+            scopes,
+            [
+                "https://api.spaces.skype.com/.default",
+                "https://chatsvcagg.teams.microsoft.com/.default"
+            ]
+        );
+        assert!(!format!("{scopes:?}").contains("segredo"));
     }
 
     #[test]
