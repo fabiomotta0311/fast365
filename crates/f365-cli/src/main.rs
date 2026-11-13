@@ -7,6 +7,8 @@
 //!   f365 listen  → Trouter WS (D)
 //!   f365 send    → POST chatsvcagg (E)
 
+mod session_cmd;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -50,11 +52,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Auth => todo!("Fase 0-A: captura de sessão via WebView (§2.1)"),
+        Command::Auth => session_cmd::auth()?,
         Command::Chats { top: _ } => todo!("Fase 0-B/C: troca de tokens + GET chatsvcagg (§2.3)"),
         Command::Listen => todo!("Fase 0-C: Trouter WS, evento = invalidação (§2.3)"),
         Command::Send { .. } => todo!("Fase 0-D: POST chatsvcagg (§2.3)"),
         Command::Token { .. } => todo!("debug: imprime access token + claims (§2.3)"),
-        Command::Whoami => todo!("valida sessão: UPN/tenant/região (§2.3)"),
+        Command::Whoami => session_cmd::whoami()?,
     }
+    Ok(())
 }

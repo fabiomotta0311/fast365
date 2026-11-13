@@ -4,10 +4,21 @@
 //! Contrato central: o provider descreve uma OPERAÇÃO (`AuthOp`); a sessão a EXECUTA. O token é
 //! detalhe interno — nunca cruza a fronteira de crate.
 
+#[cfg(feature = "webview")]
+pub mod capture;
 pub mod clock;
+// Política de captura e parser de sessão só têm consumidor com a WebView (e nos testes).
+#[cfg_attr(not(feature = "webview"), allow(dead_code))]
+mod probe;
+mod secret;
+#[cfg_attr(not(feature = "webview"), allow(dead_code))]
+mod session;
 pub mod transport;
+#[cfg_attr(not(feature = "webview"), allow(dead_code))]
+pub mod vault;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use session::AccountInfo;
 
 use async_trait::async_trait;
 use std::time::Duration;
