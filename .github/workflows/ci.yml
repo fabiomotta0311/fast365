@@ -101,20 +101,27 @@ jobs:
       - run: cargo check --workspace --locked
 
   deny:
-    name: cargo-deny (${{ matrix.checks }})
+    # Analisa exatamente o que é distribuído: Windows COM webview e Linux headless SEM ela.
+    # (`--all-features` sem alvo misturaria "Linux + webview" → GTK, combinação que não existe.)
+    name: cargo-deny (${{ matrix.profile }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        checks: [advisories, bans licenses sources]
+        include:
+          - profile: windows-webview
+            arguments: --all-features --target x86_64-pc-windows-msvc
+          - profile: linux-headless
+            arguments: --target x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          command: check ${{ matrix.checks }}
+          command: check
+          arguments: ${{ matrix.arguments }}
 
   coverage:
     name: Cobertura (cargo-llvm-cov)

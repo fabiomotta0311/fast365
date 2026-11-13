@@ -1,9 +1,8 @@
 # cargo-deny — licenças, vulnerabilidades, crates banidos e origem das dependências.
-# Rodar local (opcional): `cargo install cargo-deny --locked && cargo deny check`.
-
-[graph]
-# Inclui a feature `webview` (wry/tao) e todos os alvos (Linux/Windows) na análise.
-all-features = true
+# Analisa os dois perfis distribuídos (o CI roda ambos):
+#   cargo deny --all-features --target x86_64-pc-windows-msvc check   # Windows com webview
+#   cargo deny --target x86_64-unknown-linux-gnu check                 # Linux headless
+# NÃO usar `--all-features` sem alvo: puxa "Linux + webview" (GTK/glib), que o projeto não builda.
 
 [advisories]
 version = 2
@@ -16,7 +15,7 @@ ignore = []                  # toda exceção aqui precisa de ID RUSTSEC + motiv
 version = 2
 confidence-threshold = 0.93
 # Permissivas, compatíveis com MIT OR Apache-2.0. MPL-2.0 é copyleft fraco por ARQUIVO: ok usar
-# sem modificar (entra via wry→cssparser/selectors, só no Linux). CDLA-Permissive-2.0: webpki-roots.
+# sem modificar (cssparser/selectors via wry). CDLA-Permissive-2.0: webpki-roots.
 allow = [
   "MIT",
   "Apache-2.0",
