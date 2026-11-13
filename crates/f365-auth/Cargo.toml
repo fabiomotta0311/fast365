@@ -25,7 +25,7 @@ async-trait.workspace = true
 # WebView nativa efêmera só para o pareamento/login (ver §2.1).
 wry = { version = "0.47", optional = true }
 tao = { version = "0.30", optional = true }
-base64 = "0.22"
+base64 = "0.23"
 jsonwebtoken = "9"           # inspeção (NÃO validação) de claims: exp, aud, tid
 zeroize = "1"                # zera segredos (RT/cookies) ao sair de escopo
 
