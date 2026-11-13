@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  headless:
+    name: Headless (Linux, sem webview)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatação
+        run: cargo fmt --all -- --check
+      - name: Clippy (warnings = erro)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check
+        run: cargo check --workspace
+      - name: Testes
+        run: cargo test --workspace
+
+  windows-webview:
+    name: Windows (gate, --features webview)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (feature webview)
+        run: cargo check -p f365-cli --features webview
