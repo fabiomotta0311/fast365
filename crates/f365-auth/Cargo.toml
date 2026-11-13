@@ -26,7 +26,7 @@ async-trait.workspace = true
 wry = { version = "0.47", optional = true }
 tao = { version = "0.30", optional = true }
 base64 = "0.22"
-jsonwebtoken = "9"           # inspeção (NÃO validação) de claims: exp, aud, tid
+jsonwebtoken = "11"           # inspeção (NÃO validação) de claims: exp, aud, tid
 zeroize = "1"                # zera segredos (RT/cookies) ao sair de escopo
 
 # Sem `windows-native` o keyring v3 cai num store EM MEMÓRIA e o RT some ao fim do processo.
