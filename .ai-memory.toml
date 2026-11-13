@@ -1,0 +1,11 @@
+# Escopo compartilhado da memória de projeto (ai-memory).
+#
+# Hermes, Antigravity e dsh resolvem ESTE escopo ao abrir o projeto NESTE diretório.
+# Com os mesmos valores, os três compartilham a mesma memória (o store é server-side,
+# chaveado por (workspace, project) — independe da máquina/checkout).
+#
+# Regras de uso: ver AGENTS.md › "Memória compartilhada (ai-memory)".
+# NUNCA usar hermes/hermes-default nem antigravity/* (escopos antigos).
+
+workspace = "default"
+project   = "fabiomotta0311-pm-project"
