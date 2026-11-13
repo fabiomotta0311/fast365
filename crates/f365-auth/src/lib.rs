@@ -1,15 +1,16 @@
-//! `f365-auth` — SSO Microsoft, captura de sessão (WebView), armazenamento no keyring
-//! e token-exchange genérico. Ver `docs/ARQUITETURA.md` §1 e §2.1.
+//! `f365-auth` — executor autenticado do core: SSO Microsoft, captura de sessão (WebView, atrás da
+//! feature `webview`), keyring, troca de tokens. Ver `docs/ARQUITETURA.md` §1 e `AGENTS.md`.
 //!
-//! Este crate NÃO conhece Teams nem Outlook — só os conceitos de `Resource`/`scope`.
-//! Os providers (`f365-teams`, futuro `f365-outlook`) consomem o trait [`SessionProvider`].
+//! Contrato central: o provider descreve uma OPERAÇÃO (`AuthOp`); a sessão a EXECUTA. O token é
+//! detalhe interno — nunca cruza a fronteira de crate.
 
 pub mod transport;
 
 use async_trait::async_trait;
-use std::time::SystemTime;
+use std::time::Duration;
+use transport::{HttpRequest, HttpResponse};
 
-/// Resource/scope alvo de um access token (o `aud` que o provider precisa).
+/// Resource/autorização que a operação exige (o `aud` interno).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resource {
     /// Tokens de chat/skype do Teams (`chatsvcagg` + Trouter).
@@ -18,26 +19,34 @@ pub enum Resource {
     OutlookSubstrate,
 }
 
-/// Access token com validade, entregue pela sessão sob demanda.
+/// Operação autenticada declarada por um provider. **NÃO contém token.**
 #[derive(Debug, Clone)]
-pub struct AccessToken {
-    pub value: String,
-    pub expires_at: SystemTime,
+pub struct AuthOp {
+    /// Qual autorização a operação exige.
+    pub resource: Resource,
+    /// Método, path, headers de domínio e body (sem credencial).
+    pub request: HttpRequest,
+    /// Exige cookies / execução no contexto da página parqueada.
+    pub needs_page_context: bool,
+    /// Pode ser repetida com segurança (importa para reconciliação de envio).
+    pub idempotent: bool,
+    /// Prazo máximo da operação.
+    pub timeout: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum AuthError {
-    #[error("sessão não encontrada / não pareada (rode `f365 auth`)")]
+pub enum ExecError {
+    #[error("sessão não pareada (rode `f365 auth`)")]
     NotPaired,
-    #[error("falha ao renovar token: {0}")]
-    Refresh(String),
+    #[error("falha de autenticação: {0}")]
+    Auth(String),
+    #[error("falha de transporte: {0}")]
+    Transport(String),
 }
 
-/// Entrega um access token válido para um `resource`, renovando em silêncio se expirado.
-///
-/// Implementado na Fase 0/2 por um provider concreto que lê o refresh token do keyring
-/// e troca pelos tokens da cadeia (ver §2.2).
+/// Contrato central do core: executa uma operação autenticada, resolvendo auth + rota de transporte
+/// internamente. O token vive dentro da implementação; providers nunca o veem.
 #[async_trait]
-pub trait SessionProvider: Send + Sync {
-    async fn token_for(&self, resource: Resource) -> Result<AccessToken, AuthError>;
+pub trait AuthenticatedExecutor: Send + Sync {
+    async fn execute(&self, op: AuthOp) -> Result<HttpResponse, ExecError>;
 }

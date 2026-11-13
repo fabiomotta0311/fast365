@@ -4,6 +4,7 @@
 > Entrega final: **aplicação desktop nativa (`.exe`)** para Windows primeiro; Linux/macOS depois.
 > CLI de validação: `f365`. Core em Rust puro; UI visual em **Tauri v2 + React** (ver §0.1).
 > Abordagem: **emulação do cliente web oficial** (sem Graph API, sem aprovação de admin de tenant).
+> Identidade técnica: **local-first · execução adaptativa · sincronização reproduzível** · manutenção AI-Native (§0.2).
 
 ---
 
@@ -36,6 +37,35 @@ chegam do `chatsvcagg` como `messagetype: RichText/Html`, que uma UI web renderi
 A fronteira de crates **não muda** com essa decisão: o core Rust (`f365-auth`/`f365-teams`/`f365-storage`)
 é idêntico; a UI apenas fala com ele por **commands/events do Tauri** em vez de canais `mpsc`/`watch` —
 a mesma fronteira com outro nome.
+
+---
+
+## 0.2 Premissa transversal — AI-Native & manutenção por agentes
+
+O Fast365 é mantido majoritariamente por **agentes de IA** (Hermes, dsh, Antigravity, Claude). A
+arquitetura otimiza o **custo esperado de manutenção automatizada** — menos arquivos e contexto para
+compreender, modificar e validar uma mudança — sem abrir mão de correção. Regras operacionais estáveis
+vivem em [`AGENTS.md`](../AGENTS.md); isto aqui é o resumo de arquitetura.
+
+**Princípios adotados:**
+- **Localidade de contexto:** uma funcionalidade se entende/modifica olhando o mínimo de arquivos.
+  Dentro de `f365-teams`, organizar por **capacidade** (`chats/`, `history/`, `send/`, `realtime/`),
+  slices auto-contidos — não por camada técnica (`models/`+`services/`+`repos/`).
+- **Abstração só paga o próprio custo:** uma trait/interface sobrevive se **reduz acoplamento** ou
+  **torna a validação mais barata** (testabilidade). Senão, não existe. É o filtro que decide quais
+  abstrações da §1/Fase 2 ficam — o **executor autenticado**, a **fronteira do motor** e o **modelo de
+  capacidade** passam; qualquer trait "para um provider hipotético" não.
+- **Sem scaffolding antecipado:** nada de estrutura para necessidade futura hipotética (o *crate*
+  `f365-outlook` só nasce na Fase 4; uma variante de enum como placeholder é barata e permitida).
+- **Contratos + checagens executáveis no lugar de narrativa:** comportamento expresso por tipos,
+  invariantes e testes; comentário de código mínimo. (Este doc é registro de *decisão*, não narrativa
+  redundante do código.)
+- **Duplicação limitada > acoplamento:** repetir um punhado de linhas é melhor que criar dependência
+  entre slices só para não repetir.
+
+**Legibilidade humana não é meta separada:** contribuidores open-source também desenvolvem via agentes,
+então otimizar para manutenção barata por IA (contratos explícitos + testes determinísticos) já serve o
+humano. Não há trade-off a equilibrar aqui.
 
 ---
 
@@ -77,7 +107,7 @@ fast365/
 ├── docs/
 │   └── ARQUITETURA.md              # este documento
 └── crates/
-    ├── f365-auth/                  # [Fase 0] SSO Microsoft, WebView, keyring, token-exchange genérico
+    ├── f365-auth/                  # [Fase 0] executor autenticado: SSO, WebView, keyring, troca de tokens
     ├── f365-teams/                 # [Fase 0] provider Teams: chatsvcagg (REST) + Trouter (WS)
     ├── f365-cli/                   # [Fase 0] binário `f365` — orquestra auth + teams
     ├── f365-storage/               # [Fase 2] placeholder — cache rusqlite + refresh em background
@@ -90,51 +120,50 @@ fast365/
 
 | Crate          | Fase | Responsabilidade | Depende de | NÃO conhece |
 |----------------|------|------------------|------------|-------------|
-| `f365-auth`    | 0    | Login via `wry`, captura de cookies/tokens, armazenamento `keyring`, refresh silencioso, token-exchange genérico (MSAL → resource token) | `wry`, `reqwest`, `keyring`, `tokio` | nada de Teams/Outlook — só conceitos de "scope/resource" |
-| `f365-teams`   | 0    | Cadeia específica Skype/CSA, REST `chatsvcagg`, WS `Trouter` | `f365-auth` (trait de sessão) | `wry`, UI, storage |
+| `f365-auth`    | 0    | **Executor autenticado**: login `wry`, captura, `keyring`, refresh, troca de tokens; **executa operações** (token interno) | `wry`, `reqwest`, `keyring`, `tokio` | nada de Teams/Outlook — só `Resource` |
+| `f365-teams`   | 0    | Cadeia Skype/CSA, REST `chatsvcagg`, WS `Trouter` (descreve operações) | `f365-auth` (`AuthenticatedExecutor`) | `wry`, UI, storage, **tokens** |
 | `f365-cli`     | 0    | Binário `f365`, subcomandos, logging | `f365-auth`, `f365-teams`, `clap` | — |
 | `f365-storage` | 2    | SQLite WAL (fonte da verdade, offline-first) + busca FTS5 | `rusqlite` | UI |
 | `f365-ui`      | 3    | Shell Tauri v2 + UI React isolada do core por commands/events | `tauri`, `f365-*` via IPC | detalhes de rede |
 | `f365-outlook` | 4    | OWA/Substrate | `f365-auth` | Teams |
 
-**Contrato de desacoplamento (chave da escalabilidade):** `f365-auth` expõe uma trait
-`SessionProvider` que entrega um *access token* para um dado *resource/scope*. `f365-teams` e, no
-futuro, `f365-outlook` consomem essa trait — nunca falam com `wry` nem conhecem o fluxo de login.
+**Contrato central do core — executor autenticado (não "fornecedor de token").**
+A interface pública do core **executa uma operação autenticada**; o **token é detalhe interno** e nunca
+cruza a fronteira de crate. O provider descreve a operação + seus requisitos de auth; a sessão decide
+*como* executá-la (HTTP Rust com token efêmero, ou dentro da página parqueada). Isso reduz a circulação
+de segredos e mantém regra de domínio (chats) fora do módulo de sessão.
 
 ```rust
 // f365-auth/src/lib.rs (esboço do contrato, não implementação)
 #[async_trait::async_trait]
-pub trait SessionProvider: Send + Sync {
-    /// Retorna um access token válido para o resource pedido, renovando em silêncio se expirado.
-    async fn token_for(&self, resource: &Resource) -> Result<AccessToken, AuthError>;
+pub trait AuthenticatedExecutor: Send + Sync {
+    /// Executa a operação, resolvendo auth + transporte internamente.
+    async fn execute(&self, op: AuthOp) -> Result<HttpResponse, ExecError>;
 }
 
-pub enum Resource {
-    /// aud dos tokens de chat/skype do Teams
-    TeamsChatSvc,
-    /// placeholder Fase 4
-    OutlookSubstrate,
+/// O que o provider declara — NÃO contém token.
+pub struct AuthOp {
+    pub resource: Resource,         // qual aud/autorização a operação exige
+    pub request: HttpRequest,       // método, path, headers de domínio, body
+    pub needs_page_context: bool,   // exige cookies / execução na página
+    pub idempotent: bool,           // pode repetir com segurança (importa p/ reconciliação)
+    pub timeout: Duration,
 }
+
+pub enum Resource { TeamsChatSvc, OutlookSubstrate /* Fase 4 */ }
 ```
 
-**Transport trait (robustez — lição do `rusty-teams`, ver §5):** além de emitir tokens, a sessão
-abstrai *como* o request sai, para **degradar graciosamente** quando a Microsoft bloquear o caminho puro.
+Internamente (lição do `rusty-teams`, ver §5), o executor escolhe a **rota de transporte** — e o token
+vive só aqui dentro:
 
 ```rust
-// f365-auth/src/transport.rs (esboço)
-#[async_trait::async_trait]
-pub trait Transport: Send + Sync {
-    async fn send(&self, req: HttpRequest) -> Result<HttpResponse, TransportError>;
+// estratégia INTERNA do executor — não cruza a fronteira de crate
+enum Route {
+    Rust,     // reqwest + token efêmero (PADRÃO, leve)
+    InPage,   // fetch na WebView parqueada (contexto genuíno + cookies) — FALLBACK
 }
-
-/// (1) PADRÃO: request puro via reqwest (rápido, leve)
-pub struct RustTransport { /* reqwest::Client */ }
-/// (2) FALLBACK: executa `fetch` DENTRO da WebView parqueada
-///     (contexto genuíno do cliente + cookies + token que o MSAL da página já renova)
-pub struct InPageTransport { /* handle da WebView via evaluate_script/CDP */ }
-
-// A política usa (1) por padrão e cai para (2) em 401/403/challenge de Conditional Access.
-// WebSocket e chamadas cookie-bound rodam sempre via (2).
+// Padrão: Rust; cai para InPage em 401/403/challenge de Conditional Access.
+// WebSocket e chamadas cookie-bound usam InPage sempre.
 ```
 
 ### `Cargo.toml` raiz (workspace)
@@ -299,8 +328,8 @@ serde_json.workspace = true
    `fast365` / conta `<upn-do-usuario>`. Access/skype tokens ficam **só em memória** e são renovados sob
    demanda (padrão convergente de `ic3`/`ost`/`rusty-teams`).
 
-> **Transport trait (lição do `rusty-teams`) — seu seguro contra No-Go.** Abstraia *como* o request sai
-> atrás do trait (§1): (1) **Rust puro** (`reqwest`) — padrão, leve; (2) **in-page fetch** pela WebView
+> **Transporte interno do executor (lição do `rusty-teams`) — seu seguro contra No-Go.** O executor (§1)
+> escolhe *como* o request sai: (1) **Rust puro** (`reqwest`) — padrão, leve; (2) **in-page fetch** pela WebView
 > parqueada (executa no contexto genuíno do cliente, com cookies e o token que o MSAL da página já
 > renova) — para endpoints que fingerprintam/exigem cookie; (3) **cookie-bound/WS** sempre dentro da
 > página. Quando a Microsoft barrar o request puro (checkpoint B/F), você **degrada para a página real
@@ -373,8 +402,32 @@ f365 whoami                      # valida sessão: UPN, tenant, região descober
 Access que exige device compliance que nem a página real satisfaz, ou Trouter que rejeita qualquer
 cliente não-oficial. Só então reavaliar a estratégia de base antes de qualquer outra fase.
 
-> Antes de declarar No-Go em B ou F, **tente o `InPageTransport`**: ele resolve a maioria dos bloqueios
+> Antes de declarar No-Go em B ou F, **tente a rota `InPage`**: ela resolve a maioria dos bloqueios
 > de fingerprint/cookie, porque o request passa a sair do contexto genuíno do cliente web.
+
+### 2.5 Disponibilidade por capacidade (não um booleano global de conexão)
+
+O estado do cliente **não** é "conectado/desconectado". É **por capacidade**, por conta/tenant e por
+geração de sessão:
+
+| Capacidade        | Rota             | Estado            |
+|-------------------|------------------|-------------------|
+| listar conversas  | HTTP Rust        | disponível        |
+| ler histórico     | HTTP Rust        | disponível        |
+| baixar mídia      | contexto página  | disponível        |
+| tempo real        | socket Rust      | reconectando      |
+| enviar mensagem   | —                | exige novo login  |
+
+(Nomes/rotas ilustrativos.) Regras:
+- Cada capacidade começa numa **rota conhecida e já implementada** — não se descobre endpoint nem se
+  escolhe rota por tentativa e erro em operação de escrita.
+- Falha em uma capacidade (ex.: mídia) **não** derruba as outras nem dispara troca global de transporte.
+- Expiração/logout invalidam o conhecimento daquela geração de sessão.
+- A UI mostra **degradação parcial explícita**: "histórico ok; tempo real reconectando; envio aguardando
+  auth" — útil ao usuário e torna problema de protocolo diagnosticável.
+
+**Decidir agora:** disponibilidade é por capacidade. A seleção automática de rota cresce incremental
+(Fase 2+), não na Fase 0.
 
 ---
 
@@ -435,11 +488,31 @@ Entregue em `f365-auth` + `f365-teams` + `f365-cli`. Critério = matriz §2.4 ve
 - Refresh silencioso de token em **task `tokio` dedicada** (renova antes de `exp`, backoff em erro).
 - Reconexão automática do Trouter (resubscribe + replay de gap via REST por `lastSyncToken`); eventos
   tratados como **invalidação** (§2.3), não como dado.
-- **Resiliência de protocolo (o diferencial do Fast365):** externalize o **"protocol profile"** (hosts,
-  paths, `X-MS-Client-Version`, client IDs) em arquivo de config versionado — uma quebra da Microsoft
-  vira *update de config, não recompilar*. Testes com **`wiremock`** (mock de chatsvc + Trouter) e
-  marcadores **`UNVERIFIED`** no código para cada suposição de protocolo (lições do `ic3`); **redija
-  tokens** em logs e HAR.
+- **Motor de sincronização reproduzível (assinatura técnica).** O núcleo de decisão é uma **máquina de
+  estados** que recebe *acontecimentos* (resposta HTTP, invalidação do Trouter, rede caiu, prazo
+  expirou, usuário enviou) e produz *decisões* (gravar no SQLite, buscar histórico, agendar reconexão,
+  tentar envio, publicar à UI). **Relógio e rede são injetáveis** → testes determinísticos de suspensão,
+  eventos duplicados/fora de ordem e reconciliação de envio, sem esperar minutos e sem rede real. Não é
+  event-sourcing nem framework próprio; é uma FSM explícita com seams.
+  - **Invariante de envio:** se a resposta se perde e depois chega uma invalidação, o motor
+    **reconcilia** a mensagem já enviada (via `clientmessageid`) em vez de reenviar. Se o protocolo não
+    permitir confirmar a correspondência, o estado é **"incerto"** — nunca inventar entrega única.
+  - **Fronteira (decidir já):** o motor **não** chama `reqwest`, relógio de parede, WebView ou UI
+    diretamente. A Fase 0 já é escrita contra esses seams (injeta `Clock`, usa o executor) para não
+    virar código descartável — mas o motor completo é entregue aqui, na Fase 2.
+- **Resiliência de protocolo — perfil declarativo × adaptador (separar honestamente):**
+  - **Perfil declarativo** (config versionada): hosts permitidos, paths, versões, parâmetros conhecidos,
+    client IDs. Mudança da Microsoft **que couber aqui** vira *update de config, não recompilar*.
+  - **Adaptador de protocolo** (código): transformação de payload, auth, framing. **Nem toda** mudança
+    é corrigível por JSON — não finja que é.
+  - **Catálogo de evidências:** cada suposição de protocolo recebe um **ID de contrato estável** (ex.:
+    `SEND-RECONCILE-001`) ligado a hipótese, evidência (`arquivo@commit` ou teste), comportamento
+    dependente e fallback. Marcadores **`UNVERIFIED`** no código referenciam esse ID (lição do `ic3`).
+    Regra estável "sempre/nunca" vai no `AGENTS.md`, não só na memória.
+  - **Bundle de diagnóstico seguro por construção:** só IDs de contrato, estados/transições, status HTTP
+    e categorias de erro, durações/contagens e IDs locais pseudonimizados. **Sem** texto de mensagem,
+    token, cookie ou URL assinada. Captura de conteúdo é modo separado e explícito → dá pra colaborar
+    open-source sem o usuário publicar HAR sensível. Testes com **`wiremock`** (mock de chatsvc + Trouter).
 - Go/No-Go da fase: sobreviver a 8 h ligado, reconectar após sleep/rede caindo, sem reabrir WebView.
 
 ### Fase 3 — UI nativa (`f365-ui`: Tauri v2 + React)
@@ -472,7 +545,7 @@ RAM-alvo ~45–90 MB.
 ### Fase 4 — Busca, anexos e Outlook (`f365-outlook`)
 - **Busca avançada (opcional):** migrar de FTS5 para `tantivy` **apenas se** a busca FTS5 virar gargalo (ranking/fuzzy/escala). Não é o default.
 - Anexos: download via endpoints capturados, cache local.
-- **Outlook**: novo provider `f365-outlook` consumindo o **mesmo `SessionProvider`** de `f365-auth`
+- **Outlook**: novo provider `f365-outlook` consumindo o **mesmo `AuthenticatedExecutor`** de `f365-auth`
   (resource `OutlookSubstrate`), falando com OWA/Substrate API. Zero mudança em `f365-auth`/`f365-teams`
   valida que a fronteira da Fase 0 foi bem desenhada.
 
@@ -540,6 +613,17 @@ mapeamento de protocolo. Esta é a destilação do melhor de cada um para o Fast
   manter puro-`chatsvc`**, porém desenhar o provider como trait para **plugar um backend Graph opcional**
   no futuro, se houver consentimento e se quisermos mais estabilidade.
 
+### Assinatura técnica & demo
+
+> **Fast365 = cliente local-first com execução adaptativa e sincronização reproduzível.**
+
+Demo que comunica engenharia (melhor que "usa menos RAM"): (1) abrir histórico local **sem rede**;
+(2) escrever mensagem → persistir como **pendente**; (3) reconectar e **reconciliar** o envio;
+(4) simular perda da resposta **sem duplicar**; (5) reproduzir o mesmo cenário em **teste determinístico**;
+(6) exibir **capacidades por rota** (§2.5). Prioridade: fixar o **executor autenticado** (§1) e a
+**fronteira testável do motor** (Fase 2) **antes** da primeira implementação real — são as decisões
+caras de mudar depois.
+
 ---
 
 ## 6. Visão & Features habilitadas pela arquitetura
@@ -580,6 +664,23 @@ mas desenhar o core ciente de que esse seam vai existir.
 - **Decisões de UX a resolver depois:** (a) enviar o texto **já traduzido** (funciona mesmo que o colega
   use o Teams oficial) vs. enviar o original e cada lado traduzir localmente; (b) exibir original +
   tradução ou só a tradução.
+
+### Decisão de dados para features de IA — fatos × interpretações
+
+**Conteúdo derivado nunca substitui o original.** A mensagem recebida é um **fato** (versionado);
+tradução, resumo, ata e ação proposta são **artefatos derivados**, versionados e referenciando o fato +
+a versão do modelo:
+
+```
+Mensagem original + versão
+        ├── tradução + idioma + versão do modelo
+        ├── resumo + referências às mensagens
+        └── ação proposta + aprovação do usuário
+```
+
+Permite invalidar traduções quando a mensagem muda, rastrear a ata até a decisão-fonte, trocar o modelo
+sem reescrever histórico e **aprovar exatamente o texto que será enviado**. **Decidir agora** só no
+modelo de dados/API (não construir plugin): derivado é separado e versionado desde o schema.
 
 ### Outras ideias (backlog aberto)
 Espaço para novas features do dono. O padrão se mantém: se a ideia é **transformar/reagir a mensagens**,
