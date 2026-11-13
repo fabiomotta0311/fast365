@@ -15,6 +15,8 @@ preferências gerais. Decisões e o "porquê" vivem em [`docs/ARQUITETURA.md`](d
 - **WebView atrás da feature `webview`** (`default = []`). Windows builda com `--features webview`;
   Linux/VPS/CI headless, sem ela, sem GTK/WebKit.
 - **O motor de sync não chama `reqwest`/relógio/UI direto** — injeta `Clock`/transporte (testável).
+  Vive em `f365-sync` (FSM sem I/O); nunca adicionar dependência de I/O nem ler o relógio lá — o teste
+  `boundary` e o `clippy.toml` do crate falham. Tempo no core vem sempre de `f365_auth::Clock`.
 - **Sem Graph API** por padrão (evitar consentimento de admin); backend Graph só como opção futura.
 
 ## Segurança (nunca)

@@ -726,6 +726,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "f365-sync"
+version = "0.0.0"
+dependencies = [
+ "f365-auth",
+]
+
+[[package]]
 name = "f365-teams"
 version = "0.0.0"
 dependencies = [

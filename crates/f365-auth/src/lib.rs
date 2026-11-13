@@ -4,7 +4,10 @@
 //! Contrato central: o provider descreve uma OPERAÇÃO (`AuthOp`); a sessão a EXECUTA. O token é
 //! detalhe interno — nunca cruza a fronteira de crate.
 
+pub mod clock;
 pub mod transport;
+
+pub use clock::{Clock, ManualClock, SystemClock};
 
 use async_trait::async_trait;
 use std::time::Duration;
