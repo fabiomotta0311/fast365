@@ -337,6 +337,11 @@ serde_json.workspace = true
 > `AUTH-ENTRY-001`, `AUTH-MSAL-CACHE-001/002`, `AUTH-COOKIES-001` e **`AUTH-RT-SPA-001`** — o RT do
 > cliente web (SPA) dura ~24 h fixas e é preso à origem: risco direto ao Checkpoint F, mitigado pelo
 > perfil persistente da WebView (`%LOCALAPPDATA%ast365\webview`) para re-login silencioso.
+>
+> **Checkpoint A: verde (2026-11-13, conta do dono).** Janela fechou sozinha; RT + 5 cookies no
+> keyring; `whoami` correto em processo novo. Confirmados `AUTH-ENTRY-001`, `AUTH-MSAL-CACHE-001`,
+> `AUTH-COOKIES-001`. O RT é do cliente **web** `5e3ce6c0-…` (sem family RT), não do nativo
+> `1fec8e78-…` citado em §2.2 → `AUTH-RT-SPA-001` segue aberto e é o primeiro ponto do #8.
 
 > **Transporte interno do executor (lição do `rusty-teams`) — seu seguro contra No-Go.** O executor (§1)
 > escolhe *como* o request sai: (1) **Rust puro** (`reqwest`) — padrão, leve; (2) **in-page fetch** pela WebView

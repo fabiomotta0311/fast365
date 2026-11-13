@@ -20,7 +20,8 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 use wry::{WebContext, WebViewBuilder};
 
-/// `AUTH-ENTRY-001` (UNVERIFIED): abrir o Teams Web dispara o authorize MSAL do cliente oficial.
+/// `AUTH-ENTRY-001` (VERIFIED, Checkpoint A 2026-11-13): abrir o Teams Web dispara o authorize MSAL
+/// do cliente oficial (client_id web `5e3ce6c0-…`).
 pub const TEAMS_WEB_URL: &str = "https://teams.cloud.microsoft/";
 const COOKIE_URL: &str = "https://login.microsoftonline.com/";
 const PROBE_EVERY: Duration = Duration::from_secs(1);

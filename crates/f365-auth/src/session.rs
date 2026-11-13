@@ -2,17 +2,18 @@
 //! A WebView (feature `webview`) só coleta as entradas de storage e os cookies; quem decide o que é
 //! sessão é este módulo.
 //!
-//! Contratos de protocolo (todos `UNVERIFIED` até o Checkpoint A rodar na conta do dono — ver #4):
-//! - `AUTH-MSAL-CACHE-001`: o Teams Web guarda o cache MSAL em claro no `localStorage`/`sessionStorage`,
-//!   uma entrada JSON por credencial/conta. Reconhecemos pelo **conteúdo** (`credentialType`,
+//! Contratos de protocolo. Evidência = Checkpoint A manual na conta do dono, 2026-11-13 (#7):
+//! - `AUTH-MSAL-CACHE-001` (VERIFIED): o Teams Web guarda o cache MSAL em claro no storage, uma
+//!   entrada JSON por credencial/conta. Reconhecemos pelo **conteúdo** (`credentialType`,
 //!   `authorityType`), não pelo formato da chave, que muda entre versões do MSAL.js.
-//! - `AUTH-MSAL-CACHE-002`: msal-browser v4+ pode **criptografar** o cache (`{id, nonce, data}`).
-//!   Nesse caso o refresh token não é legível por script → erro explícito, nunca "captura vazia".
-//! - `AUTH-RT-SPA-001`: o RT emitido ao Teams Web (cliente SPA) tem validade fixa de ~24 h e é
-//!   vinculado à origem. Afeta o Checkpoint F; mitigação = perfil persistente da WebView (cookies
-//!   `ESTSAUTHPERSISTENT`) para re-login silencioso.
-//! - `AUTH-COOKIES-001`: os cookies de sessão do Entra são os `ESTSAUTH*`, `buid` e `esctx` de
-//!   `login.microsoftonline.com`.
+//! - `AUTH-MSAL-CACHE-002` (UNVERIFIED, não ocorreu): msal-browser v4+ pode **criptografar** o
+//!   cache (`{id, nonce, data}`) → erro explícito, nunca "captura vazia". Mantido como guarda.
+//! - `AUTH-RT-SPA-001` (PARCIAL): VERIFIED que o RT é do cliente **web** (`5e3ce6c0-…`, sem
+//!   `familyId`) — não do nativo `1fec8e78-…`. UNVERIFIED: validade fixa de ~24 h e vínculo à
+//!   origem; medir na troca de tokens (#8). Risco ao Checkpoint F; mitigação = perfil persistente
+//!   da WebView (cookies `ESTSAUTHPERSISTENT`) para re-login silencioso.
+//! - `AUTH-COOKIES-001` (VERIFIED): `login.microsoftonline.com` entrega cookies de sessão do Entra
+//!   (`ESTSAUTH*`/`buid`/`esctx`; 5 na captura, > 2560 B no total → exige o vault em pedaços).
 
 use crate::secret::Secret;
 use serde_json::Value;
