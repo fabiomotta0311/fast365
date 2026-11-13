@@ -39,6 +39,12 @@ preferências gerais. Decisões e o "porquê" vivem em [`docs/ARQUITETURA.md`](d
 - `cargo clippy --workspace -- -D warnings`
 - `cargo check --workspace` e `cargo test --workspace`
 - No Windows, validar o gate com `--features webview`.
+- O CI (`.github/workflows/ci.yml`) é a régua final: roda tudo acima com `--locked`, mais MSRV,
+  `cargo deny` (licenças/vulnerabilidades/origens) e cobertura. PR só conclui com CI verde.
+- **MSRV:** `rust-version` no `Cargo.toml` é contrato. Se uma dependência exigir Rust mais novo, suba o
+  `rust-version` no mesmo PR (o job `msrv` falha caso contrário).
+- **`deny.toml`:** nunca afrouxar para passar. Ignorar advisory exige ID RUSTSEC + motivo + prazo;
+  licença nova só se for permissiva e compatível com `MIT OR Apache-2.0`.
 
 ## Memória compartilhada (ai-memory)
 - Escopo obrigatório em toda chamada de projeto: `workspace = "default"`,

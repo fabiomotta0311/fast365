@@ -177,7 +177,7 @@ members = ["crates/f365-auth", "crates/f365-teams", "crates/f365-cli"]
 [workspace.package]
 edition = "2021"           # subir p/ 2024 quando estabilizar na toolchain de uso
 license = "MIT OR Apache-2.0"
-rust-version = "1.82"
+rust-version = "1.89"
 
 [workspace.dependencies]
 tokio   = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }

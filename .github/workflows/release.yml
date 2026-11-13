@@ -1,0 +1,94 @@
+name: Release
+
+# Tag `vX.Y.Z` → build do `f365.exe` (Windows, --features webview) + GitHub Release com zip e SHA-256.
+# workflow_dispatch → só o build, com o zip como artefato (sem publicar Release).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build-windows:
+    name: Build f365.exe (Windows, webview)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    outputs:
+      package: ${{ steps.pkg.outputs.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Versão (tag precisa bater com f365-cli)
+        id: ver
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq 'f365-cli').version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME não bate com f365-cli $version (esperado v$version)."
+          }
+          $suffix = if ($env:GITHUB_REF_TYPE -eq 'tag') { $version } else { "$version-$($env:GITHUB_SHA.Substring(0,7))" }
+          "suffix=$suffix" >> $env:GITHUB_OUTPUT
+      - name: Build release
+        run: cargo build --release --locked -p f365-cli --features webview
+      - name: Empacotar (zip + SHA-256)
+        id: pkg
+        shell: pwsh
+        run: |
+          $name = "f365-${{ steps.ver.outputs.suffix }}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force dist/$name | Out-Null
+          Copy-Item target/release/f365.exe, README.md dist/$name/
+          Compress-Archive -Path dist/$name/* -DestinationPath dist/$name.zip
+          $hash = (Get-FileHash dist/$name.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii -NoNewline dist/$name.zip.sha256
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "**$name.zip** — SHA-256 ``$hash``" >> $env:GITHUB_STEP_SUMMARY
+      - name: Smoke test do binário
+        run: target/release/f365.exe --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+  publish:
+    name: Publicar GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build-windows.outputs.package }}
+          path: dist
+      - name: Criar Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >
+          gh release create "$TAG" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "$TAG"
+          --generate-notes
+          --verify-tag
