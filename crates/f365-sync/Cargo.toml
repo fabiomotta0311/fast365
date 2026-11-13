@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
+publish.workspace = true
 
 # Fronteira do motor (docs/ARQUITETURA.md, Fase 2): NUNCA adicionar aqui rede (reqwest,
 # tokio-tungstenite), WebView (wry/tao), UI (tauri) nem storage. O teste
