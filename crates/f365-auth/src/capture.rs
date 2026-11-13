@@ -29,7 +29,7 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
-use wry::{WebContext, WebViewBuilder};
+use wry::{NewWindowResponse, WebContext, WebViewBuilder};
 use zeroize::{Zeroize, Zeroizing};
 
 /// `AUTH-ENTRY-001` (VERIFIED, Checkpoint A 2026-11-13): abrir o Teams Web dispara o authorize MSAL
@@ -156,7 +156,7 @@ fn capture_session(
     // Toda navegação de topo invalida as sondas em voo do documento anterior.
     let generation = Arc::new(AtomicU64::new(0));
     let mut context = WebContext::new(Some(opts.profile_dir.clone()));
-    let webview = WebViewBuilder::with_web_context(&mut context)
+    let webview = WebViewBuilder::new_with_web_context(&mut context)
         .with_url(&opts.start_url)
         .with_navigation_handler({
             let generation = Arc::clone(&generation);
@@ -164,6 +164,20 @@ fn capture_session(
                 generation.fetch_add(1, Ordering::SeqCst);
                 true // login/federação podem passar por qualquer host; só a origem decide a sessão
             }
+        })
+        // Pop-ups (`window.open`) negados de propósito: o login do Teams Web é por redirect no topo
+        // (Checkpoint A). O wry ≥ 0.5x já nega sem handler, mas em silêncio — aqui fica explícito e
+        // logado (só o host: a query pode carregar código/token), para o caso de algum MFA/IdP
+        // federado depender de pop-up.
+        .with_new_window_req_handler(|url, _features| {
+            let host = url::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned));
+            tracing::warn!(
+                host = host.as_deref().unwrap_or("?"),
+                "pop-up bloqueado na janela de login"
+            );
+            NewWindowResponse::Deny
         })
         .build(&window)
         .map_err(|e| web(&e))?;

@@ -23,8 +23,8 @@ url.workspace = true
 async-trait.workspace = true
 
 # WebView nativa efêmera só para o pareamento/login (ver §2.1).
-wry = { version = "0.47", optional = true }
-tao = { version = "0.30", optional = true }
+wry = { version = "0.57", optional = true }
+tao = { version = "0.37", optional = true }
 base64 = "0.23"              # engine escalar `general_purpose` explícito (SIMD da 0.23 não é usado)
 zeroize = "1"                # zera segredos (RT/cookies) ao sair de escopo
 
