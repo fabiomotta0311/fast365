@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Credenciais / sessão capturada — NUNCA versionar
+*.jwt
+*.har
+.f365/
+session.json

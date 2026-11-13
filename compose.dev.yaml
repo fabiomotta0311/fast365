@@ -1,0 +1,27 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: fast365-dev:local
+    container_name: fast365-dev
+    init: true
+    restart: unless-stopped
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - fast365-cargo-home:/cargo-home
+      - fast365-target:/workspace/target
+    command: ["sleep", "infinity"]
+    networks:
+      - dev
+
+volumes:
+  fast365-cargo-home:
+    name: fast365-dev-cargo-home
+  fast365-target:
+    name: fast365-dev-target
+
+networks:
+  dev:
+    name: fast365-dev-network
