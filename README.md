@@ -68,6 +68,17 @@ cargo test --workspace
 
 No Windows, valide o caminho da WebView: `cargo check -p f365-cli --features webview`.
 
+## CI e releases
+
+| Workflow | Quando | O quê |
+|----------|--------|-------|
+| `ci.yml` | push na `main`, PR | fmt · clippy/test/doc Linux headless · clippy/test Windows `--features webview` · MSRV · `cargo deny` · cobertura (`cargo-llvm-cov`, resumo no job + `lcov.info`) |
+| `audit.yml` | diário | `cargo deny check advisories` (vulnerabilidades novas sem precisar de push) |
+| `release.yml` | tag `vX.Y.Z` (ou manual) | `f365.exe` release com webview → zip + SHA-256; na tag, publica a GitHub Release |
+
+Para lançar: suba `version` em `crates/f365-cli/Cargo.toml`, faça merge e `git tag vX.Y.Z && git push --tags`
+(a tag precisa bater com a versão, ou o workflow falha).
+
 ## Workspace
 
 ```

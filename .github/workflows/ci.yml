@@ -4,43 +4,157 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  RUSTDOCFLAGS: -D warnings
+
+# Actions fixadas por SHA (tag no comentário). O Dependabot mantém atualizadas.
+# Cache: só a main grava (PRs leem), para não poluir/estourar o cache com branches.
 
 jobs:
-  headless:
-    name: Headless (Linux, sem webview)
+  fmt:
+    name: Formatação
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Formatação
-        run: cargo fmt --all -- --check
-      - name: Clippy (warnings = erro)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Check
-        run: cargo check --workspace
-      - name: Testes
-        run: cargo test --workspace
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-  windows-webview:
+  headless:
+    name: Linux headless (sem webview)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy (warnings = erro)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Testes
+        run: cargo test --workspace --locked
+      - name: Rustdoc (warnings = erro)
+        run: cargo doc --workspace --no-deps --locked
+
+  windows:
     name: Windows (gate, --features webview)
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check (feature webview)
-        run: cargo check -p f365-cli --features webview
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy (warnings = erro, todas as features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Testes (todas as features)
+        run: cargo test --workspace --all-features --locked
+
+  msrv:
+    name: MSRV (rust-version do Cargo.toml)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ler rust-version (fonte única = Cargo.toml)
+        id: msrv
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].rust_version] | unique | if length == 1 then .[0] else error("rust-version divergente entre crates: \(.)") end')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --workspace --locked
+
+  deny:
+    # Analisa exatamente o que é distribuído: Windows COM webview e Linux headless SEM ela.
+    # (`--all-features` sem alvo misturaria "Linux + webview" → GTK, combinação que não existe.)
+    name: cargo-deny (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: windows-webview
+            arguments: --all-features --target x86_64-pc-windows-msvc
+          - profile: linux-headless
+            arguments: --target x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: ${{ matrix.arguments }}
+
+  coverage:
+    name: Cobertura (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Rodar testes instrumentados
+        run: cargo llvm-cov --workspace --locked --no-report
+      - name: Relatórios (lcov + resumo no job)
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          {
+            echo '### Cobertura de testes'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+          if-no-files-found: error
