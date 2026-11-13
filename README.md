@@ -20,6 +20,7 @@ Abordagem: **emular o cliente web oficial** (sem Graph API, sem aprovação de a
 | [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) | Plano de arquitetura e execução (o "porquê" de cada decisão). |
 | [`AGENTS.md`](AGENTS.md) | Regras estáveis "sempre/nunca" para qualquer agente que contribuir. |
 | [`README-DEV-VPS.md`](README-DEV-VPS.md) | Ambiente de dev headless na VPS (core sem GUI). |
+| [`docs/onboarding/`](docs/onboarding/) | Prompts para integrar Hermes/Antigravity/DSH à memória compartilhada. |
 
 ## Status
 
