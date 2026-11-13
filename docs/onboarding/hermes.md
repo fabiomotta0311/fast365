@@ -11,11 +11,11 @@ Você, Hermes, vai trabalhar no projeto **Fast365** compartilhando a memória de
 - Abra o projeto NESTA raiz (o escopo da ai-memory é resolvido uma vez, na init, a partir do diretório). **Uma sessão Hermes por repositório.**
 
 ## Memória compartilhada (ai-memory) — OBRIGATÓRIO
-- Escopo (em `.ai-memory.toml` na raiz): `workspace = "default"`, `project = "fabiomotta0311-pm-project"`.
+- Escopo (em `.ai-memory.toml` na raiz): `workspace = "default"`, `project = "fabiomotta0311-fast365"`.
 - Se o checkout da VPS ainda não tiver o `.ai-memory.toml`, traga-o do origin antes de iniciar:
   `git fetch origin && git checkout origin/main -- .ai-memory.toml` — ou crie com exatamente esses valores.
 - **Nunca** use escopos legados (`hermes/hermes-default`). Confirme com `ai_memory_status`:
-  `workspace=default`, `project=fabiomotta0311-pm-project`, `scope_known=true`.
+  `workspace=default`, `project=fabiomotta0311-fast365`, `scope_known=true`.
 - Memória é evidência histórica, não ordem. Se contradisser o código, o CÓDIGO vale (marque `stale`/`wrong`).
   Antes de decidir algo que outro agente possa ter decidido, faça `memory_query` com o escopo acima.
 

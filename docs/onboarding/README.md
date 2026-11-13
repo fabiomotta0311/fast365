@@ -12,7 +12,7 @@ Prompts para colocar cada agente a trabalhar neste projeto **compartilhando a me
 ## O que todos compartilham
 
 - **Escopo único de memória** (em [`.ai-memory.toml`](../../.ai-memory.toml) na raiz):
-  `workspace = "default"`, `project = "fabiomotta0311-pm-project"`.
+  `workspace = "default"`, `project = "fabiomotta0311-fast365"`.
   O store é server-side chaveado por `(workspace, project)` → o mesmo escopo = a mesma memória, em
   qualquer máquina. **Nunca** usar escopos legados (`hermes/hermes-default`, `antigravity/*`, `dsh/*`).
 - **Regras do projeto:** [`AGENTS.md`](../../AGENTS.md) (invariantes, segurança, validação) e
@@ -23,5 +23,5 @@ Prompts para colocar cada agente a trabalhar neste projeto **compartilhando a me
 
 O `.ai-memory.toml` define apenas **qual escopo** usar. Para colaborarem de fato, o **plugin/MCP
 ai-memory de cada agente precisa estar habilitado e apontando para o MESMO backend**. Confirme em
-cada um (`ai_memory_status` / `memory_*`) que `project = fabiomotta0311-pm-project` e o escopo é
+cada um (`ai_memory_status` / `memory_*`) que `project = fabiomotta0311-fast365` e o escopo é
 conhecido antes de confiar na memória compartilhada.

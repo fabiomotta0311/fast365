@@ -11,7 +11,7 @@ Você é um dos três agentes (Hermes, Antigravity, DSH) que colaboram no projet
 - Se preferir um clone próprio: `git clone https://github.com/fabiomotta0311/fast365.git` e abra a raiz do clone (traz o `.ai-memory.toml` junto).
 
 ## Memória compartilhada (ai-memory) — OBRIGATÓRIO
-- Escopo compartilhado (em `.ai-memory.toml` na raiz): `workspace = "default"`, `project = "fabiomotta0311-pm-project"`.
+- Escopo compartilhado (em `.ai-memory.toml` na raiz): `workspace = "default"`, `project = "fabiomotta0311-fast365"`.
 - Em TODA chamada de memória de projeto use esse escopo. Se seu harness resolve pelo diretório, confirme que resolveu para esses valores; se as tools pedem escopo explícito (`memory_*`), passe `workspace` e `project` em TODA chamada.
 - **Nunca** use escopos legados `antigravity/*` nem `hermes/hermes-default`. Nunca faça chamada de projeto sem escopo.
 
@@ -42,4 +42,4 @@ cargo test --workspace
 - Login Microsoft e captura de sessão só nesta máquina Windows do dono. Nunca leve token/cookie/refresh/`.jwt`/`.har` para fora. Refresh só no keyring. Nenhum segredo em logs/diagnóstico.
 
 ## Confirmação (faça agora)
-- `ai_memory_status` (ou equivalente): `project=fabiomotta0311-pm-project`, `workspace=default`, escopo conhecido. Faça um `memory_query` curto para confirmar a leitura compartilhada.
+- `ai_memory_status` (ou equivalente): `project=fabiomotta0311-fast365`, `workspace=default`, escopo conhecido. Faça um `memory_query` curto para confirmar a leitura compartilhada.
