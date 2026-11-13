@@ -4,10 +4,16 @@
 //! Contrato central: o provider descreve uma OPERAÇÃO (`AuthOp`); a sessão a EXECUTA. O token é
 //! detalhe interno — nunca cruza a fronteira de crate.
 
+#[cfg(feature = "webview")]
+pub mod capture;
 pub mod clock;
+mod secret;
+pub mod session;
 pub mod transport;
+pub mod vault;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use secret::Secret;
 
 use async_trait::async_trait;
 use std::time::Duration;
