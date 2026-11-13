@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/f365-auth", "crates/f365-teams", "crates/f365-cli"]
+members = ["crates/f365-auth", "crates/f365-teams", "crates/f365-sync", "crates/f365-cli"]
 # storage/ui/outlook adicionados só nas respectivas fases (ver docs/ARQUITETURA.md)
 
 [workspace.package]

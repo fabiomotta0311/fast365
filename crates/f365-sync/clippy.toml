@@ -1,0 +1,8 @@
+# O motor recebe o tempo de fora (parâmetro `now` / `Clock` injetado). Ler o relógio de parede ou
+# dormir aqui quebraria os testes determinísticos — o CI roda clippy com -D warnings.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "use o `now` recebido ou um `Clock` injetado" },
+  { path = "std::time::SystemTime::now", reason = "use `Clock::utc_now` injetado" },
+  { path = "std::thread::sleep", reason = "o motor não espera; emite `Decision::ScheduleWake`" },
+  { path = "tokio::time::sleep", reason = "o motor não espera; emite `Decision::ScheduleWake`" },
+]

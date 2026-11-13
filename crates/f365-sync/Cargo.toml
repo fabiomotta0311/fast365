@@ -1,0 +1,13 @@
+[package]
+name = "f365-sync"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Fronteira do motor (docs/ARQUITETURA.md, Fase 2): NUNCA adicionar aqui rede (reqwest,
+# tokio-tungstenite), WebView (wry/tao), UI (tauri) nem storage. O teste
+# `boundary::manifest_has_no_io_dependencies` falha se isso acontecer.
+[dependencies]
+f365-auth = { path = "../f365-auth" }

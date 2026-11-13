@@ -109,6 +109,7 @@ fast365/
 └── crates/
     ├── f365-auth/                  # [Fase 0] executor autenticado: SSO, WebView, keyring, troca de tokens
     ├── f365-teams/                 # [Fase 0] provider Teams: chatsvcagg (REST) + Trouter (WS)
+    ├── f365-sync/                  # [Fase 0: fronteira · Fase 2: lógica] motor FSM sem I/O (Event → Decision)
     ├── f365-cli/                   # [Fase 0] binário `f365` — orquestra auth + teams
     ├── f365-storage/               # [Fase 2] placeholder — cache rusqlite + refresh em background
     ├── f365-ui/                    # [Fase 3] placeholder — shell Tauri v2
@@ -122,6 +123,7 @@ fast365/
 |----------------|------|------------------|------------|-------------|
 | `f365-auth`    | 0    | **Executor autenticado**: login `wry`, captura, `keyring`, refresh, troca de tokens; **executa operações** (token interno) | `wry`, `reqwest`, `keyring`, `tokio` | nada de Teams/Outlook — só `Resource` |
 | `f365-teams`   | 0    | Cadeia Skype/CSA, REST `chatsvcagg`, WS `Trouter` (descreve operações) | `f365-auth` (`AuthenticatedExecutor`) | `wry`, UI, storage, **tokens** |
+| `f365-sync`    | 0→2  | Motor de sync: FSM pura `handle(now, Event) -> Vec<Decision>`; reexporta `Clock` e `AuthenticatedExecutor` para o driver | `f365-auth` (só tipos) | rede, relógio de parede, WebView, UI, storage — garantido por teste do manifesto + `clippy.toml` |
 | `f365-cli`     | 0    | Binário `f365`, subcomandos, logging | `f365-auth`, `f365-teams`, `clap` | — |
 | `f365-storage` | 2    | SQLite WAL (fonte da verdade, offline-first) + busca FTS5 | `rusqlite` | UI |
 | `f365-ui`      | 3    | Shell Tauri v2 + UI React isolada do core por commands/events | `tauri`, `f365-*` via IPC | detalhes de rede |
