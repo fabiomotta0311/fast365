@@ -78,6 +78,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Testes (todas as features)
         run: cargo test --workspace --all-features --locked
+      - name: Verificar recurso de ícone do executável
+        run: |
+          cargo build -p f365-cli --features webview --locked
+          python crates/f365-cli/tests/windows_icon.py target/debug/f365.exe
 
   msrv:
     name: MSRV (rust-version do Cargo.toml)
