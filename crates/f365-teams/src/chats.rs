@@ -3,12 +3,14 @@
 //! O provider só **descreve** a operação; quem põe credencial, valida o host e escolhe a rota é o
 //! executor (`f365_auth::executor`).
 //!
-//! Contratos de protocolo (UNVERIFIED até o Checkpoint C rodar na conta do dono — ver #5):
-//! - `TEAMS-CSA-LIST-001`: `GET https://chatsvcagg.teams.microsoft.com/api/v1/teams/users/me` com o
-//!   token de `aud chatsvcagg` lista o que o usuário vê.
-//! - `TEAMS-CSA-SHAPE-001`: a resposta traz `chats[]` (`id`, `title` — nulo em 1:1 —, `chatType`) e
-//!   `teams[]` (`displayName`, `channels[]` com `id`/`displayName`). Leitura tolerante: campo ausente
-//!   vira valor padrão; só a falta das duas listas é tratada como contrato quebrado.
+//! Contratos. Evidência = Checkpoint C na conta do dono, 2026-11-13 (#10), via executor (#9):
+//! - `TEAMS-CSA-LIST-001` (VERIFIED): `GET https://chatsvcagg.teams.microsoft.com/api/v1/teams/users/me`
+//!   com o token de `aud chatsvcagg` → HTTP 200 com as conversas do usuário.
+//! - `TEAMS-CSA-SHAPE-001` (PARCIAL): VERIFIED `chats[]` com `id`, `title` (nulo em 1:1) e `chatType`
+//!   — valores vistos: `meeting` e `chat` (este vale para 1:1 **e** grupo). O 1:1 se reconhece pelo
+//!   id `…@unq.gbl.spaces`.
+//!   UNVERIFIED: `teams[].channels[]` (não apareceu nos primeiros itens). Leitura tolerante: campo
+//!   ausente vira valor padrão; só a falta das duas listas é tratada como contrato quebrado.
 
 use crate::TeamsError;
 use f365_auth::transport::HttpRequest;
@@ -19,6 +21,7 @@ use std::time::Duration;
 pub(crate) const LIST_URL: &str =
     "https://chatsvcagg.teams.microsoft.com/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true";
 const TIMEOUT: Duration = Duration::from_secs(30);
+const ONE_ON_ONE_SUFFIX: &str = "@unq.gbl.spaces";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationKind {
@@ -65,13 +68,14 @@ pub(crate) fn parse(body: &[u8]) -> Result<Vec<Conversation>, TeamsError> {
     for chat in chats.into_iter().flatten() {
         let Some(id) = text(chat, "id") else { continue };
         let chat_type = text(chat, "chatType").map(str::to_owned);
-        let title =
-            text(chat, "title")
-                .map(str::to_owned)
-                .unwrap_or_else(|| match chat_type.as_deref() {
-                    Some("oneOnOne") => "(conversa 1:1 sem título)".into(),
-                    _ => "(chat sem título)".into(),
-                });
+        // 1:1 se reconhece pelo id: o `chatType` vem `chat` também em grupo (TEAMS-CSA-SHAPE-001).
+        let title = text(chat, "title").map(str::to_owned).unwrap_or_else(|| {
+            if id.ends_with(ONE_ON_ONE_SUFFIX) {
+                "(conversa 1:1 sem título)".into()
+            } else {
+                "(chat sem título)".into()
+            }
+        });
         out.push(Conversation {
             id: id.to_owned(),
             title,
@@ -162,6 +166,32 @@ mod tests {
             got[2].kind,
             ConversationKind::Channel {
                 team: "Engenharia".into()
+            }
+        );
+    }
+
+    /// Visto no Checkpoint C: `chatType` é `chat` em 1:1 e em grupo; o 1:1 sem título se reconhece
+    /// pelo id.
+    #[test]
+    fn one_on_one_is_recognized_by_id_not_chat_type() {
+        let got = parse(&body(json!({"chats": [
+            {"id": "19:a_b@unq.gbl.spaces", "title": null, "chatType": "chat"},
+            {"id": "19:grupo@thread.v2", "title": null, "chatType": "chat"},
+            {"id": "19:meeting_x@thread.v2", "title": "Reunião", "chatType": "meeting"}
+        ]})))
+        .unwrap();
+        assert_eq!(got[0].title, "(conversa 1:1 sem título)");
+        assert_eq!(got[1].title, "(chat sem título)");
+        assert_eq!(
+            got[0].kind,
+            ConversationKind::Chat {
+                chat_type: Some("chat".into())
+            }
+        );
+        assert_eq!(
+            got[2].kind,
+            ConversationKind::Chat {
+                chat_type: Some("meeting".into())
             }
         );
     }
