@@ -2,13 +2,15 @@
 //! Ver `docs/ARQUITETURA.md` §2/§3.
 //!
 //! Consome `f365_auth::AuthenticatedExecutor` (descreve `AuthOp`, não vê token). Não conhece a
-//! WebView, a UI nem o storage. Organizado por capacidade: `chats/`, `send/`; depois `history/`,
-//! `realtime/`.
+//! WebView, a UI nem o storage. Organizado por capacidade: `chats/`, `send/`, `realtime/`; depois
+//! `history/`.
 
 pub mod chats;
+pub mod realtime;
 pub mod send;
 
 pub use chats::{Conversation, ConversationKind};
+pub use realtime::RealtimeEvent;
 pub use send::{new_client_message_id, SendReceipt};
 
 use f365_auth::{AuthenticatedExecutor, ExecError};
@@ -26,6 +28,9 @@ pub enum TeamsError {
     /// Entrada recusada antes de qualquer envio.
     #[error("entrada inválida: {0}")]
     InvalidInput(&'static str),
+    /// Falha do canal de tempo real (WebSocket/socket.io) — sem URL nem parâmetros assinados.
+    #[error("tempo real: {0}")]
+    Realtime(String),
 }
 
 /// Cliente do provider Teams.

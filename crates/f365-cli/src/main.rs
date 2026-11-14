@@ -8,6 +8,7 @@
 //!   f365 send    → POST chatsvcagg (E)
 
 mod chats_cmd;
+mod listen_cmd;
 mod send_cmd;
 mod session_cmd;
 mod token_cmd;
@@ -61,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Auth => session_cmd::auth()?,
         Command::Chats { top } => chats_cmd::chats(top).await?,
-        Command::Listen => todo!("Fase 0-C: Trouter WS, evento = invalidação (§2.3)"),
+        Command::Listen => listen_cmd::listen().await?,
         Command::Send { chat_id, text } => send_cmd::send(&chat_id, &text).await?,
         Command::Token { resource } => token_cmd::token(resource).await?,
         Command::Whoami { offline } => session_cmd::whoami(offline).await?,
