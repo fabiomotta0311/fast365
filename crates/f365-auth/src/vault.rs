@@ -33,8 +33,8 @@
 //! let _ = f365_auth::vault::Vault::keyring().load_session();
 //! ```
 //!
-//! Fora do Windows o `keyring` usa um store em memória: nada persiste — de propósito, segredo da
-//! conta não vai para VPS/CI (`AGENTS.md`).
+//! Fora do Windows não há keyring persistente: gravar falha com erro explícito e ler devolve "nunca
+//! pareado" — de propósito, segredo da conta não vai para VPS/CI (`AGENTS.md`).
 
 use crate::secret::Secret;
 use crate::session::{AccountInfo, CapturedSession, RefreshToken, SessionCookie};
@@ -68,35 +68,88 @@ pub(crate) trait SecretStore: Send + Sync {
     fn remove(&self, key: &str) -> Result<(), VaultError>;
 }
 
-/// Keyring do SO (`keyring` crate), serviço [`SERVICE`].
-pub(crate) struct KeyringStore;
+/// Keyring do SO. No Windows: Credential Manager via `windows-native-keyring-store`, com a
+/// configuração do keyring 3 (alvo `<chave>.<serviço>`, persistência `Enterprise`) — credenciais
+/// gravadas antes da migração continuam legíveis (`KEYRING-COMPAT-001`, VERIFIED 2026-11-13:
+/// sessão gravada pelo keyring 3 lida pelo código novo, `f365 whoami --offline` rodado pelo dono).
+///
+/// O store é passado explicitamente a cada credencial (sem store global de processo).
+#[cfg(windows)]
+pub(crate) struct KeyringStore {
+    service: &'static str,
+    store: Result<std::sync::Arc<windows_native_keyring_store::Store>, String>,
+}
 
+#[cfg(windows)]
 impl KeyringStore {
-    fn entry(key: &str) -> Result<keyring::Entry, VaultError> {
-        keyring::Entry::new(SERVICE, key).map_err(|e| VaultError::Store(e.to_string()))
+    pub(crate) fn new(service: &'static str) -> Self {
+        let store = windows_native_keyring_store::Store::new().map_err(|e| e.to_string());
+        Self { service, store }
+    }
+
+    fn entry(&self, key: &str) -> Result<keyring_core::Entry, VaultError> {
+        use keyring_core::api::CredentialStoreApi;
+        let store = self
+            .store
+            .as_ref()
+            .map_err(|e| VaultError::Store(e.clone()))?;
+        store
+            .build(self.service, key, None)
+            .map_err(|e| VaultError::Store(e.to_string()))
     }
 }
 
+#[cfg(windows)]
 impl SecretStore for KeyringStore {
     fn put(&self, key: &str, value: &[u8]) -> Result<(), VaultError> {
-        Self::entry(key)?
+        self.entry(key)?
             .set_secret(value)
             .map_err(|e| VaultError::Store(e.to_string()))
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, VaultError> {
-        match Self::entry(key)?.get_secret() {
+        match self.entry(key)?.get_secret() {
             Ok(v) => Ok(Some(v)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(e) => Err(VaultError::Store(e.to_string())),
         }
     }
 
     fn remove(&self, key: &str) -> Result<(), VaultError> {
-        match Self::entry(key)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        match self.entry(key)?.delete_credential() {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(e) => Err(VaultError::Store(e.to_string())),
         }
+    }
+}
+
+/// Fora do Windows não há keyring persistente **de propósito**: segredo da conta não vai para
+/// VPS/CI (`AGENTS.md`). Leitura = nunca pareado; gravação = erro explícito (nunca "finge" salvar).
+#[cfg(not(windows))]
+pub(crate) struct KeyringStore;
+
+#[cfg(not(windows))]
+impl KeyringStore {
+    pub(crate) fn new(_service: &'static str) -> Self {
+        Self
+    }
+}
+
+#[cfg(not(windows))]
+impl SecretStore for KeyringStore {
+    fn put(&self, _key: &str, _value: &[u8]) -> Result<(), VaultError> {
+        Err(VaultError::Store(
+            "não há keyring persistente fora do Windows: a sessão só é gravada na máquina do dono"
+                .into(),
+        ))
+    }
+
+    fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, VaultError> {
+        Ok(None)
+    }
+
+    fn remove(&self, _key: &str) -> Result<(), VaultError> {
+        Ok(())
     }
 }
 
@@ -193,7 +246,7 @@ pub struct Vault {
 
 impl Vault {
     pub fn keyring() -> Self {
-        Self::with_store(KeyringStore)
+        Self::with_store(KeyringStore::new(SERVICE))
     }
 
     pub(crate) fn with_store(store: impl SecretStore + 'static) -> Self {
@@ -685,14 +738,50 @@ mod tests {
         assert_eq!(v.active_account().unwrap(), None);
     }
 
-    /// Manual, no Windows: `cargo test -p f365-auth -- --ignored keyring_selftest` e depois
-    /// `cmdkey /list:selftest.fast365` em OUTRO processo — prova que não é o store em memória.
+    /// Serviço só de teste: os selftests NUNCA tocam nas credenciais `fast365` do dono (AGENTS.md).
+    #[cfg(windows)]
+    const SELFTEST_SERVICE: &str = "fast365-selftest";
+
+    /// Manual, no Windows, em DOIS processos (prova persistência real, não store em memória):
+    /// 1. `cargo test -p f365-auth -- --ignored keyring_selftest_write`
+    /// 2. `cmdkey /list:selftest.fast365-selftest` (outro programa vê a credencial)
+    /// 3. `cargo test -p f365-auth -- --ignored keyring_selftest_read_and_delete`
+    #[cfg(windows)]
     #[test]
     #[ignore = "toca o Credential Manager real"]
-    fn keyring_selftest() {
-        let store = KeyringStore;
-        let big = vec![b'x'; CHUNK];
-        store.put("selftest", &big).unwrap();
-        assert_eq!(store.get("selftest").unwrap(), Some(big));
+    fn keyring_selftest_write() {
+        let store = KeyringStore::new(SELFTEST_SERVICE);
+        store.put("selftest", &selftest_blob()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "toca o Credential Manager real; rodar depois de keyring_selftest_write"]
+    fn keyring_selftest_read_and_delete() {
+        let store = KeyringStore::new(SELFTEST_SERVICE);
+        assert_eq!(
+            store.get("selftest").unwrap(),
+            Some(selftest_blob()),
+            "gravado por outro processo"
+        );
+        store.remove("selftest").unwrap();
+        assert_eq!(store.get("selftest").unwrap(), None);
+    }
+
+    /// 2048 bytes binários (todos os valores de byte): pega truncamento e conversão UTF-16.
+    #[cfg(windows)]
+    fn selftest_blob() -> Vec<u8> {
+        (0..CHUNK).map(|i| (i % 256) as u8).collect()
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn no_persistent_keyring_outside_windows() {
+        let v = Vault::keyring();
+        assert_eq!(v.active_account().unwrap(), None);
+        assert!(matches!(
+            KeyringStore::new(SERVICE).put("k", b"v"),
+            Err(VaultError::Store(_))
+        ));
     }
 }
