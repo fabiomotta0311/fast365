@@ -8,6 +8,7 @@
 //!   f365 send    → POST chatsvcagg (E)
 
 mod chats_cmd;
+mod send_cmd;
 mod session_cmd;
 mod token_cmd;
 
@@ -35,7 +36,7 @@ enum Command {
     },
     /// Conecta no Trouter (WS) e imprime eventos de novas mensagens.
     Listen,
-    /// Envia uma mensagem de teste (POST chatsvcagg).
+    /// Envia texto puro para uma conversa (chat regional; id vem de `f365 chats`). Checkpoint E.
     Send { chat_id: String, text: String },
     /// Renova em silêncio (sem WebView) e imprime os claims do token — nunca o token (Checkpoint B).
     Token {
@@ -61,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Auth => session_cmd::auth()?,
         Command::Chats { top } => chats_cmd::chats(top).await?,
         Command::Listen => todo!("Fase 0-C: Trouter WS, evento = invalidação (§2.3)"),
-        Command::Send { .. } => todo!("Fase 0-D: POST chatsvcagg (§2.3)"),
+        Command::Send { chat_id, text } => send_cmd::send(&chat_id, &text).await?,
         Command::Token { resource } => token_cmd::token(resource).await?,
         Command::Whoami { offline } => session_cmd::whoami(offline).await?,
     }

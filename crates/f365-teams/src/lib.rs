@@ -2,12 +2,14 @@
 //! Ver `docs/ARQUITETURA.md` §2/§3.
 //!
 //! Consome `f365_auth::AuthenticatedExecutor` (descreve `AuthOp`, não vê token). Não conhece a
-//! WebView, a UI nem o storage. Organizado por capacidade: `chats/` (aqui), depois `history/`,
-//! `send/`, `realtime/`.
+//! WebView, a UI nem o storage. Organizado por capacidade: `chats/`, `send/`; depois `history/`,
+//! `realtime/`.
 
 pub mod chats;
+pub mod send;
 
 pub use chats::{Conversation, ConversationKind};
+pub use send::{new_client_message_id, SendReceipt};
 
 use f365_auth::{AuthenticatedExecutor, ExecError};
 use std::sync::Arc;
@@ -21,6 +23,9 @@ pub enum TeamsError {
     Http { service: &'static str, status: u16 },
     #[error("resposta inesperada — {0}")]
     Malformed(&'static str),
+    /// Entrada recusada antes de qualquer envio.
+    #[error("entrada inválida: {0}")]
+    InvalidInput(&'static str),
 }
 
 /// Cliente do provider Teams.
@@ -47,7 +52,27 @@ impl TeamsClient {
         Ok(all)
     }
 
-    // Próximos: history / send / listen montam `AuthOp` e chamam `exec.execute(..)`. Ver §2.3.
+    /// Envia `text` (texto puro) para a conversa. `client_message_id` vem de quem chama
+    /// ([`new_client_message_id`]), gerado ANTES: se der erro de rede/prazo, o resultado é
+    /// desconhecido e essa é a chave para conferir — nunca reenviar às cegas.
+    pub async fn send_text(
+        &self,
+        chat_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<SendReceipt, TeamsError> {
+        let op = send::send_op(chat_id, text, client_message_id)?;
+        let resp = self.exec.execute(op).await?;
+        if !(200..300).contains(&resp.status) {
+            return Err(TeamsError::Http {
+                service: "chat regional",
+                status: resp.status,
+            });
+        }
+        Ok(send::receipt(&resp, client_message_id))
+    }
+
+    // Próximos: history / listen montam `AuthOp` e chamam `exec.execute(..)`. Ver §2.3.
     // Evento do Trouter = invalidação → buscar conteúdo fresco via REST (§2.3).
 }
 
@@ -127,6 +152,34 @@ mod tests {
                 status: 404
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn send_goes_through_the_executor_once_and_returns_receipt() {
+        let exec = FakeExec::replying(Ok(HttpResponse {
+            status: 201,
+            headers: vec![],
+            body: br#"{"OriginalArrivalTime": 42}"#.to_vec(),
+        }));
+        let r = TeamsClient::new(exec.clone())
+            .send_text("19:a@thread.v2", "oi", "1234567890123456789")
+            .await
+            .unwrap();
+        assert_eq!(r.server_message_id.as_deref(), Some("42"));
+        let ops = exec.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(!ops[0].idempotent);
+    }
+
+    #[tokio::test]
+    async fn invalid_send_never_reaches_the_executor() {
+        let exec = FakeExec::replying(Err(ExecError::NotPaired));
+        let err = TeamsClient::new(exec.clone())
+            .send_text("19:a/../x", "oi", "1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TeamsError::InvalidInput(_)));
+        assert!(exec.ops.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

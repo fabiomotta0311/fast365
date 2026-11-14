@@ -16,9 +16,9 @@
 //! injetada nunca vaza token para outro destino.
 //!
 //! Contratos de protocolo:
-//! - `EXEC-SCHEME-001` (PARCIAL): VERIFIED no Checkpoint C (#10) que o `chatsvcagg` aceita
-//!   `Authorization: Bearer <aud chatsvcagg>`. UNVERIFIED: o chat regional aceitar
-//!   `Authentication: skypetoken=<skype token>` — verificar no #11/#12.
+//! - `EXEC-SCHEME-001` (VERIFIED): `chatsvcagg` aceita `Authorization: Bearer <aud chatsvcagg>`
+//!   (Checkpoint C, #10); o chat regional aceita `Authentication: skypetoken=<skype token>`
+//!   (Checkpoint E, #12).
 //! - `EXEC-HOST-001` (VERIFIED): o agregador REST fica em `chatsvcagg.teams.microsoft.com` (Checkpoint
 //!   C, #10); o chat regional, no host de `regionGtms.chatService` (#8: `amer.ng.msg.teams.microsoft.com`).
 //! - `EXEC-CHALLENGE-001` (UNVERIFIED): desafio de Conditional Access chega como 401 com
@@ -106,6 +106,28 @@ fn redact_query(url: &str) -> String {
     url.split(['?', '#']).next().unwrap_or_default().to_owned()
 }
 
+/// Chat regional: o provider pode mandar só o **caminho** (`/v1/...`) e o executor completa com o
+/// host descoberto no authsvc (o provider não precisa saber a região). URL absoluta também vale,
+/// desde que seja exatamente esse host.
+fn chat_url(op: &AuthOp, chat_service: &str) -> Result<String, ExecError> {
+    let base = url::Url::parse(chat_service)
+        .ok()
+        .filter(|u| {
+            u.host_str()
+                .is_some_and(|h| h.ends_with(CHAT_SERVICE_SUFFIX))
+        })
+        .ok_or_else(|| ExecError::Auth("authsvc devolveu um chatService inesperado".into()))?;
+    let regional = base.host_str().unwrap_or_default().to_owned();
+    let path = &op.request.url;
+    let url = if path.starts_with('/') && !path.starts_with("//") {
+        format!("{}{path}", chat_service.trim_end_matches('/'))
+    } else {
+        path.clone()
+    };
+    require_host(op.resource, &url, |h| h == regional)?;
+    Ok(url)
+}
+
 impl SessionExecutor {
     pub fn new(
         broker: Arc<TokenBroker>,
@@ -180,10 +202,11 @@ impl SessionExecutor {
         let transport = self.in_page.as_ref().ok_or(ExecError::RouteUnavailable(
             "InPage (fetch na WebView parqueada) ainda não implementada",
         ))?;
-        self.check_host(op).await?;
+        let mut req = op.request.clone();
+        req.url = self.resolve_url(op).await?;
         // Sem credencial nossa: dentro da página quem autentica é o contexto genuíno do cliente.
         let resp = transport
-            .send(op.request.clone())
+            .send(req)
             .await
             .map_err(|e| ExecError::Transport(e.to_string()))?;
         match classify(&resp) {
@@ -195,28 +218,21 @@ impl SessionExecutor {
         }
     }
 
-    async fn check_host(&self, op: &AuthOp) -> Result<(), ExecError> {
+    /// URL final validada do recurso (sem anexar credencial) — usada pela rota InPage.
+    async fn resolve_url(&self, op: &AuthOp) -> Result<String, ExecError> {
         match op.resource {
             Resource::ChatSvcAgg => {
-                require_host(op.resource, &op.request.url, |h| h == CHATSVCAGG_HOST)
+                require_host(op.resource, &op.request.url, |h| h == CHATSVCAGG_HOST)?;
+                Ok(op.request.url.clone())
             }
             Resource::ChatService => {
                 let skype = self.broker.skype_token().await.map_err(token_error)?;
-                self.require_chat_host(op, &skype.endpoint.chat_service)
+                chat_url(op, &skype.endpoint.chat_service)
             }
             Resource::OutlookSubstrate => {
                 Err(ExecError::RouteUnavailable("Outlook/Substrate (Fase 4)"))
             }
         }
-    }
-
-    fn require_chat_host(&self, op: &AuthOp, chat_service: &str) -> Result<(), ExecError> {
-        let regional = url::Url::parse(chat_service)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .filter(|h| h.ends_with(CHAT_SERVICE_SUFFIX))
-            .ok_or_else(|| ExecError::Auth("authsvc devolveu um chatService inesperado".into()))?;
-        require_host(op.resource, &op.request.url, |h| h == regional)
     }
 
     /// Valida o destino ANTES de obter/anexar a credencial do recurso.
@@ -237,7 +253,7 @@ impl SessionExecutor {
             }
             Resource::ChatService => {
                 let skype = self.broker.skype_token().await.map_err(token_error)?;
-                self.require_chat_host(op, &skype.endpoint.chat_service)?;
+                req.url = chat_url(op, &skype.endpoint.chat_service)?;
                 req.headers.push((
                     "Authentication".into(),
                     format!("skypetoken={}", skype.secret.expose()),
@@ -681,6 +697,57 @@ mod tests {
                 .unwrap()
                 .status,
             404
+        );
+    }
+
+    /// O provider manda só o caminho; o executor completa com o host regional do authsvc.
+    #[tokio::test]
+    async fn relative_chat_path_is_completed_with_the_regional_host() {
+        let api = FakeApi::script(vec![Step::Status(201, vec![])]);
+        let h = harness(api.clone(), None);
+        let o = op(
+            Resource::ChatService,
+            "/v1/users/ME/conversations/19:x@thread.v2/messages",
+        );
+        h.exec.execute(o).await.unwrap();
+        let sent = api.seen();
+        assert_eq!(
+            sent[0].url,
+            "https://amer.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:x@thread.v2/messages"
+        );
+        assert_eq!(
+            header(&sent[0], "Authentication"),
+            Some("skypetoken=skype-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_relative_or_misplaced_relative_urls_are_refused() {
+        for (resource, url) in [
+            (Resource::ChatService, "//evil.example/v1/x"),
+            (Resource::ChatSvcAgg, "/api/v1/teams/users/me"),
+        ] {
+            let api = FakeApi::script(vec![]);
+            let h = harness(api.clone(), None);
+            let err = h.exec.execute(op(resource, url)).await.unwrap_err();
+            assert!(
+                matches!(err, ExecError::HostNotAllowed { .. }),
+                "{url}: {err:?}"
+            );
+            assert!(api.seen().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn in_page_receives_the_resolved_chat_url() {
+        let page = FakeApi::script(vec![Step::Status(200, vec![])]);
+        let h = harness(FakeApi::script(vec![]), Some(page.clone()));
+        let mut o = op(Resource::ChatService, "/v1/users/ME/properties");
+        o.needs_page_context = true;
+        h.exec.execute(o).await.unwrap();
+        assert_eq!(
+            page.seen()[0].url,
+            "https://amer.ng.msg.teams.microsoft.com/v1/users/ME/properties"
         );
     }
 
