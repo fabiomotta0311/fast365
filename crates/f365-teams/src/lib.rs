@@ -36,11 +36,17 @@ pub enum TeamsError {
 /// Cliente do provider Teams.
 pub struct TeamsClient {
     exec: Arc<dyn AuthenticatedExecutor>,
+    #[cfg(test)]
+    realtime_test_url: Option<String>,
 }
 
 impl TeamsClient {
     pub fn new(exec: Arc<dyn AuthenticatedExecutor>) -> Self {
-        Self { exec }
+        Self {
+            exec,
+            #[cfg(test)]
+            realtime_test_url: None,
+        }
     }
 
     /// Conversas e canais visíveis para o usuário (no máximo `top`, na ordem da API).

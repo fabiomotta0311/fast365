@@ -112,15 +112,17 @@ impl TeamsClient {
             ))?;
 
         on_event(RealtimeEvent::Step("3/4 WebSocket"));
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(trouter::ws_url(&info, &hs.session_id, &epid))
-                .await
-                .map_err(|e| {
-                    TeamsError::Realtime(format!(
-                        "WebSocket recusado: {} (TROUTER-WS-001)",
-                        ws_error_kind(&e)
-                    ))
-                })?;
+        let ws_url = trouter::ws_url(&info, &hs.session_id, &epid);
+        #[cfg(test)]
+        let ws_url = self.realtime_test_url.clone().unwrap_or(ws_url);
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
+            .await
+            .map_err(|e| {
+                TeamsError::Realtime(format!(
+                    "WebSocket recusado: {} (TROUTER-WS-001)",
+                    ws_error_kind(&e)
+                ))
+            })?;
         await_connect(&mut ws, clock).await?;
 
         on_event(RealtimeEvent::Step("4/4 registro do endpoint"));
@@ -282,6 +284,126 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, connect_async};
+
+    #[tokio::test]
+    async fn listen_retries_ready_error_sessions_and_stops_at_failure_limit() {
+        use async_trait::async_trait;
+        use f365_auth::{AuthOp, AuthenticatedExecutor, ExecError};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::SystemTime;
+
+        struct ScriptedExec(AtomicUsize);
+        #[async_trait]
+        impl AuthenticatedExecutor for ScriptedExec {
+            async fn execute(&self, op: AuthOp) -> Result<HttpResponse, ExecError> {
+                let call = self.0.fetch_add(1, Ordering::SeqCst);
+                // Two complete sessions separated by two failed connection requests,
+                // followed by eight failed requests; the last reaches the limit.
+                let (status, body) = match call {
+                    0 | 5 => (
+                        200,
+                        r#"{"socketio":"https://test.trouter.teams.microsoft.com/","surl":"synthetic","connectparams":{}}"#,
+                    ),
+                    1 | 6 => (200, "sid:40:60:websocket"),
+                    2 | 7 => (200, "{}"),
+                    3 | 4 | 8..=15 => (503, ""),
+                    _ => panic!("unexpected request {call}"),
+                };
+                assert_eq!(op.resource, f365_auth::Resource::Trouter);
+                Ok(HttpResponse {
+                    status,
+                    headers: vec![],
+                    body: body.as_bytes().to_vec(),
+                })
+            }
+        }
+        #[derive(Default)]
+        struct RetryClock(Mutex<Vec<Duration>>, AtomicBool);
+        #[async_trait]
+        impl Clock for RetryClock {
+            fn now(&self) -> Instant {
+                Instant::now()
+            }
+            fn utc_now(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+            }
+            async fn sleep(&self, duration: Duration) {
+                // Confirmation and keep-alive are driven by the local socket instead.
+                if self.1.swap(false, Ordering::SeqCst) {
+                    self.0.lock().unwrap().push(duration);
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(tcp).await.unwrap();
+                ws.send(Message::text("1::")).await.unwrap();
+                ws.send(Message::text("7:::error")).await.unwrap();
+            }
+        });
+        let exec = Arc::new(ScriptedExec(AtomicUsize::new(0)));
+        let mut client = TeamsClient::new(exec.clone());
+        client.realtime_test_url = Some(url);
+        let clock = RetryClock::default();
+        let mut events = Vec::new();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.listen(&clock, &mut |event| {
+                if matches!(event, RealtimeEvent::Reconnecting { .. }) {
+                    clock.1.store(true, Ordering::SeqCst);
+                }
+                events.push(event)
+            }),
+        )
+        .await
+        .expect("listen must terminate")
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(err, TeamsError::Http { status: 503, .. }));
+        assert_eq!(exec.0.load(Ordering::SeqCst), 16);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| **e == RealtimeEvent::Ready)
+                .count(),
+            2
+        );
+        let retries: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RealtimeEvent::Reconnecting { attempt, after } => Some((*attempt, after.as_secs())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            retries,
+            [
+                (1, 2),
+                (2, 4),
+                (3, 8),
+                (1, 2),
+                (2, 4),
+                (3, 8),
+                (4, 16),
+                (5, 32),
+                (6, 60),
+                (7, 60),
+                (8, 60)
+            ]
+        );
+        assert_eq!(
+            *clock.0.lock().unwrap(),
+            retries
+                .iter()
+                .map(|(_, secs)| Duration::from_secs(*secs))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn retry_count_resets_after_ready_even_when_session_errors() {
