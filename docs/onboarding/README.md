@@ -18,6 +18,9 @@ Prompts para colocar cada agente a trabalhar neste projeto **compartilhando a me
 - **Regras do projeto:** [`AGENTS.md`](../../AGENTS.md) (invariantes, segurança, validação) e
   [`docs/ARQUITETURA.md`](../ARQUITETURA.md) (o porquê).
 - **Trabalho em Issues** com label `ai-ready` sem `blocked` pendente (roadmap no README do repo).
+- **Limites de agente** (seção "Agentes: sandbox, sessão do dono e revisão" do `AGENTS.md`): agente
+  nunca abre a janela de login nem toca no perfil WebView2/keyring do dono; teste de WebView dentro
+  de sandbox dá falso negativo; revisor só comenta, nunca faz merge/push.
 
 ## Pré-requisito que o prompt NÃO resolve
 

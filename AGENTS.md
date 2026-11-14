@@ -27,6 +27,26 @@ preferências gerais. Decisões e o "porquê" vivem em [`docs/ARQUITETURA.md`](d
   mensagem, token, cookie ou URL assinada). Captura de conteúdo é modo separado e explícito.
 - Engenharia reversa só com a sessão do próprio dono; respeitar o uso aceitável do tenant.
 
+## Agentes: sandbox, sessão do dono e revisão
+Vale para **qualquer** agente (Claude, GPT/Codex, Hermes, Antigravity, DSH), inclusive em revisão.
+- **Login/captura só pelo dono, fora de sandbox.** `f365 auth` (e tudo que abre a janela WebView2)
+  roda **somente** num Windows PowerShell normal aberto pelo dono — nunca no terminal/shell de um
+  agente nem no painel de terminal de app de agente. Agente **nunca** abre a janela de login.
+- **Teste de WebView/login dentro de sandbox não vale como evidência.** Sem escrita no `AppData`, o
+  WebView2 dá **falso negativo**: tela branca que não fecha, `ERROR_BUSY` (`0x800700AA`) ou
+  "Acesso negado (os error 5)" — com o perfil intacto (incidente de 2026-11-13). Antes de concluir
+  "perfil quebrado" ou "versão X regrediu", reproduzir fora do sandbox.
+- **Nunca** ler, listar, copiar ou alterar `%LOCALAPPDATA%\fast365\` (perfil WebView2 com cookies de
+  sessão) nem credenciais do serviço `fast365` no Credential Manager. Comandos que só **leem a conta
+  ou trocam tokens** (`f365 whoami`, `f365 token`) exigem pedido explícito do dono na conversa; a
+  saída deles nunca contém token.
+- **Nunca** alterar permissões (ACL) fora do repositório nem conceder ao próprio sandbox acesso a
+  `AppData`, `%USERPROFILE%` ou perfis de navegador. Se o sandbox exigir isso, **pare e peça ao dono**.
+- **Revisor só revisa.** A saída de uma revisão é o parecer (comentário no PR). Revisor **nunca** faz
+  merge, push, rebase, fecha/reabre PR ou Issue, nem altera branch alheia; quem aplica é o agente
+  implementador, com aval do dono. Testes de revisão só com dados sintéticos, em clone isolado.
+- Todo relatório diz explicitamente **o que não foi verificado** e por quê (ex.: "não rodei o login").
+
 ## Convenções de código (AI-Native)
 - **Vertical slices por capacidade** dentro dos providers; maximizar localidade de contexto.
 - **Abstração só existe se** reduz acoplamento ou melhora testabilidade. Sem scaffolding antecipado;
