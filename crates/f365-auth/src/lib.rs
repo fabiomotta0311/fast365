@@ -36,6 +36,9 @@ pub enum Resource {
     /// Serviço de chat regional (`<região>.ng.msg.teams.microsoft.com`, descoberto no authsvc):
     /// skype token.
     ChatService,
+    /// Tempo real (Trouter): skype token no cabeçalho `X-Skypetoken`, só para `*.trouter.teams.
+    /// microsoft.com` e o registrador `teams.microsoft.com/registrar/…`.
+    Trouter,
     /// Placeholder Fase 4 — OWA/Substrate.
     OutlookSubstrate,
 }

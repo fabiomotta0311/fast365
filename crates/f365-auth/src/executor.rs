@@ -21,6 +21,9 @@
 //!   (Checkpoint E, #12).
 //! - `EXEC-HOST-001` (VERIFIED): o agregador REST fica em `chatsvcagg.teams.microsoft.com` (Checkpoint
 //!   C, #10); o chat regional, no host de `regionGtms.chatService` (#8: `amer.ng.msg.teams.microsoft.com`).
+//! - `TROUTER-AUTH-001` (VERIFIED no Checkpoint D, #11): as chamadas HTTP do Trouter (dados de conexão, handshake
+//!   socket.io, registrador) aceitam o skype token em `X-Skypetoken`. Hosts: `go.trouter…`, o host
+//!   `*.trouter.teams.microsoft.com` devolvido por ele, e os registradores (só em `/registrar/…`).
 //! - `EXEC-CHALLENGE-001` (UNVERIFIED): desafio de Conditional Access chega como 401 com
 //!   `WWW-Authenticate` contendo `claims`/`insufficient_claims`/`interaction_required`.
 
@@ -32,6 +35,11 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 const CHATSVCAGG_HOST: &str = "chatsvcagg.teams.microsoft.com";
+const TROUTER_SUFFIX: &str = ".trouter.teams.microsoft.com";
+/// Registradores: o legado do prior art e o que o Trouter informa hoje em `registrarUrl`
+/// (VERIFIED no Checkpoint D, 2026-11-14: `communications.svc.cloud.microsoft/registrar/<região>/v3`).
+const REGISTRAR_HOSTS: [&str; 2] = ["teams.microsoft.com", "communications.svc.cloud.microsoft"];
+const REGISTRAR_PATH: &str = "/registrar/";
 /// Sufixo exigido do host regional devolvido pelo authsvc (defesa contra resposta inesperada).
 const CHAT_SERVICE_SUFFIX: &str = ".teams.microsoft.com";
 /// Cabeçalhos que só o executor põe; um `AuthOp` trazendo algum deles é bug do provider.
@@ -104,6 +112,29 @@ fn require_host(
 /// Para mensagens de erro: a query pode carregar ids ou tokens de terceiros.
 fn redact_query(url: &str) -> String {
     url.split(['?', '#']).next().unwrap_or_default().to_owned()
+}
+
+/// Trouter: HTTPS nos hosts do Trouter, ou o registrador — mesmo host do Teams, mas só no caminho
+/// `/registrar/` (o resto de `teams.microsoft.com` não recebe o skype token).
+fn trouter_url(op: &AuthOp) -> Result<String, ExecError> {
+    let url = &op.request.url;
+    require_host(op.resource, url, |h| {
+        h.ends_with(TROUTER_SUFFIX) || REGISTRAR_HOSTS.contains(&h)
+    })?;
+    let parsed = url::Url::parse(url).map_err(|_| ExecError::HostNotAllowed {
+        resource: op.resource,
+        url: redact_query(url),
+    })?;
+    let registrar_host = parsed
+        .host_str()
+        .is_some_and(|h| REGISTRAR_HOSTS.contains(&h));
+    if registrar_host && !parsed.path().starts_with(REGISTRAR_PATH) {
+        return Err(ExecError::HostNotAllowed {
+            resource: op.resource,
+            url: redact_query(url),
+        });
+    }
+    Ok(url.clone())
 }
 
 /// Chat regional: o provider pode mandar só o **caminho** (`/v1/...`) e o executor completa com o
@@ -229,6 +260,7 @@ impl SessionExecutor {
                 let skype = self.broker.skype_token().await.map_err(token_error)?;
                 chat_url(op, &skype.endpoint.chat_service)
             }
+            Resource::Trouter => trouter_url(op),
             Resource::OutlookSubstrate => {
                 Err(ExecError::RouteUnavailable("Outlook/Substrate (Fase 4)"))
             }
@@ -259,6 +291,12 @@ impl SessionExecutor {
                     format!("skypetoken={}", skype.secret.expose()),
                 ));
             }
+            Resource::Trouter => {
+                req.url = trouter_url(op)?;
+                let skype = self.broker.skype_token().await.map_err(token_error)?;
+                req.headers
+                    .push(("X-Skypetoken".into(), skype.secret.expose().to_owned()));
+            }
             Resource::OutlookSubstrate => {
                 return Err(ExecError::RouteUnavailable("Outlook/Substrate (Fase 4)"));
             }
@@ -273,7 +311,7 @@ impl SessionExecutor {
                     .invalidate_access(TokenResource::ChatSvcAgg)
                     .await
             }
-            Resource::ChatService => self.broker.invalidate_skype().await,
+            Resource::ChatService | Resource::Trouter => self.broker.invalidate_skype().await,
             Resource::OutlookSubstrate => {}
         }
     }
@@ -749,6 +787,46 @@ mod tests {
             page.seen()[0].url,
             "https://amer.ng.msg.teams.microsoft.com/v1/users/ME/properties"
         );
+    }
+
+    #[tokio::test]
+    async fn trouter_gets_x_skypetoken_only_on_trouter_hosts_and_registrar_path() {
+        for url in [
+            "https://go.trouter.teams.microsoft.com/v4/a?epid=1",
+            "https://pub-ent-brso-07-t.trouter.teams.microsoft.com/socket.io/1/?v=v4",
+            "https://teams.microsoft.com/registrar/prod/V2/registrations",
+            "https://communications.svc.cloud.microsoft/registrar/noam/v3/registrations",
+        ] {
+            let api = FakeApi::script(vec![Step::Status(200, vec![])]);
+            let h = harness(api.clone(), None);
+            h.exec.execute(op(Resource::Trouter, url)).await.unwrap();
+            assert_eq!(
+                header(&api.seen()[0], "X-Skypetoken"),
+                Some("skype-1"),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://teams.microsoft.com/api/mt/amer/beta/users",
+            "https://communications.svc.cloud.microsoft/api/outra-coisa",
+            "https://evil.svc.cloud.microsoft/registrar/x",
+            "https://trouter.teams.microsoft.com.evil.com/x",
+            "https://evil.example/registrar/prod",
+            "http://go.trouter.teams.microsoft.com/v4/a",
+        ] {
+            let api = FakeApi::script(vec![]);
+            let h = harness(api.clone(), None);
+            let err = h
+                .exec
+                .execute(op(Resource::Trouter, url))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ExecError::HostNotAllowed { .. }),
+                "{url}: {err:?}"
+            );
+            assert!(api.seen().is_empty(), "{url}");
+        }
     }
 
     #[tokio::test]

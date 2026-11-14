@@ -20,3 +20,6 @@ url.workspace = true
 async-trait.workspace = true
 uuid = { version = "1", features = ["v4"] }     # messageId / clientmessageid
 futures-util = "0.3"                             # streams do WS
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
