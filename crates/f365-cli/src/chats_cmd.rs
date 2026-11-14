@@ -7,14 +7,18 @@ use f365_auth::SystemClock;
 use f365_teams::{ConversationKind, TeamsClient};
 use std::sync::Arc;
 
-pub async fn chats(top: usize) -> anyhow::Result<()> {
-    let exec = SessionExecutor::new(
+/// Executor da sessão salva: rota Rust; a InPage ainda não existe (ver #9).
+pub fn executor() -> anyhow::Result<SessionExecutor> {
+    Ok(SessionExecutor::new(
         Arc::new(crate::token_cmd::broker()?),
         Arc::new(RustTransport::new()?),
-        None, // rota InPage ainda não existe (ver #9)
+        None,
         Arc::new(SystemClock),
-    );
-    let conversations = TeamsClient::new(Arc::new(exec))
+    ))
+}
+
+pub async fn chats(top: usize) -> anyhow::Result<()> {
+    let conversations = TeamsClient::new(Arc::new(executor()?))
         .list_conversations(top)
         .await?;
 
