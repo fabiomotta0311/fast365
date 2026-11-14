@@ -81,7 +81,6 @@ pub(crate) struct AccessToken {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SkypeToken {
-    #[allow(dead_code)] // consumidor: executor (#9) — Trouter e chatsvc
     pub secret: Secret,
     valid_until: Instant,
     pub endpoint: ChatEndpoint,
@@ -165,6 +164,16 @@ impl TokenBroker {
         let token = self.redeem(resource).await?;
         cache.access.insert(resource, token.clone());
         Ok(token)
+    }
+
+    /// Descarta o access token em cache (o servidor o recusou com 401): o próximo uso resgata outro.
+    pub(crate) async fn invalidate_access(&self, resource: TokenResource) {
+        self.cache.lock().await.access.remove(&resource);
+    }
+
+    /// Descarta o skype token em cache (recusado pelo serviço de chat).
+    pub(crate) async fn invalidate_skype(&self) {
+        self.cache.lock().await.skype = None;
     }
 
     pub(crate) async fn skype_token(&self) -> Result<SkypeToken, TokenError> {

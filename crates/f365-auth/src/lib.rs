@@ -7,6 +7,7 @@
 #[cfg(feature = "webview")]
 pub mod capture;
 pub mod clock;
+pub mod executor;
 // Política de captura e parser de sessão só têm consumidor com a WebView (e nos testes).
 #[cfg_attr(not(feature = "webview"), allow(dead_code))]
 mod probe;
@@ -26,11 +27,15 @@ use async_trait::async_trait;
 use std::time::Duration;
 use transport::{HttpRequest, HttpResponse};
 
-/// Resource/autorização que a operação exige (o `aud` interno).
+/// Autorização que a operação exige. Cada uma tem um esquema de credencial e os hosts para onde
+/// ela pode ir — o executor recusa qualquer outro (ver `executor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resource {
-    /// Tokens de chat/skype do Teams (`chatsvcagg` + Trouter).
-    TeamsChatSvc,
+    /// Agregador REST de conversas: `Authorization: Bearer` (aud `chatsvcagg.teams.microsoft.com`).
+    ChatSvcAgg,
+    /// Serviço de chat regional (`<região>.ng.msg.teams.microsoft.com`, descoberto no authsvc):
+    /// skype token.
+    ChatService,
     /// Placeholder Fase 4 — OWA/Substrate.
     OutlookSubstrate,
 }
@@ -56,8 +61,16 @@ pub enum ExecError {
     NotPaired,
     #[error("falha de autenticação: {0}")]
     Auth(String),
-    #[error("falha de transporte: {0}")]
+    /// Erro de rede: o efeito no servidor é **desconhecido** — nunca repetido automaticamente.
+    #[error("falha de transporte (resultado desconhecido): {0}")]
     Transport(String),
+    #[error("rota indisponível: {0}")]
+    RouteUnavailable(&'static str),
+    /// O destino não é um host permitido para a credencial do recurso: nada foi enviado.
+    #[error("host não permitido para {resource:?}: {url}")]
+    HostNotAllowed { resource: Resource, url: String },
+    #[error("operação excedeu o prazo de {0:?} (resultado desconhecido)")]
+    TimedOut(Duration),
 }
 
 /// Contrato central do core: executa uma operação autenticada, resolvendo auth + rota de transporte
