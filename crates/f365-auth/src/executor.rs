@@ -16,10 +16,11 @@
 //! injetada nunca vaza token para outro destino.
 //!
 //! Contratos de protocolo:
-//! - `EXEC-SCHEME-001` (UNVERIFIED): `chatsvcagg` aceita `Authorization: Bearer <aud chatsvcagg>`; o
-//!   serviço de chat regional aceita `Authentication: skypetoken=<skype token>`. Verificar no #10/#11.
-//! - `EXEC-HOST-001` (UNVERIFIED): o agregador REST fica em `chatsvcagg.teams.microsoft.com`; o chat
-//!   regional, no host de `regionGtms.chatService` (VERIFIED no #8: `amer.ng.msg.teams.microsoft.com`).
+//! - `EXEC-SCHEME-001` (PARCIAL): VERIFIED no Checkpoint C (#10) que o `chatsvcagg` aceita
+//!   `Authorization: Bearer <aud chatsvcagg>`. UNVERIFIED: o chat regional aceitar
+//!   `Authentication: skypetoken=<skype token>` — verificar no #11/#12.
+//! - `EXEC-HOST-001` (VERIFIED): o agregador REST fica em `chatsvcagg.teams.microsoft.com` (Checkpoint
+//!   C, #10); o chat regional, no host de `regionGtms.chatService` (#8: `amer.ng.msg.teams.microsoft.com`).
 //! - `EXEC-CHALLENGE-001` (UNVERIFIED): desafio de Conditional Access chega como 401 com
 //!   `WWW-Authenticate` contendo `claims`/`insufficient_claims`/`interaction_required`.
 
