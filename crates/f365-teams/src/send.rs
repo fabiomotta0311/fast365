@@ -7,13 +7,16 @@
 //! prazo), quem chamou ainda tem a chave para reconciliar sem reenviar (`SEND-RECONCILE-001`). O
 //! envio **não** é idempotente — o executor nunca o repete.
 //!
-//! Contratos de protocolo (UNVERIFIED até o Checkpoint E — ver #5):
-//! - `SEND-PATH-001`: `POST /v1/users/ME/conversations/{id}/messages` no chat regional.
-//! - `SEND-BODY-001`: corpo `{content, messagetype: "Text", contenttype: "text", clientmessageid}`.
-//!   Texto puro de propósito: `RichText/Html` exigiria escapar HTML (risco de injeção).
-//! - `SEND-CLIENTMSGID-001`: `clientmessageid` numérico em texto (como o cliente web gera).
-//! - `SEND-RESPONSE-001`: `201` com o id da mensagem no fim do `Location` ou em
-//!   `OriginalArrivalTime` no corpo.
+//! Contratos. Evidência = Checkpoint E na conta do dono, 2026-11-13 23:55 (#12): mensagem enviada
+//! pelo `f365 send` apareceu **uma vez** no Teams oficial.
+//! - `SEND-PATH-001` (VERIFIED): `POST /v1/users/ME/conversations/{id}/messages` no chat regional.
+//!   O chat do usuário consigo mesmo tem id `48:notes` (não aparece no agregador).
+//! - `SEND-BODY-001` (VERIFIED): corpo `{content, messagetype: "Text", contenttype: "text",
+//!   clientmessageid}`. Texto puro de propósito: `RichText/Html` exigiria escapar HTML (injeção).
+//! - `SEND-CLIENTMSGID-001` (VERIFIED): `clientmessageid` numérico de 19 dígitos aceito.
+//! - `SEND-RESPONSE-001` (PARCIAL): VERIFIED que vem um id numérico = horário de chegada em ms
+//!   (bateu com o horário exibido no Teams). UNVERIFIED se veio do `Location` ou do corpo — o
+//!   parser aceita os dois.
 
 use crate::TeamsError;
 use f365_auth::transport::{HttpRequest, HttpResponse};
