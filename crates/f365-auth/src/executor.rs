@@ -21,9 +21,9 @@
 //!   (Checkpoint E, #12).
 //! - `EXEC-HOST-001` (VERIFIED): o agregador REST fica em `chatsvcagg.teams.microsoft.com` (Checkpoint
 //!   C, #10); o chat regional, no host de `regionGtms.chatService` (#8: `amer.ng.msg.teams.microsoft.com`).
-//! - `TROUTER-AUTH-001` (UNVERIFIED): as chamadas HTTP do Trouter (dados de conexão, handshake
+//! - `TROUTER-AUTH-001` (VERIFIED no Checkpoint D, #11): as chamadas HTTP do Trouter (dados de conexão, handshake
 //!   socket.io, registrador) aceitam o skype token em `X-Skypetoken`. Hosts: `go.trouter…`, o host
-//!   `*.trouter.teams.microsoft.com` devolvido por ele, e `teams.microsoft.com/registrar/…`.
+//!   `*.trouter.teams.microsoft.com` devolvido por ele, e os registradores (só em `/registrar/…`).
 //! - `EXEC-CHALLENGE-001` (UNVERIFIED): desafio de Conditional Access chega como 401 com
 //!   `WWW-Authenticate` contendo `claims`/`insufficient_claims`/`interaction_required`.
 
@@ -36,7 +36,9 @@ use std::sync::Arc;
 
 const CHATSVCAGG_HOST: &str = "chatsvcagg.teams.microsoft.com";
 const TROUTER_SUFFIX: &str = ".trouter.teams.microsoft.com";
-const REGISTRAR_HOST: &str = "teams.microsoft.com";
+/// Registradores: o legado do prior art e o que o Trouter informa hoje em `registrarUrl`
+/// (VERIFIED no Checkpoint D, 2026-11-14: `communications.svc.cloud.microsoft/registrar/<região>/v3`).
+const REGISTRAR_HOSTS: [&str; 2] = ["teams.microsoft.com", "communications.svc.cloud.microsoft"];
 const REGISTRAR_PATH: &str = "/registrar/";
 /// Sufixo exigido do host regional devolvido pelo authsvc (defesa contra resposta inesperada).
 const CHAT_SERVICE_SUFFIX: &str = ".teams.microsoft.com";
@@ -117,13 +119,16 @@ fn redact_query(url: &str) -> String {
 fn trouter_url(op: &AuthOp) -> Result<String, ExecError> {
     let url = &op.request.url;
     require_host(op.resource, url, |h| {
-        h.ends_with(TROUTER_SUFFIX) || h == REGISTRAR_HOST
+        h.ends_with(TROUTER_SUFFIX) || REGISTRAR_HOSTS.contains(&h)
     })?;
     let parsed = url::Url::parse(url).map_err(|_| ExecError::HostNotAllowed {
         resource: op.resource,
         url: redact_query(url),
     })?;
-    if parsed.host_str() == Some(REGISTRAR_HOST) && !parsed.path().starts_with(REGISTRAR_PATH) {
+    let registrar_host = parsed
+        .host_str()
+        .is_some_and(|h| REGISTRAR_HOSTS.contains(&h));
+    if registrar_host && !parsed.path().starts_with(REGISTRAR_PATH) {
         return Err(ExecError::HostNotAllowed {
             resource: op.resource,
             url: redact_query(url),
@@ -790,6 +795,7 @@ mod tests {
             "https://go.trouter.teams.microsoft.com/v4/a?epid=1",
             "https://pub-ent-brso-07-t.trouter.teams.microsoft.com/socket.io/1/?v=v4",
             "https://teams.microsoft.com/registrar/prod/V2/registrations",
+            "https://communications.svc.cloud.microsoft/registrar/noam/v3/registrations",
         ] {
             let api = FakeApi::script(vec![Step::Status(200, vec![])]);
             let h = harness(api.clone(), None);
@@ -802,6 +808,8 @@ mod tests {
         }
         for url in [
             "https://teams.microsoft.com/api/mt/amer/beta/users",
+            "https://communications.svc.cloud.microsoft/api/outra-coisa",
+            "https://evil.svc.cloud.microsoft/registrar/x",
             "https://trouter.teams.microsoft.com.evil.com/x",
             "https://evil.example/registrar/prod",
             "http://go.trouter.teams.microsoft.com/v4/a",

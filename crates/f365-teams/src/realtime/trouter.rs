@@ -1,20 +1,23 @@
-//! Operações do Trouter (`docs/ARQUITETURA.md` §3.5). Cada passo é um contrato UNVERIFIED até o
-//! Checkpoint D (prior art: purple-teams); o erro de cada passo cita o contrato que quebrou.
+//! Operações do Trouter (`docs/ARQUITETURA.md` §3.5). Evidência = Checkpoint D na conta do dono,
+//! 2026-11-14 (#11): os 4 passos passaram, a sessão ficou >18 min viva, e uma mensagem chegou ao
+//! `listen` ~1,1 s depois de chegar ao servidor. O erro de cada passo cita o contrato que quebrou.
 //!
-//! - `TROUTER-CONNECT-001`: `POST https://go.trouter.teams.microsoft.com/v4/a?epid=<uuid>` devolve
-//!   JSON com `socketio` (URL base `https://<nó>.trouter.teams.microsoft.com/`), `surl` (URL do
-//!   endpoint para o registrador), `ccid` e `connectparams` (parâmetros assinados do socket).
-//! - `TROUTER-HANDSHAKE-001`: `GET <socketio>socket.io/1/?v=v4&<connectparams>&tc=…&timeout=40&
-//!   epid=…&ccid=…&auth=true` devolve o handshake socket.io v1.
-//! - `TROUTER-WS-001`: `wss://<nó>/socket.io/1/websocket/<sid>?<mesma query>` abre **sem** skype
-//!   token (a autorização são os `connectparams` assinados). Se exigir token, o socket precisa
-//!   mudar para dentro do `f365-auth` (o token não sai de lá).
-//! - `TROUTER-REGISTRAR-001`: `POST https://teams.microsoft.com/registrar/prod/V2/registrations`
-//!   associa o `surl` ao cliente para receber notificações de chat.
-//! - `TROUTER-MSG-001`: cada mensagem (tipo 3) é um "request" `{id, method, url, headers, body}`
-//!   que exige resposta `{id, status: 200, headers: {}, body: ""}`; o recurso alterado aparece como
-//!   `…/conversations/<id>/…` na `url` ou no `body` (que pode vir compactado — aí a conversa fica
-//!   desconhecida, mas a invalidação vale igual).
+//! - `TROUTER-CONNECT-001` (VERIFIED): `POST https://go.trouter.teams.microsoft.com/v4/a?epid=<uuid>`
+//!   devolve `socketio` (`https://<nó>.trouter.teams.microsoft.com/`), `surl`, `ccid`,
+//!   `registrarUrl` e `connectparams` assinados (`issuer, scae, se, sig, sp, sr, st`) — além de
+//!   `curlb`, `healthUrl`, `id`, `ttl`, `url`, ainda sem uso.
+//! - `TROUTER-HANDSHAKE-001` (VERIFIED): `GET <socketio>socket.io/1/?v=v4&<connectparams>&tc=…&
+//!   timeout=40&epid=…&ccid=…&con_num=<ms>_<n>&auth=true`. **Sem `con_num` → HTTP 400** (corpo vazio).
+//! - `TROUTER-WS-001` (VERIFIED): `wss://<nó>/socket.io/1/websocket/<sid>?<mesma query>` abre e
+//!   confirma (`1::`) **sem** skype token — a autorização são os `connectparams` assinados.
+//! - `TROUTER-REGISTRAR-001` (VERIFIED): o registrador vem em `registrarUrl`
+//!   (`https://communications.svc.cloud.microsoft/registrar/<região>/v3/registrations`) e aceita o
+//!   corpo do prior art (`clientDescription` + `transports.TROUTER[].path = surl`).
+//! - `TROUTER-MSG-001` (VERIFIED): notificações chegam como mensagem (tipo 3), respondidas com
+//!   `{id, status: 200}`; o id da conversa sai do `url`/`resourceLink` (`48:notes` visto). Parte das
+//!   notificações vem sem id legível (corpo compactado) → invalidação genérica.
+//! - Sinais vistos: `trouter.connected` e `trouter.message_loss` (avisos de possível lacuna — base
+//!   do replay por REST da Fase 2).
 //!
 //! Os `connectparams` são uma credencial curta do socket: nunca vão para log nem mensagem de erro.
 
@@ -37,6 +40,10 @@ pub(crate) struct ConnectInfo {
     pub socketio: String,
     pub surl: String,
     pub ccid: Option<String>,
+    /// Registrador informado pelo próprio Trouter (`registrarUrl`); o executor ainda trava o host.
+    pub registrar: Option<String>,
+    /// Número da conexão `<timestamp_ms>_<n>` (`TROUTER-HANDSHAKE-001`, prior art purple-teams).
+    pub con_num: Option<String>,
     /// Parâmetros assinados do socket — credencial: `Debug` não os mostra.
     params: Vec<(String, String)>,
 }
@@ -108,6 +115,8 @@ pub(crate) fn parse_connect(body: &[u8]) -> Result<ConnectInfo, TeamsError> {
         socketio,
         surl,
         ccid: text("ccid"),
+        registrar: text("registrarUrl"),
+        con_num: None,
         params,
     })
 }
@@ -119,6 +128,65 @@ fn scalar(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
+}
+
+/// Só os NOMES dos campos (e dos `connectparams`) — nunca os valores, que incluem assinatura.
+pub(crate) fn shape(body: &[u8]) -> Vec<String> {
+    let Ok(Value::Object(top)) = serde_json::from_slice::<Value>(body) else {
+        return vec!["<não é objeto JSON>".into()];
+    };
+    let mut out: Vec<String> = top.keys().cloned().collect();
+    if let Some(Value::Object(cp)) = top.get("connectparams") {
+        out.extend(
+            cp.iter()
+                .map(|(k, v)| format!("connectparams.{k}:{}", kind(v))),
+        );
+    }
+    out
+}
+
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "str",
+        Value::Number(_) => "num",
+        Value::Bool(_) => "bool",
+        Value::Object(_) => "obj",
+        Value::Array(_) => "arr",
+        Value::Null => "null",
+    }
+}
+
+/// Até 300 caracteres do corpo de uma resposta de erro, com valores após `sig`/`token` mascarados.
+pub(crate) fn redacted_snippet(body: &[u8]) -> String {
+    let text: String = String::from_utf8_lossy(body).chars().take(300).collect();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(i) = rest.to_ascii_lowercase().find(['s', 't']).filter(|_| true) {
+        let lower = rest.to_ascii_lowercase();
+        let hit = ["sig", "token", "skypetoken"]
+            .iter()
+            .find(|k| lower[i..].starts_with(**k));
+        out.push_str(&rest[..i]);
+        match hit {
+            Some(k) => {
+                out.push_str(&rest[i..i + k.len()]);
+                let after = &rest[i + k.len()..];
+                let skip = after
+                    .find(|c: char| c == '&' || c == '"' || c == ',' || c.is_whitespace())
+                    .unwrap_or(after.len());
+                if skip > 0 {
+                    out.push_str("<oculto>");
+                }
+                rest = &after[skip..];
+            }
+            None => {
+                out.push_str(&rest[i..i + 1]);
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Query comum ao handshake e ao WebSocket.
@@ -133,6 +201,9 @@ pub(crate) fn query(info: &ConnectInfo, epid: &str) -> String {
     q.append_pair("epid", epid);
     if let Some(ccid) = &info.ccid {
         q.append_pair("ccid", ccid);
+    }
+    if let Some(n) = &info.con_num {
+        q.append_pair("con_num", n);
     }
     q.append_pair("auth", "true");
     q.finish()
@@ -171,7 +242,11 @@ pub(crate) fn registrar_op(info: &ConnectInfo, epid: &str) -> AuthOp {
         "nodeId": "",
         "transports": {"TROUTER": [{"context": "", "path": info.surl, "ttl": 86_400}]},
     });
-    op("POST", REGISTRAR_URL.into(), Some(body))
+    let url = info
+        .registrar
+        .clone()
+        .unwrap_or_else(|| REGISTRAR_URL.into());
+    op("POST", url, Some(body))
 }
 
 /// Resposta obrigatória a uma mensagem (tipo 3) do Trouter (`TROUTER-MSG-001`).
@@ -281,6 +356,31 @@ mod tests {
         assert!(ws.starts_with("wss://pub-ent-brso-07-t.trouter.teams.microsoft.com:443/socket.io/1/websocket/SID9?v=v4&"));
     }
 
+    /// Achado do Checkpoint D: sem `con_num` o handshake dá HTTP 400.
+    #[test]
+    fn con_num_goes_on_handshake_and_websocket_query() {
+        let mut info = parse_connect(&connect_body()).unwrap();
+        info.con_num = Some("1731600000000_1".into());
+        assert!(handshake_op(&info, "ep")
+            .request
+            .url
+            .contains("con_num=1731600000000_1"));
+        assert!(ws_url(&info, "S", "ep").contains("con_num=1731600000000_1"));
+    }
+
+    /// Achado do Checkpoint D: o registrador atual vem em `registrarUrl` (v3).
+    #[test]
+    fn registrar_url_from_trouter_wins_over_the_legacy_default() {
+        let mut body: Value = serde_json::from_slice(&connect_body()).unwrap();
+        body["registrarUrl"] =
+            "https://communications.svc.cloud.microsoft/registrar/noam/v3/registrations".into();
+        let info = parse_connect(body.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            registrar_op(&info, "ep").request.url,
+            "https://communications.svc.cloud.microsoft/registrar/noam/v3/registrations"
+        );
+    }
+
     #[test]
     fn registrar_registers_the_surl_for_this_endpoint() {
         let info = parse_connect(&connect_body()).unwrap();
@@ -325,6 +425,26 @@ mod tests {
             conversation_of(&compressed),
             None,
             "sem id legível: invalidação genérica"
+        );
+    }
+
+    #[test]
+    fn diagnostics_show_field_names_never_values() {
+        let shape = shape(&connect_body());
+        assert!(shape.contains(&"socketio".to_owned()));
+        assert!(shape.contains(&"connectparams.sig:str".to_owned()));
+        assert!(!format!("{shape:?}").contains("SEGREDO"));
+
+        let snip =
+            redacted_snippet(b"Bad Request: invalid sig=ABC123&se=1 skypetoken=XYZ, epid ok");
+        assert!(!snip.contains("ABC123") && !snip.contains("XYZ"), "{snip}");
+        assert!(
+            snip.contains("Bad Request") && snip.contains("epid ok"),
+            "{snip}"
+        );
+        assert_eq!(
+            redacted_snippet("ação sem segredo".as_bytes()),
+            "ação sem segredo"
         );
     }
 

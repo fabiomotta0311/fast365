@@ -1,7 +1,7 @@
 //! Framing socket.io **v1** (o que o Trouter fala): `tipo:id:endpoint[:dados]`.
 //!
-//! `TROUTER-SIO-001` (UNVERIFIED — prior art purple-teams): tipos 0 desconectar, 1 conectar,
-//! 2 heartbeat, 3 mensagem, 4 json, 5 evento, 6 ack, 7 erro, 8 noop; `id` com `+` pede ack.
+//! `TROUTER-SIO-001` (VERIFIED no Checkpoint D, #11): tipos 0 desconectar, 1 conectar, 2 heartbeat,
+//! 3 mensagem, 4 json, 5 evento, 6 ack, 7 erro, 8 noop; `id` com `+` pede ack.
 //! Handshake HTTP devolve `sessionid:heartbeat:closetimeout:transportes`.
 
 use std::time::Duration;

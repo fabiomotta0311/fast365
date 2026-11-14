@@ -13,6 +13,7 @@ mod socketio;
 mod trouter;
 
 use crate::{TeamsClient, TeamsError};
+use f365_auth::transport::HttpResponse;
 use f365_auth::Clock;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::Value;
@@ -85,15 +86,22 @@ impl TeamsClient {
 
         on_event(RealtimeEvent::Step("1/4 dados de conexão do Trouter"));
         let resp = self.exec.execute(trouter::connect_op(&epid)).await?;
-        ensure_2xx("Trouter (conexão)", resp.status)?;
-        let info = trouter::parse_connect(&resp.body)?;
+        ensure_2xx("Trouter (conexão)", &resp)?;
+        tracing::debug!(campos = ?trouter::shape(&resp.body), "Trouter: formato da resposta de conexão");
+        let mut info = trouter::parse_connect(&resp.body)?;
+        let ms = clock
+            .utc_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        info.con_num = Some(format!("{ms}_1"));
 
         on_event(RealtimeEvent::Step("2/4 handshake socket.io"));
         let resp = self
             .exec
             .execute(trouter::handshake_op(&info, &epid))
             .await?;
-        ensure_2xx("Trouter (handshake)", resp.status)?;
+        ensure_2xx("Trouter (handshake)", &resp)?;
         let hs = std::str::from_utf8(&resp.body)
             .ok()
             .and_then(socketio::parse_handshake)
@@ -119,7 +127,7 @@ impl TeamsClient {
             .exec
             .execute(trouter::registrar_op(&info, &epid))
             .await?;
-        ensure_2xx("Trouter (registrador, TROUTER-REGISTRAR-001)", resp.status)?;
+        ensure_2xx("Trouter (registrador, TROUTER-REGISTRAR-001)", &resp)?;
 
         *ever_ready = true;
         on_event(RealtimeEvent::Ready);
@@ -127,11 +135,16 @@ impl TeamsClient {
     }
 }
 
-fn ensure_2xx(service: &'static str, status: u16) -> Result<(), TeamsError> {
-    (200..300)
-        .contains(&status)
-        .then_some(())
-        .ok_or(TeamsError::Http { service, status })
+fn ensure_2xx(service: &'static str, resp: &HttpResponse) -> Result<(), TeamsError> {
+    if (200..300).contains(&resp.status) {
+        return Ok(());
+    }
+    // Diagnóstico (RUST_LOG=f365_teams=debug): trecho do corpo de ERRO, com assinaturas mascaradas.
+    tracing::debug!(service, status = resp.status, corpo = %trouter::redacted_snippet(&resp.body), "Trouter recusou");
+    Err(TeamsError::Http {
+        service,
+        status: resp.status,
+    })
 }
 
 /// Tipo do erro do WebSocket, sem URL (a query carrega os parâmetros assinados).
