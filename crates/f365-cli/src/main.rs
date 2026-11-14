@@ -8,6 +8,7 @@
 //!   f365 send    → POST chatsvcagg (E)
 
 mod session_cmd;
+mod token_cmd;
 
 use clap::{Parser, Subcommand};
 
@@ -35,13 +36,17 @@ enum Command {
     Listen,
     /// Envia uma mensagem de teste (POST chatsvcagg).
     Send { chat_id: String, text: String },
-    /// Imprime o access token atual + claims decodificados (debug).
+    /// Renova em silêncio (sem WebView) e imprime os claims do token — nunca o token (Checkpoint B).
     Token {
-        #[arg(long, default_value = "teams")]
-        resource: String,
+        #[arg(long, value_enum, default_value = "teams")]
+        resource: token_cmd::Resource,
     },
-    /// Valida a sessão: UPN, tenant, região descoberta.
-    Whoami,
+    /// Valida a sessão: UPN, tenant e região descoberta (online).
+    Whoami {
+        /// Não consulta a rede: só o que está no keyring.
+        #[arg(long)]
+        offline: bool,
+    },
 }
 
 #[tokio::main]
@@ -56,8 +61,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Chats { top: _ } => todo!("Fase 0-B/C: troca de tokens + GET chatsvcagg (§2.3)"),
         Command::Listen => todo!("Fase 0-C: Trouter WS, evento = invalidação (§2.3)"),
         Command::Send { .. } => todo!("Fase 0-D: POST chatsvcagg (§2.3)"),
-        Command::Token { .. } => todo!("debug: imprime access token + claims (§2.3)"),
-        Command::Whoami => session_cmd::whoami()?,
+        Command::Token { resource } => token_cmd::token(resource).await?,
+        Command::Whoami { offline } => session_cmd::whoami(offline).await?,
     }
     Ok(())
 }

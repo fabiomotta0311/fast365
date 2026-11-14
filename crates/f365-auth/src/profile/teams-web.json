@@ -1,0 +1,10 @@
+{
+  "_comment": "Protocol profile do Teams Web (docs/ARQUITETURA.md §Fase 2 'perfil declarativo'). Sem segredos. Cada valor tem ID de contrato; ver profile.rs.",
+  "token_endpoint": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+  "spa_origin": "https://teams.cloud.microsoft",
+  "scopes": {
+    "teams": "https://api.spaces.skype.com/.default openid profile offline_access",
+    "chatsvcagg": "https://chatsvcagg.teams.microsoft.com/.default openid profile offline_access"
+  },
+  "authsvc_url": "https://teams.microsoft.com/api/authsvc/v1.0/authz"
+}

@@ -10,9 +10,11 @@ pub mod clock;
 // Política de captura e parser de sessão só têm consumidor com a WebView (e nos testes).
 #[cfg_attr(not(feature = "webview"), allow(dead_code))]
 mod probe;
+mod profile;
 mod secret;
 #[cfg_attr(not(feature = "webview"), allow(dead_code))]
 mod session;
+pub mod tokens;
 pub mod transport;
 #[cfg_attr(not(feature = "webview"), allow(dead_code))]
 pub mod vault;

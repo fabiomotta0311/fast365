@@ -386,6 +386,14 @@ serde_json.workspace = true
   bloquear** device-code por política de Conditional Access — por isso a WebView continua o caminho
   primário, com device-code como opção secundária.
 
+> **Checkpoint B: verde (2026-11-13, conta do dono, #8).** Cadeia real, sem WebView: RT (cliente web
+> `5e3ce6c0-…`, resgatado com `Origin: https://teams.cloud.microsoft`) → token `aud
+> https://api.spaces.skype.com` → `authsvc/v1.0/authz` → skype token + `regionGtms.chatService`
+> (`https://<região>.ng.msg.teams.microsoft.com`); token `aud https://chatsvcagg.teams.microsoft.com`
+> para o REST. O RT rotaciona a cada resgate. Valores no protocol profile
+> `crates/f365-auth/src/profile/teams-web.json`. Em aberto: `AUTH-RT-SPA-001` (validade fixa ~24 h
+> desde o login) — medir resgatando depois de 24 h da captura.
+
 ### 2.3 Subcomandos mínimos do binário `f365` (os quatro provam o gate)
 
 ```

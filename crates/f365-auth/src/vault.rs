@@ -100,14 +100,41 @@ impl SecretStore for KeyringStore {
     }
 }
 
+/// Store em memória compartilhável (clones veem os mesmos dados) — testes de outros módulos.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct MemoryStore(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+);
+
+#[cfg(test)]
+impl SecretStore for MemoryStore {
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), VaultError> {
+        self.0.lock().unwrap().insert(key.into(), value.into());
+        Ok(())
+    }
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, VaultError> {
+        Ok(self.0.lock().unwrap().get(key).cloned())
+    }
+    fn remove(&self, key: &str) -> Result<(), VaultError> {
+        self.0.lock().unwrap().remove(key);
+        Ok(())
+    }
+}
+
 /// Conta salva + metadados não secretos (o que `f365 whoami` mostra).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAccount {
     pub account: AccountInfo,
     pub client_id: String,
     pub family_id: Option<String>,
+    /// Quando o login foi feito (não muda com a rotação do RT — é a base da validade do RT de SPA).
     pub captured_at: SystemTime,
     pub cookie_count: usize,
+    /// Escopos dos access tokens que a própria página do Teams pediu (evidência de `TOKEN-SCOPE-001`).
+    pub observed_scopes: Vec<String>,
+    /// Último resgate bem-sucedido do RT (`None` = nunca resgatado desde a captura).
+    pub last_refresh: Option<SystemTime>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,6 +147,15 @@ struct AccountRecord {
     family_id: Option<String>,
     captured_at_unix: u64,
     cookie_count: usize,
+    // Campos novos com default: sessões gravadas antes deles continuam legíveis.
+    #[serde(default)]
+    observed_scopes: Vec<String>,
+    #[serde(default)]
+    last_refresh_unix: Option<u64>,
+}
+
+fn unix(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -205,8 +241,26 @@ impl Vault {
         Ok(())
     }
 
-    /// Sessão completa (com segredos) da conta ativa — uso interno do executor (#8).
-    #[allow(dead_code)] // consumidor: troca de tokens (#8)
+    /// Troca o RT pelo rotacionado no resgate, numa geração nova (mesmas garantias do `save`),
+    /// preservando o instante do login.
+    pub(crate) fn rotate_refresh_token(
+        &self,
+        new: Secret,
+        refreshed_at: SystemTime,
+    ) -> Result<(), VaultError> {
+        let stored = self
+            .active_account()?
+            .ok_or(VaultError::Corrupt("sem sessão para rotacionar"))?;
+        let mut session = self
+            .load_session()?
+            .ok_or(VaultError::Corrupt("sem sessão para rotacionar"))?;
+        session.refresh_token.secret = new;
+        // Persistido em segundos: truncar antes, senão a releitura de validação nunca bate.
+        session.last_refresh = Some(UNIX_EPOCH + Duration::from_secs(unix(refreshed_at)));
+        self.save(&session, stored.captured_at)
+    }
+
+    /// Sessão completa (com segredos) da conta ativa — uso interno de `f365-auth`.
     pub(crate) fn load_session(&self) -> Result<Option<CapturedSession>, VaultError> {
         let Some(ptr) = self.pointer()? else {
             return Ok(None);
@@ -243,11 +297,10 @@ impl Vault {
             environment: session.account.environment.clone(),
             client_id: session.refresh_token.client_id.clone(),
             family_id: session.refresh_token.family_id.clone(),
-            captured_at_unix: captured_at
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            captured_at_unix: unix(captured_at),
             cookie_count: session.cookies.len(),
+            observed_scopes: session.observed_scopes.clone(),
+            last_refresh_unix: session.last_refresh.map(unix),
         };
 
         self.put_chunked(
@@ -262,10 +315,7 @@ impl Vault {
 
         // Lê de volta antes de publicar: só um commit que relê idêntico vira a sessão ativa.
         let stored = self.read_generation(prefix)?;
-        if stored.refresh_token != session.refresh_token
-            || stored.cookies != session.cookies
-            || stored.account != session.account
-        {
+        if stored != *session {
             return Err(VaultError::Corrupt("releitura diverge do que foi gravado"));
         }
         Ok(())
@@ -291,6 +341,8 @@ impl Vault {
                 client_id: stored.client_id,
                 family_id: stored.family_id,
             },
+            observed_scopes: stored.observed_scopes,
+            last_refresh: stored.last_refresh,
             cookies: cookies
                 .into_iter()
                 .map(|mut c| SessionCookie {
@@ -320,6 +372,10 @@ impl Vault {
             family_id: r.family_id,
             captured_at: UNIX_EPOCH + Duration::from_secs(r.captured_at_unix),
             cookie_count: r.cookie_count,
+            observed_scopes: r.observed_scopes,
+            last_refresh: r
+                .last_refresh_unix
+                .map(|s| UNIX_EPOCH + Duration::from_secs(s)),
         })
     }
 
@@ -474,6 +530,8 @@ mod tests {
                 client_id: "client-web".into(),
                 family_id: Some("1".into()),
             },
+            observed_scopes: vec!["https://api.spaces.skype.com/.default".into()],
+            last_refresh: None,
             cookies: vec![SessionCookie {
                 name: "ESTSAUTHPERSISTENT".into(),
                 value: Secret::new(rt.to_string().repeat(cookie_len)),
