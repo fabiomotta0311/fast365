@@ -70,7 +70,8 @@ pub(crate) trait SecretStore: Send + Sync {
 
 /// Keyring do SO. No Windows: Credential Manager via `windows-native-keyring-store`, com a
 /// configuração do keyring 3 (alvo `<chave>.<serviço>`, persistência `Enterprise`) — credenciais
-/// gravadas antes da migração continuam legíveis (`KEYRING-COMPAT-001`).
+/// gravadas antes da migração continuam legíveis (`KEYRING-COMPAT-001`, VERIFIED 2026-11-13:
+/// sessão gravada pelo keyring 3 lida pelo código novo, `f365 whoami --offline` rodado pelo dono).
 ///
 /// O store é passado explicitamente a cada credencial (sem store global de processo).
 #[cfg(windows)]
