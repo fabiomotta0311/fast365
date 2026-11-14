@@ -732,7 +732,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "keyring",
  "reqwest",
  "serde",
