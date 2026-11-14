@@ -50,19 +50,20 @@ impl TeamsClient {
         let mut failures = 0u32;
         let mut ever_ready = false;
         loop {
-            let err = match self
-                .listen_once(clock, &mut *on_event, &mut ever_ready)
-                .await
-            {
-                Ok(()) => {
-                    failures = 0;
-                    None
+            let mut session_ready = false;
+            let mut forward = |event| {
+                if event == RealtimeEvent::Ready {
+                    session_ready = true;
                 }
+                on_event(event);
+            };
+            let err = match self.listen_once(clock, &mut forward, &mut ever_ready).await {
+                Ok(()) => None,
                 // Antes da primeira conexão, falhar rápido: é contrato de protocolo, não rede.
                 Err(e) if !ever_ready => return Err(e),
                 Err(e) => Some(e),
             };
-            failures += 1;
+            failures = next_failure_count(failures, err.is_none(), session_ready);
             if failures > MAX_CONSECUTIVE_FAILURES {
                 return Err(err
                     .unwrap_or_else(|| TeamsError::Realtime("Trouter caiu repetidamente".into())));
@@ -135,12 +136,19 @@ impl TeamsClient {
     }
 }
 
+fn next_failure_count(previous: u32, ended_ok: bool, session_ready: bool) -> u32 {
+    if ended_ok || session_ready {
+        1
+    } else {
+        previous + 1
+    }
+}
+
 fn ensure_2xx(service: &'static str, resp: &HttpResponse) -> Result<(), TeamsError> {
     if (200..300).contains(&resp.status) {
         return Ok(());
     }
-    // Diagnóstico (RUST_LOG=f365_teams=debug): trecho do corpo de ERRO, com assinaturas mascaradas.
-    tracing::debug!(service, status = resp.status, corpo = %trouter::redacted_snippet(&resp.body), "Trouter recusou");
+    tracing::debug!(service, status = resp.status, "Trouter recusou");
     Err(TeamsError::Http {
         service,
         status: resp.status,
@@ -274,6 +282,62 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, connect_async};
+
+    #[test]
+    fn retry_count_resets_after_ready_even_when_session_errors() {
+        let mut count = 0;
+        for _ in 0..3 {
+            count = next_failure_count(count, false, false);
+        }
+        assert_eq!(count, 3);
+        count = next_failure_count(count, false, true);
+        assert_eq!(count, 1);
+        count = next_failure_count(count, false, false);
+        assert_eq!(count, 2);
+        count = next_failure_count(count, true, true);
+        assert_eq!(count, 1);
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            count = next_failure_count(count, false, false);
+        }
+        assert!(count > MAX_CONSECUTIVE_FAILURES);
+    }
+
+    #[test]
+    fn http_error_log_excludes_body() {
+        use std::io::Write;
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let output = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || Writer(output.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let resp = HttpResponse {
+                status: 400,
+                headers: vec![],
+                body: br#"{"sig":"SYNTHETIC_SECRET","unknown":"PRIVATE_TEXT"}"#.to_vec(),
+            };
+            assert!(ensure_2xx("test", &resp).is_err());
+        });
+        let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("400"), "{log}");
+        assert!(
+            !log.contains("SYNTHETIC_SECRET") && !log.contains("PRIVATE_TEXT"),
+            "{log}"
+        );
+    }
 
     /// Servidor WebSocket local que segue um roteiro e devolve o que o cliente escreveu.
     async fn scripted_server(

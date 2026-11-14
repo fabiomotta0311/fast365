@@ -156,39 +156,6 @@ fn kind(v: &Value) -> &'static str {
     }
 }
 
-/// Até 300 caracteres do corpo de uma resposta de erro, com valores após `sig`/`token` mascarados.
-pub(crate) fn redacted_snippet(body: &[u8]) -> String {
-    let text: String = String::from_utf8_lossy(body).chars().take(300).collect();
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(i) = rest.to_ascii_lowercase().find(['s', 't']).filter(|_| true) {
-        let lower = rest.to_ascii_lowercase();
-        let hit = ["sig", "token", "skypetoken"]
-            .iter()
-            .find(|k| lower[i..].starts_with(**k));
-        out.push_str(&rest[..i]);
-        match hit {
-            Some(k) => {
-                out.push_str(&rest[i..i + k.len()]);
-                let after = &rest[i + k.len()..];
-                let skip = after
-                    .find(|c: char| c == '&' || c == '"' || c == ',' || c.is_whitespace())
-                    .unwrap_or(after.len());
-                if skip > 0 {
-                    out.push_str("<oculto>");
-                }
-                rest = &after[skip..];
-            }
-            None => {
-                out.push_str(&rest[i..i + 1]);
-                rest = &rest[i + 1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Query comum ao handshake e ao WebSocket.
 pub(crate) fn query(info: &ConnectInfo, epid: &str) -> String {
     let mut q = url::form_urlencoded::Serializer::new(String::new());
@@ -258,10 +225,16 @@ pub(crate) fn response_for(message: &Value) -> Option<String> {
 
 /// Só o id da conversa alterada — o conteúdo da mensagem nunca é lido (evento = invalidação).
 pub(crate) fn conversation_of(message: &Value) -> Option<String> {
-    let haystacks = ["url", "body"]
-        .into_iter()
-        .filter_map(|k| message.get(k).and_then(Value::as_str));
-    for text in haystacks {
+    let body = message.get("body").and_then(|v| match v {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+        Value::Object(_) => Some(v.clone()),
+        _ => None,
+    });
+    let haystacks = [
+        message.get("url"),
+        body.as_ref().and_then(|b| b.get("resourceLink")),
+    ];
+    for text in haystacks.into_iter().flatten().filter_map(Value::as_str) {
         let text = text.replace("\\/", "/");
         for (i, _) in text.match_indices("/conversations/") {
             let rest = &text[i + "/conversations/".len()..];
@@ -405,6 +378,12 @@ mod tests {
     }
 
     #[test]
+    fn ignores_conversation_paths_in_message_content() {
+        let msg = json!({"body": json!({"content": "See /conversations/19:fake@thread.v2/messages/1"}).to_string()});
+        assert_eq!(conversation_of(&msg), None);
+    }
+
+    #[test]
     fn extracts_only_the_conversation_id() {
         let in_body = json!({"id": 1, "url": "/v4/f/a/messaging",
             "body": r#"{"resourceLink":"https:\/\/amer.ng.msg.teams.microsoft.com\/v1\/users\/ME\/conversations\/19:abc@thread.v2\/messages\/1731","content":"texto privado"}"#});
@@ -434,18 +413,6 @@ mod tests {
         assert!(shape.contains(&"socketio".to_owned()));
         assert!(shape.contains(&"connectparams.sig:str".to_owned()));
         assert!(!format!("{shape:?}").contains("SEGREDO"));
-
-        let snip =
-            redacted_snippet(b"Bad Request: invalid sig=ABC123&se=1 skypetoken=XYZ, epid ok");
-        assert!(!snip.contains("ABC123") && !snip.contains("XYZ"), "{snip}");
-        assert!(
-            snip.contains("Bad Request") && snip.contains("epid ok"),
-            "{snip}"
-        );
-        assert_eq!(
-            redacted_snippet("ação sem segredo".as_bytes()),
-            "ação sem segredo"
-        );
     }
 
     #[test]
