@@ -234,7 +234,7 @@ fn capture_session(
                     .entries
                     .iter()
                     .map(|[k, v]| (k.as_str(), v.as_str()));
-                match session::read_msal_cache(entries) {
+                match session::read_msal_cache(entries, clock.utc_now()) {
                     MsalProbe::Found(account, refresh_token, observed_scopes) => {
                         let session = webview
                             .cookies_for_url(COOKIE_URL)

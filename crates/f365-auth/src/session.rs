@@ -13,10 +13,15 @@
 //!   no MSAL v2, `msal.<clientId>.active-account` (`localAccountId` em texto).
 //! - `AUTH-RT-SPA-001` (VERIFIED, 2026-11-15): o RT é do cliente **web** (`5e3ce6c0-…`, sem
 //!   `familyId`) e tem **validade fixa**: login em 13/11 23:04 → recusado com `AADSTS700084` em
-//!   15/11, mesmo com resgates bem-sucedidos no meio (rotação não estende). O `f365 auth` seguinte
-//!   **re-logou sem senha** pelos cookies do perfil persistente da WebView → base do
-//!   re-pareamento automático (`TokenBroker::with_repair` + captura `silent`), o mesmo caminho
-//!   do prior art (rusty-teams recarrega a página e deixa o MSAL dela re-logar).
+//!   15/11, mesmo com resgates bem-sucedidos no meio (rotação não estende). Mitigação:
+//!   re-pareamento automático (`TokenBroker::with_repair` + captura `silent`), como no prior art
+//!   (rusty-teams recarrega a página e deixa o MSAL dela re-logar). VERIFIED (2026-11-15, após o
+//!   fix de RT vencido): `auth --silent` sem janela trouxe RT **novo** (4 cookies ESTSAUTH*, escopos
+//!   `api.spaces.skype.com` renovados pela página) e o `token` seguinte passou.
+//! - `AUTH-MSAL-RT-EXPIRY-001` (VERIFIED, 2026-11-15): o cache
+//!   MSAL do perfil persistente mantém o RT **vencido** até a página trocá-lo; a entrada traz
+//!   `expiresOn` (s) e `lastUpdatedAt` (ms). RT vencido é ignorado e, entre os válidos, vence o
+//!   atualizado mais recentemente — mesmo critério do rusty-teams.
 //! - `AUTH-COOKIES-001` (VERIFIED): `login.microsoftonline.com` entrega cookies de sessão do Entra
 //!   (`ESTSAUTH*`/`buid`/`esctx`; 5 na captura, > 2560 B no total → exige o vault em pedaços).
 //! - `AUTH-ORIGIN-001`: só aceitamos storage lido nas origens HTTPS exatas do Teams Web
@@ -115,11 +120,19 @@ impl ActiveHint {
 }
 
 /// Lê as entradas `(chave, valor)` coletadas do storage da página.
+///
+/// `now` (tempo civil do `Clock`) descarta refresh tokens já vencidos (`AUTH-MSAL-RT-EXPIRY-001`).
 pub(crate) fn read_msal_cache<'a>(
     entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    now: std::time::SystemTime,
 ) -> MsalProbe {
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut accounts: Vec<Account> = Vec::new();
-    let mut tokens: Vec<(String, String, RefreshToken)> = Vec::new(); // (home, environment, rt)
+    // (home, environment, rt, lastUpdatedAt em ms)
+    let mut tokens: Vec<(String, String, RefreshToken, u64)> = Vec::new();
     let mut hints: Vec<ActiveHint> = Vec::new();
     let mut targets: Vec<(String, String, String)> = Vec::new(); // (home, environment, escopos)
     let mut encrypted = false;
@@ -144,14 +157,18 @@ pub(crate) fn read_msal_cache<'a>(
                 text("environment"),
                 text("clientId"),
             ) {
-                if !secret.is_empty() {
+                // RT vencido fica no cache até o MSAL da página trocá-lo: capturá-lo regravaria uma
+                // sessão morta (visto em 2026-11-15). Sem `expiresOn` (MSAL antigo) = aceito.
+                let expired = number(obj.get("expiresOn")).is_some_and(|exp| exp <= now_secs);
+                if !secret.is_empty() && !expired {
+                    let updated = number(obj.get("lastUpdatedAt")).unwrap_or(0);
                     let family_id = text("familyId").filter(|f| !f.is_empty());
                     let rt = RefreshToken {
                         secret: Secret::new(secret),
                         client_id,
                         family_id,
                     };
-                    tokens.push((home, env, rt));
+                    tokens.push((home, env, rt, updated));
                 }
             }
         } else if text("credentialType")
@@ -193,14 +210,19 @@ pub(crate) fn read_msal_cache<'a>(
     };
 
     // Só RTs da MESMA identidade e ambiente; entre eles, o family RT é o mais útil (#8).
-    let mut compatible: Vec<RefreshToken> = tokens
+    // Entre os válidos da mesma identidade: o atualizado mais recentemente primeiro (o que o MSAL
+    // da página acabou de renovar); empate → family RT, depois client id.
+    let mut compatible: Vec<(RefreshToken, u64)> = tokens
         .into_iter()
-        .filter(|(home, env, _)| *home == account.home_account_id && *env == account.environment)
-        .map(|(_, _, rt)| rt)
+        .filter(|(home, env, _, _)| *home == account.home_account_id && *env == account.environment)
+        .map(|(_, _, rt, updated)| (rt, updated))
         .collect();
-    compatible.sort_by(|a, b| {
-        (a.family_id.is_none(), &a.client_id).cmp(&(b.family_id.is_none(), &b.client_id))
+    compatible.sort_by(|(a, au), (b, bu)| {
+        bu.cmp(au).then_with(|| {
+            (a.family_id.is_none(), &a.client_id).cmp(&(b.family_id.is_none(), &b.client_id))
+        })
     });
+    let compatible = compatible.into_iter().map(|(rt, _)| rt);
     let mut scopes: Vec<String> = targets
         .into_iter()
         .filter(|(home, env, _)| *home == account.home_account_id && *env == account.environment)
@@ -286,6 +308,15 @@ fn active_hint(key: &str, raw: &str, parsed: Option<&Value>) -> Option<ActiveHin
     }
 }
 
+/// Número que o MSAL guarda ora como texto, ora como número (`expiresOn`, `lastUpdatedAt`).
+fn number(v: Option<&Value>) -> Option<u64> {
+    match v? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 fn is_encrypted_entry(obj: &Map<String, Value>) -> bool {
     ["id", "nonce", "data"]
         .iter()
@@ -344,8 +375,78 @@ mod tests {
         ("msal.client-web.active-account-filters", v.to_string())
     }
 
+    /// "Agora" fixo dos testes (2026-11-15 ≈ 1_794_700_000 s).
+    const NOW: u64 = 1_794_700_000;
+
     fn probe(entries: &[(&str, String)]) -> MsalProbe {
-        read_msal_cache(entries.iter().map(|(k, v)| (*k, v.as_str())))
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(NOW);
+        read_msal_cache(entries.iter().map(|(k, v)| (*k, v.as_str())), now)
+    }
+
+    fn rt_with(home: &str, secret: &str, expires_on: u64, last_updated_ms: u64) -> String {
+        let mut v: Value = serde_json::from_str(&rt(home, "client-web", None, secret)).unwrap();
+        v["expiresOn"] = expires_on.to_string().into();
+        v["lastUpdatedAt"] = last_updated_ms.to_string().into();
+        v.to_string()
+    }
+
+    /// Visto em 2026-11-15: o perfil persistente ainda tinha o RT de 24 h vencido; capturá-lo
+    /// regravou uma sessão morta. Vencido é ignorado até o MSAL da página trazer o novo.
+    #[test]
+    fn expired_refresh_token_in_cache_is_never_captured() {
+        let stale = rt_with(HOME_A, "rt-vencido", NOW - 3_600, 1_000);
+        let only_stale = probe(&[
+            ("a", account(HOME_A, "tid-a", "a@empresa.com")),
+            ("rt", stale.clone()),
+        ]);
+        assert_eq!(
+            only_stale,
+            MsalProbe::Pending(None),
+            "espera a página renovar"
+        );
+
+        let fresh = rt_with(HOME_A, "rt-novo", NOW + 86_000, 2_000);
+        let both = probe(&[
+            ("a", account(HOME_A, "tid-a", "a@empresa.com")),
+            ("v", stale),
+            ("n", fresh),
+        ]);
+        assert_eq!(found_upn(both).1, "rt-novo");
+    }
+
+    #[test]
+    fn newest_valid_refresh_token_wins() {
+        let older = rt_with(HOME_A, "rt-antigo-valido", NOW + 1_000, 1_000);
+        let newer = rt_with(HOME_A, "rt-recente", NOW + 80_000, 9_000);
+        let got = probe(&[
+            ("a", account(HOME_A, "tid-a", "a@empresa.com")),
+            ("o", older),
+            ("n", newer),
+        ]);
+        assert_eq!(found_upn(got).1, "rt-recente");
+    }
+
+    #[test]
+    fn expires_on_as_number_or_text_and_missing_is_accepted() {
+        let mut numeric: Value = serde_json::from_str(&rt(HOME_A, "c", None, "rt-num")).unwrap();
+        numeric["expiresOn"] = (NOW - 1).into();
+        let got = probe(&[
+            ("a", account(HOME_A, "tid-a", "a@e.com")),
+            ("r", numeric.to_string()),
+        ]);
+        assert_eq!(
+            got,
+            MsalProbe::Pending(None),
+            "vencido também em formato numérico"
+        );
+
+        let no_expiry = rt(HOME_A, "c", None, "rt-sem-validade");
+        let got = probe(&[("a", account(HOME_A, "tid-a", "a@e.com")), ("r", no_expiry)]);
+        assert_eq!(
+            found_upn(got).1,
+            "rt-sem-validade",
+            "MSAL antigo sem expiresOn"
+        );
     }
 
     fn found_upn(p: MsalProbe) -> (String, String) {

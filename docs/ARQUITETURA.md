@@ -395,11 +395,15 @@ serde_json.workspace = true
 > desde o login) — medir resgatando depois de 24 h da captura.
 
 > **`AUTH-RT-SPA-001` confirmado (2026-11-15).** O RT do cliente web tem validade fixa (~24 h
-> desde o login, não estendida pela rotação): recusado com `AADSTS700084` mais de 24 h após a captura. O
-> `f365 auth` seguinte re-logou **sem senha** pelos cookies do perfil persistente. Decisão: o
-> `TokenBroker` re-pareia sozinho **uma vez por processo** (WebView escondida; a janela só aparece se
-> o Microsoft pedir login). Mesmo caminho do prior art `danieldaeschle/rusty-teams`, que não guarda
-> RT e recarrega a página parqueada para o MSAL dela re-logar.
+> desde o login, não estendida pela rotação): recusado com `AADSTS700084` mais de 24 h após a
+> captura. Decisão: o `TokenBroker` re-pareia sozinho **uma vez por processo** (WebView escondida;
+> a janela só aparece se o Microsoft pedir login) — mesmo caminho do prior art
+> `danieldaeschle/rusty-teams`, que não guarda RT e recarrega a página parqueada para o MSAL dela
+> re-logar. **Pegadinha (incidente do mesmo dia):** o cache MSAL do perfil persistente guarda o RT
+> **vencido** até a página trocá-lo; a primeira re-captura fechou sem senha mas regravou o RT morto.
+> A captura agora ignora RT com `expiresOn` passado e prefere o `lastUpdatedAt` mais recente
+> (`AUTH-MSAL-RT-EXPIRY-001`). Com isso, `auth --silent` re-logou **sem janela** e trouxe RT novo,
+> e a troca de tokens seguinte passou (verificado pelo dono no mesmo dia).
 
 ### 2.3 Subcomandos mínimos do binário `f365` (os quatro provam o gate)
 
