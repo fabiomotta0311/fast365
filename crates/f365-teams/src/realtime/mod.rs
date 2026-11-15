@@ -191,6 +191,34 @@ where
     }
 }
 
+fn silence_error(clock: &dyn Clock, last_received: Instant) -> TeamsError {
+    TeamsError::Realtime(format!(
+        "sem frames do servidor há {}s — conexão considerada morta",
+        clock
+            .now()
+            .saturating_duration_since(last_received)
+            .as_secs()
+    ))
+}
+
+async fn send_before_silence<S>(
+    ws: &mut S,
+    message: Message,
+    clock: &dyn Clock,
+    last_received: Instant,
+    silence: Duration,
+) -> Result<(), TeamsError>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    let remaining = silence.saturating_sub(clock.now().saturating_duration_since(last_received));
+    tokio::select! {
+        biased;
+        () = clock.sleep(remaining) => Err(silence_error(clock, last_received)),
+        result = ws.send(message) => result.map_err(|e| TeamsError::Realtime(format!("falha ao escrever no socket: {}", ws_error_kind(&e)))),
+    }
+}
+
 /// Laço de uma sessão conectada. `Ok(())` = servidor encerrou normalmente.
 async fn run_session<S>(
     ws: &mut S,
@@ -207,25 +235,20 @@ where
             h.saturating_sub(Duration::from_secs(5))
         })
         .max(Duration::from_secs(5));
-    let mut next_keepalive: Instant = clock.now() + every;
+    let invalid_heartbeat =
+        || TeamsError::Realtime("intervalo de heartbeat fora do intervalo representável".into());
+    let mut next_keepalive: Instant = clock
+        .now()
+        .checked_add(every)
+        .ok_or_else(invalid_heartbeat)?;
     let silence = heartbeat
         .filter(|h| !h.is_zero())
         .map_or(Duration::from_secs(75), |h| h.saturating_mul(2));
     let mut last_received = clock.now();
-    let send_err = |e: WsError| {
-        TeamsError::Realtime(format!(
-            "falha ao escrever no socket: {}",
-            ws_error_kind(&e)
-        ))
-    };
-
     loop {
         let now = clock.now();
         if now.saturating_duration_since(last_received) >= silence {
-            return Err(TeamsError::Realtime(format!(
-                "sem frames do servidor há {}s — conexão considerada morta",
-                now.saturating_duration_since(last_received).as_secs()
-            )));
+            return Err(silence_error(clock, last_received));
         }
         let wait = next_keepalive
             .saturating_duration_since(now)
@@ -239,10 +262,18 @@ where
             if clock.now().saturating_duration_since(last_received) >= silence {
                 continue;
             }
-            ws.send(Message::text(socketio::encode(&Frame::Heartbeat)))
-                .await
-                .map_err(send_err)?;
-            next_keepalive = clock.now() + every;
+            send_before_silence(
+                ws,
+                Message::text(socketio::encode(&Frame::Heartbeat)),
+                clock,
+                last_received,
+                silence,
+            )
+            .await?;
+            next_keepalive = clock
+                .now()
+                .checked_add(every)
+                .ok_or_else(invalid_heartbeat)?;
             continue;
         };
         if matches!(incoming, Some(Ok(_))) {
@@ -261,16 +292,22 @@ where
         };
         match socketio::parse(text.as_str()) {
             Some(Frame::Heartbeat) => {
-                ws.send(Message::text(socketio::encode(&Frame::Heartbeat)))
-                    .await
-                    .map_err(send_err)?;
+                send_before_silence(
+                    ws,
+                    Message::text(socketio::encode(&Frame::Heartbeat)),
+                    clock,
+                    last_received,
+                    silence,
+                )
+                .await?;
             }
             Some(Frame::Message { data, .. }) => {
                 let Ok(msg) = serde_json::from_str::<Value>(&data) else {
                     continue;
                 };
                 if let Some(reply) = trouter::response_for(&msg) {
-                    ws.send(Message::text(reply)).await.map_err(send_err)?;
+                    send_before_silence(ws, Message::text(reply), clock, last_received, silence)
+                        .await?;
                 }
                 on_event(RealtimeEvent::Changed {
                     conversation: trouter::conversation_of(&msg),
@@ -648,6 +685,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_keepalive_write_cannot_hide_silence() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Blocked;
+        impl Stream for Blocked {
+            type Item = Result<Message, WsError>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Pending
+            }
+        }
+        impl Sink<Message> for Blocked {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let clock = ManualClock::default();
+        let ticker = clock.clone();
+        let mut session = tokio::spawn(async move {
+            run_session(
+                &mut Blocked,
+                &ticker,
+                Some(Duration::from_secs(40)),
+                &mut |_| {},
+            )
+            .await
+        });
+        while clock.pending_sleepers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(35));
+        tokio::task::yield_now().await;
+        clock.advance(Duration::from_secs(45));
+        let result = tokio::time::timeout(Duration::from_millis(250), &mut session).await;
+        assert!(result
+            .expect("blocked write must respect silence deadline")
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("sem frames do servidor"));
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_heartbeat_is_rejected_without_panicking() {
+        let (url, server) = scripted_server(vec![], 100).await;
+        let (mut ws, _) = connect_async(url).await.unwrap();
+        let result = run_session(
+            &mut ws,
+            &ManualClock::default(),
+            Some(Duration::from_secs(u64::MAX)),
+            &mut |_| {},
+        )
+        .await;
+        server.abort();
+        assert!(matches!(result, Err(TeamsError::Realtime(_))));
+    }
+
+    #[tokio::test]
     async fn silent_server_times_out_at_deadline() {
         let (url, server) = scripted_server(vec![], 100).await;
         let (mut ws, _) = connect_async(url).await.unwrap();
@@ -670,6 +776,62 @@ mod tests {
             err.to_string().contains("sem frames do servidor há 80s"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn frequent_server_frames_do_not_postpone_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            while rx.recv().await.is_some() {
+                ws.send(Message::text(
+                    r#"5:::{"name":"trouter.connected","args":[]}"#,
+                ))
+                .await
+                .unwrap();
+            }
+            let msg = ws.next().await.unwrap().unwrap();
+            reply_tx.send(msg).unwrap();
+        });
+        let (mut ws, _) = connect_async(url).await.unwrap();
+        let clock = ManualClock::default();
+        let ticker = clock.clone();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(async move {
+            run_session(
+                &mut ws,
+                &ticker,
+                Some(Duration::from_secs(40)),
+                &mut |event| {
+                    let _ = events_tx.send(event);
+                },
+            )
+            .await
+        });
+        while clock.pending_sleepers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..3 {
+            clock.advance(Duration::from_secs(10));
+            tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        drop(tx);
+        clock.advance(Duration::from_secs(5));
+        let reply = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("keepalive must fire at original 35s deadline")
+            .unwrap();
+        assert_eq!(reply, Message::text("2::"));
+        server.await.unwrap();
+        session.abort();
     }
 
     #[tokio::test]
