@@ -81,7 +81,9 @@ impl ManualClock {
 
     /// Quantos `sleep` estão aguardando (útil para sincronizar o teste com a tarefa testada).
     pub fn pending_sleepers(&self) -> usize {
-        self.lock().sleepers.len()
+        let mut state = self.lock();
+        state.sleepers.retain(|(_, sender)| !sender.is_closed());
+        state.sleepers.len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ManualState> {
@@ -111,6 +113,7 @@ impl Clock for ManualClock {
     async fn sleep(&self, duration: Duration) {
         let rx = {
             let mut state = self.lock();
+            state.sleepers.retain(|(_, sender)| !sender.is_closed());
             if duration.is_zero() {
                 return;
             }
@@ -161,6 +164,21 @@ mod tests {
 
         clock.advance(Duration::from_secs(1));
         task.await.expect("sleep deve terminar no prazo");
+        assert_eq!(clock.pending_sleepers(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_sleep_is_removed() {
+        let clock = ManualClock::default();
+        let task = tokio::spawn({
+            let clock = clock.clone();
+            async move { clock.sleep(Duration::from_secs(100)).await }
+        });
+        while clock.pending_sleepers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
         assert_eq!(clock.pending_sleepers(), 0);
     }
 

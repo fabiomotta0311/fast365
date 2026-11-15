@@ -25,6 +25,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 const CONNECT_CONFIRM: Duration = Duration::from_secs(15);
 /// Keep-alive quando o handshake não informa o heartbeat do servidor.
 const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const MAX_CONSECUTIVE_FAILURES: u32 = 8;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -57,17 +58,12 @@ impl TeamsClient {
                 }
                 on_event(event);
             };
-            let err = match self.listen_once(clock, &mut forward, &mut ever_ready).await {
-                Ok(()) => None,
-                // Antes da primeira conexão, falhar rápido: é contrato de protocolo, não rede.
+            let ended_ok = match self.listen_once(clock, &mut forward, &mut ever_ready).await {
+                Ok(()) => true,
                 Err(e) if !ever_ready => return Err(e),
-                Err(e) => Some(e),
+                Err(_) => false,
             };
-            failures = next_failure_count(failures, err.is_none(), session_ready);
-            if failures > MAX_CONSECUTIVE_FAILURES {
-                return Err(err
-                    .unwrap_or_else(|| TeamsError::Realtime("Trouter caiu repetidamente".into())));
-            }
+            failures = next_failure_count(failures, ended_ok, session_ready);
             let after = MAX_BACKOFF.min(Duration::from_secs(1 << failures.min(6)));
             on_event(RealtimeEvent::Reconnecting {
                 attempt: failures,
@@ -142,7 +138,7 @@ fn next_failure_count(previous: u32, ended_ok: bool, session_ready: bool) -> u32
     if ended_ok || session_ready {
         1
     } else {
-        previous + 1
+        previous.saturating_add(1)
     }
 }
 
@@ -212,6 +208,10 @@ where
         })
         .max(Duration::from_secs(5));
     let mut next_keepalive: Instant = clock.now() + every;
+    let silence = heartbeat
+        .filter(|h| !h.is_zero())
+        .map_or(Duration::from_secs(75), |h| h.saturating_mul(2));
+    let mut last_received = clock.now();
     let send_err = |e: WsError| {
         TeamsError::Realtime(format!(
             "falha ao escrever no socket: {}",
@@ -220,19 +220,34 @@ where
     };
 
     loop {
-        let wait = next_keepalive.saturating_duration_since(clock.now());
+        let now = clock.now();
+        if now.saturating_duration_since(last_received) >= silence {
+            return Err(TeamsError::Realtime(format!(
+                "sem frames do servidor há {}s — conexão considerada morta",
+                now.saturating_duration_since(last_received).as_secs()
+            )));
+        }
+        let wait = next_keepalive
+            .saturating_duration_since(now)
+            .min(silence.saturating_sub(now.saturating_duration_since(last_received)));
         // Decide primeiro, age depois: a leitura empresta o socket até o `select!` terminar.
         let incoming = tokio::select! {
             m = ws.next() => Some(m),
             () = clock.sleep(wait) => None,
         };
         let Some(incoming) = incoming else {
+            if clock.now().saturating_duration_since(last_received) >= silence {
+                continue;
+            }
             ws.send(Message::text(socketio::encode(&Frame::Heartbeat)))
                 .await
                 .map_err(send_err)?;
             next_keepalive = clock.now() + every;
             continue;
         };
+        if matches!(incoming, Some(Ok(_))) {
+            last_received = clock.now();
+        }
         let text = match incoming {
             None | Some(Ok(Message::Close(_))) => return Ok(()),
             Some(Err(e)) => {
@@ -286,7 +301,33 @@ mod tests {
     use tokio_tungstenite::{accept_async, connect_async};
 
     #[tokio::test]
-    async fn listen_retries_ready_error_sessions_and_stops_at_failure_limit() {
+    async fn first_failure_before_ready_is_returned_immediately() {
+        use async_trait::async_trait;
+        use f365_auth::{AuthOp, AuthenticatedExecutor, ExecError};
+        struct Failing;
+        #[async_trait]
+        impl AuthenticatedExecutor for Failing {
+            async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }
+        }
+        let client = TeamsClient::new(Arc::new(Failing));
+        let mut events = Vec::new();
+        let result = client
+            .listen(&ManualClock::default(), &mut |e| events.push(e))
+            .await;
+        assert!(matches!(result, Err(TeamsError::Http { status: 503, .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, RealtimeEvent::Reconnecting { .. })));
+    }
+
+    #[tokio::test]
+    async fn listen_retries_ready_error_sessions_beyond_failure_limit() {
         use async_trait::async_trait;
         use f365_auth::{AuthOp, AuthenticatedExecutor, ExecError};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -297,8 +338,7 @@ mod tests {
         impl AuthenticatedExecutor for ScriptedExec {
             async fn execute(&self, op: AuthOp) -> Result<HttpResponse, ExecError> {
                 let call = self.0.fetch_add(1, Ordering::SeqCst);
-                // Two complete sessions separated by two failed connection requests,
-                // followed by eight failed requests; the last reaches the limit.
+                // Two ready sessions with failures in between and more than eight afterward.
                 let (status, body) = match call {
                     0 | 5 => (
                         200,
@@ -306,8 +346,8 @@ mod tests {
                     ),
                     1 | 6 => (200, "sid:40:60:websocket"),
                     2 | 7 => (200, "{}"),
-                    3 | 4 | 8..=15 => (503, ""),
-                    _ => panic!("unexpected request {call}"),
+                    3 | 4 | 8..=16 => (503, ""),
+                    _ => std::future::pending().await,
                 };
                 assert_eq!(op.resource, f365_auth::Resource::Trouter);
                 Ok(HttpResponse {
@@ -351,8 +391,8 @@ mod tests {
         client.realtime_test_url = Some(url);
         let clock = RetryClock::default();
         let mut events = Vec::new();
-        let err = tokio::time::timeout(
-            Duration::from_secs(10),
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
             client.listen(&clock, &mut |event| {
                 if matches!(event, RealtimeEvent::Reconnecting { .. }) {
                     clock.1.store(true, Ordering::SeqCst);
@@ -360,12 +400,10 @@ mod tests {
                 events.push(event)
             }),
         )
-        .await
-        .expect("listen must terminate")
-        .unwrap_err();
+        .await;
         server.await.unwrap();
-        assert!(matches!(err, TeamsError::Http { status: 503, .. }));
-        assert_eq!(exec.0.load(Ordering::SeqCst), 16);
+        assert!(result.is_err(), "listen must continue after nine failures");
+        assert_eq!(exec.0.load(Ordering::SeqCst), 18);
         assert_eq!(
             events
                 .iter()
@@ -393,7 +431,9 @@ mod tests {
                 (5, 32),
                 (6, 60),
                 (7, 60),
-                (8, 60)
+                (8, 60),
+                (9, 60),
+                (10, 60)
             ]
         );
         assert_eq!(
@@ -422,6 +462,7 @@ mod tests {
             count = next_failure_count(count, false, false);
         }
         assert!(count > MAX_CONSECUTIVE_FAILURES);
+        assert_eq!(next_failure_count(u32::MAX, false, false), u32::MAX);
     }
 
     #[test]
@@ -528,6 +569,106 @@ mod tests {
         assert!(
             !format!("{events:?}").contains("texto privado"),
             "conteúdo nunca sai da sessão"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_extends_silence_deadline_but_sent_frames_do_not() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (send_heartbeat, receive_heartbeat) = tokio::sync::oneshot::channel::<()>();
+        let (ack, acked) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            receive_heartbeat.await.unwrap();
+            ws.send(Message::text("2::")).await.unwrap();
+            while let Some(Ok(msg)) = ws.next().await {
+                if msg == Message::text("2::") {
+                    let _ = ack.send(());
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        let (mut ws, _) = connect_async(url).await.unwrap();
+        let clock = ManualClock::default();
+        let ticker = clock.clone();
+        let mut session = tokio::spawn(async move {
+            run_session(&mut ws, &ticker, Some(Duration::from_secs(40)), &mut |_| {}).await
+        });
+        while clock.pending_sleepers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(30));
+        send_heartbeat.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), acked)
+            .await
+            .unwrap()
+            .unwrap();
+        while clock.pending_sleepers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(50));
+        tokio::task::yield_now().await;
+        assert!(!session.is_finished());
+        clock.advance(Duration::from_secs(30));
+        let err = tokio::time::timeout(Duration::from_secs(2), &mut session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("sem frames do servidor há 80s"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_or_zero_heartbeat_uses_default_silence_deadline() {
+        for heartbeat in [None, Some(Duration::ZERO)] {
+            let (url, server) = scripted_server(vec![], 100).await;
+            let (mut ws, _) = connect_async(url).await.unwrap();
+            let clock = ManualClock::default();
+            let ticker = clock.clone();
+            let mut session =
+                tokio::spawn(
+                    async move { run_session(&mut ws, &ticker, heartbeat, &mut |_| {}).await },
+                );
+            while clock.pending_sleepers() == 0 {
+                tokio::task::yield_now().await;
+            }
+            clock.advance(Duration::from_secs(75));
+            let err = tokio::time::timeout(Duration::from_secs(2), &mut session)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(err.to_string().contains("sem frames do servidor há 75s"));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_server_times_out_at_deadline() {
+        let (url, server) = scripted_server(vec![], 100).await;
+        let (mut ws, _) = connect_async(url).await.unwrap();
+        let clock = ManualClock::default();
+        let ticker = clock.clone();
+        let mut session = tokio::spawn(async move {
+            run_session(&mut ws, &ticker, Some(Duration::from_secs(40)), &mut |_| {}).await
+        });
+        while clock.pending_sleepers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(80));
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut session).await;
+        server.abort();
+        let err = result
+            .expect("deadline must terminate session")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("sem frames do servidor há 80s"),
+            "{err}"
         );
     }
 
