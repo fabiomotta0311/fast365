@@ -29,7 +29,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Abre WebView, captura a sessão e grava o refresh token no keyring.
-    Auth,
+    Auth {
+        /// Começa com a janela escondida (re-login pelos cookies do perfil); ela só aparece se o
+        /// Microsoft pedir login. É o que o re-pareamento automático usa.
+        #[arg(long)]
+        silent: bool,
+    },
     /// Lista conversas/canais (troca de tokens + GET chatsvcagg).
     Chats {
         #[arg(long, default_value_t = 20)]
@@ -60,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Auth => session_cmd::auth()?,
+        Command::Auth { silent } => session_cmd::auth(silent)?,
         Command::Chats { top } => chats_cmd::chats(top).await?,
         Command::Listen => listen_cmd::listen().await?,
         Command::Send { chat_id, text } => send_cmd::send(&chat_id, &text).await?,

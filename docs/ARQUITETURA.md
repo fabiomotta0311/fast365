@@ -394,6 +394,13 @@ serde_json.workspace = true
 > `crates/f365-auth/src/profile/teams-web.json`. Em aberto: `AUTH-RT-SPA-001` (validade fixa ~24 h
 > desde o login) — medir resgatando depois de 24 h da captura.
 
+> **`AUTH-RT-SPA-001` confirmado (2026-11-15).** O RT do cliente web tem validade fixa (~24 h
+> desde o login, não estendida pela rotação): recusado com `AADSTS700084` mais de 24 h após a captura. O
+> `f365 auth` seguinte re-logou **sem senha** pelos cookies do perfil persistente. Decisão: o
+> `TokenBroker` re-pareia sozinho **uma vez por processo** (WebView escondida; a janela só aparece se
+> o Microsoft pedir login). Mesmo caminho do prior art `danieldaeschle/rusty-teams`, que não guarda
+> RT e recarrega a página parqueada para o MSAL dela re-logar.
+
 ### 2.3 Subcomandos mínimos do binário `f365` (os quatro provam o gate)
 
 ```

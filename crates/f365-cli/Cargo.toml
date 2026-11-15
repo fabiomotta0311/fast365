@@ -15,6 +15,7 @@ path = "src/main.rs"
 webview = ["f365-auth/webview"]
 
 [dependencies]
+async-trait.workspace = true
 f365-auth  = { path = "../f365-auth" }
 f365-teams = { path = "../f365-teams" }
 tokio.workspace = true

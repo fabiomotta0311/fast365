@@ -11,10 +11,12 @@
 //! - `AUTH-MSAL-ACTIVE-001` (UNVERIFIED): a conta escolhida na página fica em
 //!   `msal.<clientId>.active-account-filters` (JSON `homeAccountId`/`localAccountId`/`tenantId`) ou,
 //!   no MSAL v2, `msal.<clientId>.active-account` (`localAccountId` em texto).
-//! - `AUTH-RT-SPA-001` (PARCIAL): VERIFIED que o RT é do cliente **web** (`5e3ce6c0-…`, sem
-//!   `familyId`) — não do nativo `1fec8e78-…`. UNVERIFIED: validade fixa de ~24 h e vínculo à
-//!   origem; medir na troca de tokens (#8). Risco ao Checkpoint F; mitigação = perfil persistente
-//!   da WebView (cookies `ESTSAUTHPERSISTENT`) para re-login silencioso.
+//! - `AUTH-RT-SPA-001` (VERIFIED, 2026-11-15): o RT é do cliente **web** (`5e3ce6c0-…`, sem
+//!   `familyId`) e tem **validade fixa**: login em 13/11 23:04 → recusado com `AADSTS700084` em
+//!   15/11, mesmo com resgates bem-sucedidos no meio (rotação não estende). O `f365 auth` seguinte
+//!   **re-logou sem senha** pelos cookies do perfil persistente da WebView → base do
+//!   re-pareamento automático (`TokenBroker::with_repair` + captura `silent`), o mesmo caminho
+//!   do prior art (rusty-teams recarrega a página e deixa o MSAL dela re-logar).
 //! - `AUTH-COOKIES-001` (VERIFIED): `login.microsoftonline.com` entrega cookies de sessão do Entra
 //!   (`ESTSAUTH*`/`buid`/`esctx`; 5 na captura, > 2560 B no total → exige o vault em pedaços).
 //! - `AUTH-ORIGIN-001`: só aceitamos storage lido nas origens HTTPS exatas do Teams Web

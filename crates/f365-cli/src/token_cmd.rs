@@ -20,11 +20,15 @@ pub enum Resource {
 }
 
 pub fn broker() -> anyhow::Result<TokenBroker> {
-    Ok(TokenBroker::new(
+    let broker = TokenBroker::new(
         Vault::keyring(),
         Arc::new(RustTransport::new()?),
         Arc::new(SystemClock),
-    ))
+    );
+    // RT de SPA vence em ~24 h: com a WebView disponível, re-pareia sozinho (AUTH-RT-SPA-001).
+    #[cfg(feature = "webview")]
+    let broker = broker.with_repair(Arc::new(crate::session_cmd::SilentRepair));
+    Ok(broker)
 }
 
 pub async fn token(resource: Resource) -> anyhow::Result<()> {

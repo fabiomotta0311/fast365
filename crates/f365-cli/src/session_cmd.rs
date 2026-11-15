@@ -6,15 +6,50 @@ use f365_auth::vault::{StoredAccount, Vault};
 use f365_auth::{Clock, SystemClock};
 use std::time::Duration;
 
+/// Perfil persistente da WebView: é ele que permite re-logar sem senha (`AUTH-RT-SPA-001`).
 #[cfg(feature = "webview")]
-pub fn auth() -> anyhow::Result<()> {
+pub fn profile_dir() -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
+    let local = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA não definido")?;
+    Ok(std::path::Path::new(&local).join("fast365").join("webview"))
+}
+
+/// Re-pareamento automático para o broker: WebView escondida com o perfil persistente; só aparece
+/// se o Microsoft pedir login. Precisa de runtime multi-thread (`block_in_place`).
+#[cfg(feature = "webview")]
+pub struct SilentRepair;
+
+#[cfg(feature = "webview")]
+#[async_trait::async_trait]
+impl f365_auth::tokens::SessionRepair for SilentRepair {
+    async fn repair(&self) -> Result<(), String> {
+        use f365_auth::capture::{pair, CaptureOptions};
+        eprintln!("Sessão expirada (RT de ~24 h) — renovando o login em segundo plano…");
+        let dir = profile_dir().map_err(|e| e.to_string())?;
+        tokio::task::block_in_place(|| {
+            pair(
+                &CaptureOptions::new(dir).silent(),
+                &SystemClock,
+                &Vault::keyring(),
+            )
+        })
+        .map(|_| eprintln!("Login renovado sem interação."))
+        .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "webview")]
+pub fn auth(silent: bool) -> anyhow::Result<()> {
     use f365_auth::capture::{pair, CaptureOptions};
     use f365_auth::vault::SERVICE;
 
-    let local = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA não definido")?;
-    let opts = CaptureOptions::new(std::path::Path::new(&local).join("fast365").join("webview"));
-    println!("Abrindo o Teams Web — entre com a sua conta (senha + MFA) na janela.");
+    let mut opts = CaptureOptions::new(profile_dir()?);
+    if silent {
+        opts = opts.silent();
+        println!("Re-login silencioso: a janela só aparece se o Microsoft pedir login.");
+    } else {
+        println!("Abrindo o Teams Web — entre com a sua conta (senha + MFA) na janela.");
+    }
     let account = pair(&opts, &SystemClock, &Vault::keyring())?;
     println!(
         "Sessão capturada. Refresh token + {} cookie(s) de sessão gravados no keyring (serviço `{SERVICE}`).\n",
@@ -25,7 +60,7 @@ pub fn auth() -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "webview"))]
-pub fn auth() -> anyhow::Result<()> {
+pub fn auth(_silent: bool) -> anyhow::Result<()> {
     bail!("`f365 auth` precisa da WebView: rode no Windows com `cargo run -p f365-cli --features webview -- auth`")
 }
 
