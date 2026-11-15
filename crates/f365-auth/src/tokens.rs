@@ -18,6 +18,7 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -113,6 +114,17 @@ pub enum TokenError {
     },
     #[error("resposta inesperada de {0} — o contrato de protocolo mudou?")]
     Malformed(&'static str),
+    /// O RT venceu e o re-pareamento silencioso não conseguiu outro.
+    #[error("a sessão expirou e o re-login automático falhou ({0}): rode `f365 auth`")]
+    RepairFailed(String),
+}
+
+/// Re-pareamento automático da sessão (`AUTH-RT-SPA-001`): o RT do cliente web vale ~24 h fixas;
+/// quando o Entra o recusa, quem implementa isto recaptura a sessão (ex.: WebView escondida com o
+/// perfil persistente) e grava no vault. O broker chama no máximo **uma vez** por processo.
+#[async_trait::async_trait]
+pub trait SessionRepair: Send + Sync {
+    async fn repair(&self) -> Result<(), String>;
 }
 
 #[derive(Default)]
@@ -127,6 +139,8 @@ pub struct TokenBroker {
     clock: Arc<dyn Clock>,
     profile: Profile,
     cache: Mutex<Cache>,
+    repair: Option<Arc<dyn SessionRepair>>,
+    repaired: AtomicBool,
 }
 
 impl TokenBroker {
@@ -137,7 +151,15 @@ impl TokenBroker {
             clock,
             profile: Profile::teams_web(),
             cache: Mutex::default(),
+            repair: None,
+            repaired: AtomicBool::new(false),
         }
+    }
+
+    /// Liga o re-pareamento automático quando o Entra recusar o RT.
+    pub fn with_repair(mut self, repair: Arc<dyn SessionRepair>) -> Self {
+        self.repair = Some(repair);
+        self
     }
 
     /// Garante um access token válido para `resource` e devolve só os claims dele.
@@ -161,9 +183,28 @@ impl TokenBroker {
                 return Ok(t.clone());
             }
         }
-        let token = self.redeem(resource).await?;
+        let token = match self.redeem(resource).await {
+            Err(TokenError::RefreshRejected { code }) => {
+                self.repair_once(code).await?;
+                // Sessão nova no vault: o skype token antigo também é de outra geração.
+                cache.skype = None;
+                self.redeem(resource).await?
+            }
+            other => other?,
+        };
         cache.access.insert(resource, token.clone());
         Ok(token)
+    }
+
+    /// Uma tentativa de re-pareamento por processo; sem gancho (ou já tentado), o erro original sobe.
+    async fn repair_once(&self, code: String) -> Result<(), TokenError> {
+        let Some(repair) = &self.repair else {
+            return Err(TokenError::RefreshRejected { code });
+        };
+        if self.repaired.swap(true, Ordering::SeqCst) {
+            return Err(TokenError::RefreshRejected { code });
+        }
+        repair.repair().await.map_err(TokenError::RepairFailed)
     }
 
     /// Descarta o access token em cache (o servidor o recusou com 401): o próximo uso resgata outro.
@@ -473,6 +514,7 @@ mod tests {
         transport: Arc<FakeTransport>,
         clock: ManualClock,
         vault: Vault,
+        store: MemoryStore,
     }
 
     const CAPTURED: u64 = 1_700_000_000;
@@ -511,7 +553,8 @@ mod tests {
             broker,
             transport,
             clock,
-            vault: Vault::with_store(store),
+            vault: Vault::with_store(store.clone()),
+            store,
         }
     }
 
@@ -728,5 +771,134 @@ mod tests {
         let r: TokenResponse =
             serde_json::from_value(json!({"access_token": "x", "expires_in": "3599"})).unwrap();
         assert_eq!(r.expires_in.seconds(), Some(3599));
+    }
+
+    /// Re-pareamento falso: grava uma sessão nova (RT `rt-reparado`) como a WebView faria.
+    struct FakeRepair {
+        store: MemoryStore,
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl SessionRepair for FakeRepair {
+        async fn repair(&self) -> Result<(), String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err("janela fechada".into());
+            }
+            let vault = Vault::with_store(self.store.clone());
+            let mut session = vault.load_session().unwrap().unwrap();
+            session.refresh_token.secret = Secret::new("rt-reparado");
+            vault
+                .save(
+                    &session,
+                    UNIX_EPOCH + Duration::from_secs(CAPTURED + 90_000),
+                )
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    fn with_fake_repair(
+        h: Harness,
+        fail: bool,
+    ) -> (TokenBroker, Arc<FakeTransport>, Arc<FakeRepair>, Vault) {
+        let repair = Arc::new(FakeRepair {
+            store: h.store.clone(),
+            calls: Default::default(),
+            fail,
+        });
+        (
+            h.broker.with_repair(repair.clone()),
+            h.transport,
+            repair,
+            h.vault,
+        )
+    }
+
+    fn spa_expired() -> Value {
+        json!({"error": "invalid_grant", "error_codes": [700084]})
+    }
+
+    /// AUTH-RT-SPA-001: RT de 24 h vencido → re-pareia uma vez e segue com o RT novo.
+    #[tokio::test]
+    async fn expired_spa_token_triggers_one_silent_repair_and_retries() {
+        let (broker, transport, repair, vault) = with_fake_repair(harness(true), false);
+        transport.reply(400, spa_expired());
+        transport.reply(
+            200,
+            token_ok("https://api.spaces.skype.com", 3_600, Some("rt-novo")),
+        );
+
+        let info = broker.describe(TokenResource::Teams).await.unwrap();
+
+        assert_eq!(
+            info.claims.audience.as_deref(),
+            Some("https://api.spaces.skype.com")
+        );
+        assert_eq!(repair.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let sent = transport.sent();
+        assert_eq!(form(&sent[0])["refresh_token"], "rt-antigo");
+        assert_eq!(
+            form(&sent[1])["refresh_token"],
+            "rt-reparado",
+            "retentativa usa a sessão recapturada"
+        );
+        assert_eq!(
+            vault
+                .load_session()
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .secret
+                .expose(),
+            "rt-novo"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_repair_is_reported_once() {
+        let (broker, transport, repair, _) = with_fake_repair(harness(true), true);
+        transport.reply(400, spa_expired());
+        let err = broker.describe(TokenResource::Teams).await.unwrap_err();
+        assert!(
+            matches!(&err, TokenError::RepairFailed(m) if m.contains("janela fechada")),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("f365 auth"));
+        assert_eq!(repair.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Nunca entra em loop: recusado de novo depois do reparo → erro, e não repara outra vez.
+    #[tokio::test]
+    async fn repair_runs_at_most_once_per_process() {
+        let (broker, transport, repair, _) = with_fake_repair(harness(true), false);
+        transport.reply(400, spa_expired());
+        transport.reply(400, spa_expired());
+        assert!(matches!(
+            broker.describe(TokenResource::Teams).await,
+            Err(TokenError::RefreshRejected { .. })
+        ));
+        transport.reply(400, spa_expired());
+        assert!(matches!(
+            broker.describe(TokenResource::Teams).await,
+            Err(TokenError::RefreshRejected { .. })
+        ));
+        assert_eq!(repair.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn other_errors_do_not_trigger_repair() {
+        let (broker, transport, repair, _) = with_fake_repair(harness(true), false);
+        transport.reply(
+            400,
+            json!({"error": "invalid_request", "error_codes": [9002327]}),
+        );
+        assert!(matches!(
+            broker.describe(TokenResource::Teams).await,
+            Err(TokenError::SpaOrigin)
+        ));
+        assert_eq!(repair.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

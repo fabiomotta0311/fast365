@@ -88,6 +88,33 @@ impl BlockerTimer {
     }
 }
 
+/// Hosts de login do Entra/Microsoft: se a página cair num deles, é preciso o usuário.
+const LOGIN_HOSTS: [&str; 3] = [
+    "login.microsoftonline.com",
+    "login.live.com",
+    "login.windows.net",
+];
+
+/// A navegação foi para uma tela de login (só o host conta; o caminho/query podem trazer códigos).
+pub(crate) fn is_login_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| LOGIN_HOSTS.contains(&h)))
+        .unwrap_or(false)
+}
+
+/// Modo silencioso (re-pareamento automático, `AUTH-RT-SPA-001`): a janela começa escondida e só
+/// aparece se o Microsoft pedir login ou se a captura não sair em `reveal_after` (ex.: tela de
+/// escolher conta). No modo interativo ela já nasce visível.
+pub(crate) fn should_reveal(
+    silent: bool,
+    login_seen: bool,
+    elapsed: Duration,
+    reveal_after: Duration,
+) -> bool {
+    !silent || login_seen || elapsed >= reveal_after
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +177,42 @@ mod tests {
             1,
             "https://login.microsoftonline.com",
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+        ));
+    }
+
+    #[test]
+    fn silent_window_stays_hidden_until_login_or_timeout() {
+        let r = Duration::from_secs(20);
+        assert!(
+            !should_reveal(true, false, Duration::from_secs(5), r),
+            "re-login silencioso: escondida"
+        );
+        assert!(
+            should_reveal(true, true, Duration::from_secs(1), r),
+            "pediu login: mostra já"
+        );
+        assert!(
+            should_reveal(true, false, r, r),
+            "travou (ex.: escolher conta): mostra"
+        );
+        assert!(
+            should_reveal(false, false, Duration::ZERO, r),
+            "interativo: sempre visível"
+        );
+    }
+
+    #[test]
+    fn login_url_detection_uses_the_host_only() {
+        assert!(is_login_url(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?x=1"
+        ));
+        assert!(is_login_url("https://login.live.com/oauth20_authorize.srf"));
+        assert!(!is_login_url("https://teams.cloud.microsoft/v2/"));
+        assert!(!is_login_url(
+            "https://evil.example/login.microsoftonline.com/"
+        ));
+        assert!(!is_login_url(
+            "https://login.microsoftonline.com.evil.example/"
         ));
     }
 

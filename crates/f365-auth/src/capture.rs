@@ -14,14 +14,14 @@
 //! O perfil do WebView2 fica num diretório dedicado e persistente: é o que permite, no futuro,
 //! parquear a página (transporte in-page) e re-logar em silêncio (`AUTH-RT-SPA-001`).
 
-use crate::probe::{accept_probe, BlockerTimer, Schedule, Wake};
+use crate::probe::{accept_probe, is_login_url, should_reveal, BlockerTimer, Schedule, Wake};
 use crate::secret::Secret;
 use crate::session::{self, Blocker, CapturedSession, MsalProbe, SessionCookie};
 use crate::vault::{StoredAccount, Vault, VaultError};
 use crate::Clock;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tao::dpi::LogicalSize;
@@ -64,6 +64,10 @@ pub struct CaptureOptions {
     pub profile_dir: PathBuf,
     /// Tempo máximo para o usuário concluir login + MFA.
     pub timeout: Duration,
+    /// Re-pareamento automático: a janela nasce escondida e só aparece se o Microsoft pedir login
+    /// ou se a captura não sair em `reveal_after` (`AUTH-RT-SPA-001`).
+    pub silent: bool,
+    pub reveal_after: Duration,
 }
 
 impl CaptureOptions {
@@ -72,7 +76,15 @@ impl CaptureOptions {
             start_url: TEAMS_WEB_URL.into(),
             profile_dir,
             timeout: Duration::from_secs(600),
+            silent: false,
+            reveal_after: Duration::from_secs(20),
         }
+    }
+
+    /// Mesma captura, mas começando escondida (re-login silencioso pelos cookies do perfil).
+    pub fn silent(mut self) -> Self {
+        self.silent = true;
+        self
     }
 }
 
@@ -145,23 +157,37 @@ fn capture_session(
     let web = |e: &dyn std::fmt::Display| CaptureError::WebView(e.to_string());
     std::fs::create_dir_all(&opts.profile_dir).map_err(|e| web(&e))?;
 
-    let mut event_loop = EventLoopBuilder::<ProbeResult>::with_user_event().build();
+    let mut builder = EventLoopBuilder::<ProbeResult>::with_user_event();
+    // O re-pareamento automático pode rodar fora da thread principal (no meio de um comando).
+    #[cfg(windows)]
+    {
+        use tao::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_any_thread(true);
+    }
+    let mut event_loop = builder.build();
     let proxy = event_loop.create_proxy();
     let window = WindowBuilder::new()
         .with_title("Fast365 — entre na sua conta Microsoft")
         .with_inner_size(LogicalSize::new(520.0, 760.0))
+        .with_visible(!opts.silent)
         .build(&event_loop)
         .map_err(|e| web(&e))?;
 
     // Toda navegação de topo invalida as sondas em voo do documento anterior.
     let generation = Arc::new(AtomicU64::new(0));
+    // Navegou para tela de login: no modo silencioso, é hora de mostrar a janela.
+    let login_seen = Arc::new(AtomicBool::new(false));
     let mut context = WebContext::new(Some(opts.profile_dir.clone()));
     let webview = WebViewBuilder::new_with_web_context(&mut context)
         .with_url(&opts.start_url)
         .with_navigation_handler({
             let generation = Arc::clone(&generation);
-            move |_url| {
+            let login_seen = Arc::clone(&login_seen);
+            move |url| {
                 generation.fetch_add(1, Ordering::SeqCst);
+                if is_login_url(&url) {
+                    login_seen.store(true, Ordering::SeqCst);
+                }
                 true // login/federação podem passar por qualquer host; só a origem decide a sessão
             }
         })
@@ -182,7 +208,9 @@ fn capture_session(
         .build(&window)
         .map_err(|e| web(&e))?;
 
-    let mut schedule = Schedule::new(clock.now(), opts.timeout, PROBE_EVERY);
+    let started = clock.now();
+    let mut revealed = !opts.silent;
+    let mut schedule = Schedule::new(started, opts.timeout, PROBE_EVERY);
     let mut blockers = BlockerTimer::default();
     let mut outcome: Option<Result<CapturedSession, CaptureError>> = None;
 
@@ -267,6 +295,13 @@ fn capture_session(
                 });
             }
             None => {}
+        }
+        let elapsed = clock.now().saturating_duration_since(started);
+        let login = login_seen.load(Ordering::SeqCst);
+        if !revealed && should_reveal(opts.silent, login, elapsed, opts.reveal_after) {
+            window.set_visible(true);
+            window.set_focus();
+            revealed = true;
         }
         *control_flow = ControlFlow::WaitUntil(schedule.wait_until());
     });
