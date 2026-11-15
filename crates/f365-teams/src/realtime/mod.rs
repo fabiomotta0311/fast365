@@ -28,6 +28,8 @@ const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const MAX_CONSECUTIVE_FAILURES: u32 = 8;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_INCOMING: usize = 1024 * 1024;
+const MAX_ID: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RealtimeEvent {
@@ -111,14 +113,15 @@ impl TeamsClient {
         let ws_url = trouter::ws_url(&info, &hs.session_id, &epid);
         #[cfg(test)]
         let ws_url = self.realtime_test_url.clone().unwrap_or(ws_url);
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
-            .await
-            .map_err(|e| {
-                TeamsError::Realtime(format!(
-                    "WebSocket recusado: {} (TROUTER-WS-001)",
-                    ws_error_kind(&e)
-                ))
-            })?;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async_with_config(ws_url, Some(ws_config()), false)
+                .await
+                .map_err(|e| {
+                    TeamsError::Realtime(format!(
+                        "WebSocket recusado: {} (TROUTER-WS-001)",
+                        ws_error_kind(&e)
+                    ))
+                })?;
         await_connect(&mut ws, clock).await?;
 
         on_event(RealtimeEvent::Step("4/4 registro do endpoint"));
@@ -132,6 +135,12 @@ impl TeamsClient {
         on_event(RealtimeEvent::Ready);
         run_session(&mut ws, clock, hs.heartbeat, on_event).await
     }
+}
+
+fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_INCOMING))
+        .max_frame_size(Some(MAX_INCOMING))
 }
 
 fn next_failure_count(previous: u32, ended_ok: bool, session_ready: bool) -> u32 {
@@ -172,6 +181,11 @@ where
     let wait = async {
         while let Some(msg) = ws.next().await {
             match msg {
+                Ok(Message::Text(t)) if t.len() > MAX_INCOMING => {
+                    return Err(TeamsError::Realtime(
+                        "entrada do socket excede o limite".into(),
+                    ))
+                }
                 Ok(Message::Text(t)) => match socketio::parse(t.as_str()) {
                     Some(Frame::Connect) => return Ok(()),
                     Some(Frame::Error { .. } | Frame::Disconnect) => break,
@@ -191,6 +205,23 @@ where
     }
 }
 
+fn id_within_limit(id: &Value) -> bool {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            if self.0 > MAX_ID {
+                return Err(std::io::Error::other("limit"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counter(0), id).is_ok()
+}
+
 fn silence_error(clock: &dyn Clock, last_received: Instant) -> TeamsError {
     TeamsError::Realtime(format!(
         "sem frames do servidor há {}s — conexão considerada morta",
@@ -199,24 +230,6 @@ fn silence_error(clock: &dyn Clock, last_received: Instant) -> TeamsError {
             .saturating_duration_since(last_received)
             .as_secs()
     ))
-}
-
-async fn send_before_silence<S>(
-    ws: &mut S,
-    message: Message,
-    clock: &dyn Clock,
-    last_received: Instant,
-    silence: Duration,
-) -> Result<(), TeamsError>
-where
-    S: Sink<Message, Error = WsError> + Unpin,
-{
-    let remaining = silence.saturating_sub(clock.now().saturating_duration_since(last_received));
-    tokio::select! {
-        biased;
-        () = clock.sleep(remaining) => Err(silence_error(clock, last_received)),
-        result = ws.send(message) => result.map_err(|e| TeamsError::Realtime(format!("falha ao escrever no socket: {}", ws_error_kind(&e)))),
-    }
 }
 
 /// Laço de uma sessão conectada. `Ok(())` = servidor encerrou normalmente.
@@ -245,42 +258,78 @@ where
         .filter(|h| !h.is_zero())
         .map_or(Duration::from_secs(75), |h| h.saturating_mul(2));
     let mut last_received = clock.now();
+    let (mut sink, mut stream) = ws.split();
+    let (outgoing, mut outgoing_rx) = tokio::sync::mpsc::channel::<Message>(128);
+    let pending = std::sync::atomic::AtomicUsize::new(0);
+    let pending_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let enqueue = |message: Message| {
+        let size = message.len();
+        if pending_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(size)
+            > 256 * 1024
+        {
+            return Err(TeamsError::Realtime(
+                "orçamento de escrita do socket esgotado".into(),
+            ));
+        }
+        outgoing.try_send(message).map_err(|_| {
+            TeamsError::Realtime("fila de escrita do socket cheia ou encerrada".into())
+        })?;
+        pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pending_bytes.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    };
+    let session_end = || {
+        if pending.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            Ok(())
+        } else {
+            Err(TeamsError::Realtime(
+                "socket encerrou com mensagens de escrita pendentes".into(),
+            ))
+        }
+    };
+    let writer = async {
+        while let Some(message) = outgoing_rx.recv().await {
+            let size = message.len();
+            sink.send(message).await.map_err(|e| {
+                TeamsError::Realtime(format!(
+                    "falha ao escrever no socket: {}",
+                    ws_error_kind(&e)
+                ))
+            })?;
+            pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            pending_bytes.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok::<(), TeamsError>(())
+    };
+    tokio::pin!(writer);
     loop {
         let now = clock.now();
         if now.saturating_duration_since(last_received) >= silence {
             return Err(silence_error(clock, last_received));
         }
+        if now >= next_keepalive {
+            enqueue(Message::text(socketio::encode(&Frame::Heartbeat)))?;
+            next_keepalive = now.checked_add(every).ok_or_else(invalid_heartbeat)?;
+        }
         let wait = next_keepalive
             .saturating_duration_since(now)
             .min(silence.saturating_sub(now.saturating_duration_since(last_received)));
-        // Decide primeiro, age depois: a leitura empresta o socket até o `select!` terminar.
         let incoming = tokio::select! {
-            m = ws.next() => Some(m),
+            biased;
+            result = &mut writer => return result,
+            m = stream.next() => Some(m),
             () = clock.sleep(wait) => None,
         };
         let Some(incoming) = incoming else {
-            if clock.now().saturating_duration_since(last_received) >= silence {
-                continue;
-            }
-            send_before_silence(
-                ws,
-                Message::text(socketio::encode(&Frame::Heartbeat)),
-                clock,
-                last_received,
-                silence,
-            )
-            .await?;
-            next_keepalive = clock
-                .now()
-                .checked_add(every)
-                .ok_or_else(invalid_heartbeat)?;
             continue;
         };
         if matches!(incoming, Some(Ok(_))) {
             last_received = clock.now();
         }
         let text = match incoming {
-            None | Some(Ok(Message::Close(_))) => return Ok(()),
+            None | Some(Ok(Message::Close(_))) => return session_end(),
             Some(Err(e)) => {
                 return Err(TeamsError::Realtime(format!(
                     "socket caiu: {}",
@@ -290,24 +339,26 @@ where
             Some(Ok(Message::Text(t))) => t,
             Some(Ok(_)) => continue,
         };
+        if text.len() > MAX_INCOMING {
+            return Err(TeamsError::Realtime(
+                "entrada do socket excede o limite".into(),
+            ));
+        }
         match socketio::parse(text.as_str()) {
             Some(Frame::Heartbeat) => {
-                send_before_silence(
-                    ws,
-                    Message::text(socketio::encode(&Frame::Heartbeat)),
-                    clock,
-                    last_received,
-                    silence,
-                )
-                .await?;
+                enqueue(Message::text(socketio::encode(&Frame::Heartbeat)))?;
             }
             Some(Frame::Message { data, .. }) => {
                 let Ok(msg) = serde_json::from_str::<Value>(&data) else {
                     continue;
                 };
+                if let Some(id) = msg.get("id") {
+                    if !id_within_limit(id) {
+                        return Err(TeamsError::Realtime("id excede o limite".into()));
+                    }
+                }
                 if let Some(reply) = trouter::response_for(&msg) {
-                    send_before_silence(ws, Message::text(reply), clock, last_received, silence)
-                        .await?;
+                    enqueue(Message::text(reply))?;
                 }
                 on_event(RealtimeEvent::Changed {
                     conversation: trouter::conversation_of(&msg),
@@ -318,7 +369,7 @@ where
                     on_event(RealtimeEvent::Signal(name));
                 }
             }
-            Some(Frame::Disconnect) => return Ok(()),
+            Some(Frame::Disconnect) => return session_end(),
             Some(Frame::Error { .. }) => {
                 return Err(TeamsError::Realtime(
                     "o Trouter enviou erro e encerrou".into(),
@@ -336,6 +387,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, connect_async};
+
+    #[tokio::test]
+    async fn websocket_rejects_oversized_frame_before_session_parsing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            ws.send(Message::text("x".repeat(MAX_INCOMING + 1)))
+                .await
+                .unwrap();
+        });
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async_with_config(url, Some(ws_config()), false)
+                .await
+                .unwrap();
+        let result = run_session(&mut ws, &ManualClock::default(), None, &mut |_| {}).await;
+        assert!(matches!(result, Err(TeamsError::Realtime(s)) if s.contains("socket caiu")));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn first_failure_before_ready_is_returned_immediately() {
@@ -682,6 +753,408 @@ mod tests {
             assert!(err.to_string().contains("sem frames do servidor há 75s"));
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn replies_are_written_in_receive_order() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Socket {
+            input: tokio::sync::mpsc::UnboundedReceiver<Message>,
+            output: tokio::sync::mpsc::UnboundedSender<Message>,
+        }
+        impl Stream for Socket {
+            type Item = Result<Message, WsError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.input.poll_recv(cx).map(|x| x.map(Ok))
+            }
+        }
+        impl Sink<Message> for Socket {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(self: Pin<&mut Self>, msg: Message) -> Result<(), WsError> {
+                self.output.send(msg).unwrap();
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (tx, input) = tokio::sync::mpsc::unbounded_channel();
+        let (output, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(async move {
+            run_session(
+                &mut Socket { input, output },
+                &ManualClock::default(),
+                None,
+                &mut |_| {},
+            )
+            .await
+        });
+        for id in ["first", "second", "third"] {
+            tx.send(Message::text(format!("3:::{{\"id\":\"{id}\"}}")))
+                .unwrap();
+        }
+        for id in ["first", "second", "third"] {
+            let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(reply
+                .to_text()
+                .unwrap()
+                .contains(&format!("\"id\":\"{id}\"")));
+        }
+        drop(tx);
+        assert!(session.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_enforces_aggregate_bytes_including_inflight() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Socket(usize);
+        impl Stream for Socket {
+            type Item = Result<Message, WsError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.0 += 1;
+                if self.0 > 16 {
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Ok(Message::text(format!(
+                    "3:::{{\"id\":\"{}\"}}",
+                    "x".repeat(32 * 1024)
+                )))))
+            }
+        }
+        impl Sink<Message> for Socket {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                unreachable!()
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let mut socket = Socket(0);
+        let result = run_session(&mut socket, &ManualClock::default(), None, &mut |_| {}).await;
+        assert!(matches!(result, Err(TeamsError::Realtime(s)) if s.contains("orçamento")));
+        assert_eq!(socket.0, 8, "the in-flight message must consume the budget");
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_reports_queue_saturation() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Socket;
+        impl Stream for Socket {
+            type Item = Result<Message, WsError>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Ready(Some(Ok(Message::text("2::"))))
+            }
+        }
+        impl Sink<Message> for Socket {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                unreachable!()
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let result = run_session(&mut Socket, &ManualClock::default(), None, &mut |_| {}).await;
+        assert!(matches!(result, Err(TeamsError::Realtime(s)) if s.contains("fila de escrita")));
+    }
+
+    #[tokio::test]
+    async fn session_end_reports_unwritten_reply() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Socket(bool);
+        impl Stream for Socket {
+            type Item = Result<Message, WsError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                if self.0 {
+                    Poll::Ready(None)
+                } else {
+                    self.0 = true;
+                    Poll::Ready(Some(Ok(Message::text(r#"3:::{"id":"synthetic"}"#))))
+                }
+            }
+        }
+        impl Sink<Message> for Socket {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                unreachable!()
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let result = run_session(
+            &mut Socket(false),
+            &ManualClock::default(),
+            None,
+            &mut |_| {},
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TeamsError::Realtime(_))),
+            "session ended with an unwritten reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_reply_is_rejected_instead_of_buffered() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Socket(Option<Message>);
+        impl Stream for Socket {
+            type Item = Result<Message, WsError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                Poll::Ready(self.0.take().map(Ok))
+            }
+        }
+        impl Sink<Message> for Socket {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                unreachable!()
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let input = format!("5:::{{\"name\":\"{}\"}}", "x".repeat(MAX_INCOMING));
+        let result = run_session(
+            &mut Socket(Some(Message::text(input))),
+            &ManualClock::default(),
+            None,
+            &mut |_| {},
+        )
+        .await;
+        assert!(matches!(result, Err(TeamsError::Realtime(s)) if s.contains("entrada do socket")));
+        for id in [
+            format!("\"{}\"", "x".repeat(70_000)),
+            format!("[\"{}\"]", "x".repeat(70_000)),
+        ] {
+            let input = format!("3:::{{\"id\":{id}}}");
+            let result = run_session(
+                &mut Socket(Some(Message::text(input))),
+                &ManualClock::default(),
+                None,
+                &mut |_| {},
+            )
+            .await;
+            assert!(matches!(result, Err(TeamsError::Realtime(s)) if s.contains("id excede")));
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_server_frames_while_keepalive_write_is_blocked() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Socket {
+            rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+            blocked: Option<tokio::sync::oneshot::Sender<()>>,
+            block_flush: bool,
+        }
+        impl Stream for Socket {
+            type Item = Result<Message, WsError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.rx.poll_recv(cx).map(|m| m.map(Ok))
+            }
+        }
+        impl Sink<Message> for Socket {
+            type Error = WsError;
+            fn poll_ready(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), WsError>> {
+                if self.block_flush {
+                    return Poll::Ready(Ok(()));
+                }
+                if let Some(tx) = self.blocked.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                Ok(())
+            }
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), WsError>> {
+                if let Some(tx) = self.blocked.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        for block_flush in [false, true] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (blocked, blocked_rx) = tokio::sync::oneshot::channel();
+            let clock = ManualClock::default();
+            let ticker = clock.clone();
+            let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let session = tokio::spawn(async move {
+                run_session(
+                    &mut Socket {
+                        rx,
+                        blocked: Some(blocked),
+                        block_flush,
+                    },
+                    &ticker,
+                    Some(Duration::from_secs(40)),
+                    &mut |event| {
+                        let _ = events.send(event);
+                    },
+                )
+                .await
+            });
+            while clock.pending_sleepers() == 0 {
+                tokio::task::yield_now().await;
+            }
+            clock.advance(Duration::from_secs(35));
+            tokio::time::timeout(Duration::from_secs(2), blocked_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            clock.advance(Duration::from_secs(10));
+            tx.send(Message::text(
+                r#"5:::{"name":"trouter.connected","args":[]}"#,
+            ))
+            .unwrap();
+            tokio::time::timeout(Duration::from_millis(250), received.recv())
+                .await
+                .expect("must read events during blocked writes")
+                .unwrap();
+            clock.advance(Duration::from_secs(35));
+            tokio::task::yield_now().await;
+            assert!(
+                !session.is_finished(),
+                "frame at 45s must extend deadline past 80s"
+            );
+            session.abort();
+            assert!(session.await.unwrap_err().is_cancelled());
+            assert_eq!(clock.pending_sleepers(), 0);
+            assert!(tx.is_closed(), "cancel must release the reader and writer");
+        }
+    }
+
+    #[tokio::test]
+    async fn continuously_ready_frames_cannot_starve_keepalive() {
+        use std::{
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll},
+        };
+        struct Busy(Arc<AtomicUsize>);
+        impl Stream for Busy {
+            type Item = Result<Message, WsError>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                if self.0.load(Ordering::SeqCst) > 0 {
+                    Poll::Ready(Some(Ok(Message::Close(None))))
+                } else {
+                    Poll::Ready(Some(Ok(Message::text(
+                        r#"5:::{"name":"trouter.connected","args":[]}"#,
+                    ))))
+                }
+            }
+        }
+        impl Sink<Message> for Busy {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let clock = ManualClock::default();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut events = 0;
+        run_session(
+            &mut Busy(writes.clone()),
+            &clock,
+            Some(Duration::from_secs(40)),
+            &mut |_| {
+                events += 1;
+                if events == 1 {
+                    clock.advance(Duration::from_secs(35));
+                }
+                assert!(events < 100, "keepalive starved by ready stream");
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
