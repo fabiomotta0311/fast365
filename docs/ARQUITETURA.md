@@ -402,7 +402,8 @@ serde_json.workspace = true
 > re-logar. **Pegadinha (incidente do mesmo dia):** o cache MSAL do perfil persistente guarda o RT
 > **vencido** até a página trocá-lo; a primeira re-captura fechou sem senha mas regravou o RT morto.
 > A captura agora ignora RT com `expiresOn` passado e prefere o `lastUpdatedAt` mais recente
-> (`AUTH-MSAL-RT-EXPIRY-001`).
+> (`AUTH-MSAL-RT-EXPIRY-001`). Com isso, `auth --silent` re-logou **sem janela** e trouxe RT novo,
+> e a troca de tokens seguinte passou (verificado pelo dono no mesmo dia).
 
 ### 2.3 Subcomandos mínimos do binário `f365` (os quatro provam o gate)
 

@@ -15,9 +15,10 @@
 //!   `familyId`) e tem **validade fixa**: login em 13/11 23:04 → recusado com `AADSTS700084` em
 //!   15/11, mesmo com resgates bem-sucedidos no meio (rotação não estende). Mitigação:
 //!   re-pareamento automático (`TokenBroker::with_repair` + captura `silent`), como no prior art
-//!   (rusty-teams recarrega a página e deixa o MSAL dela re-logar). UNVERIFIED: que o re-login
-//!   silencioso traga RT **novo** — a 1ª tentativa fechou sem senha mas capturou o RT vencido.
-//! - `AUTH-MSAL-RT-EXPIRY-001` (VERIFIED pelo incidente de 2026-11-15; formato UNVERIFIED): o cache
+//!   (rusty-teams recarrega a página e deixa o MSAL dela re-logar). VERIFIED (2026-11-15, após o
+//!   fix de RT vencido): `auth --silent` sem janela trouxe RT **novo** (4 cookies ESTSAUTH*, escopos
+//!   `api.spaces.skype.com` renovados pela página) e o `token` seguinte passou.
+//! - `AUTH-MSAL-RT-EXPIRY-001` (VERIFIED, 2026-11-15): o cache
 //!   MSAL do perfil persistente mantém o RT **vencido** até a página trocá-lo; a entrada traz
 //!   `expiresOn` (s) e `lastUpdatedAt` (ms). RT vencido é ignorado e, entre os válidos, vence o
 //!   atualizado mais recentemente — mesmo critério do rusty-teams.
