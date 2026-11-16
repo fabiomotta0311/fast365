@@ -52,6 +52,15 @@ fn parse(body: &[u8]) -> Result<(Vec<HistoryMessage>, Option<String>), TeamsErro
         },
         _ => return Err(TeamsError::Malformed("HISTORY-PAGE-001 (UNVERIFIED)")),
     };
+    if link.is_none()
+        && v.get("_metadata")
+            .and_then(|m| m.get("syncState"))
+            .is_some_and(|s| !s.is_null() && s.as_str() != Some(""))
+    {
+        return Err(TeamsError::Malformed(
+            "HISTORY-PAGE-001 syncState sem continuação suportada (UNVERIFIED)",
+        ));
+    }
     Ok((out, link))
 }
 
@@ -107,6 +116,9 @@ impl TeamsClient {
         top: usize,
     ) -> Result<Vec<HistoryMessage>, TeamsError> {
         validate_chat_id(chat_id)?;
+        if top > 1000 {
+            return Err(TeamsError::Malformed("HISTORY-PAGE-001 top excede 1000"));
+        }
         if top == 0 {
             return Ok(Vec::new());
         }
@@ -116,7 +128,7 @@ impl TeamsClient {
         );
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for _ in 0..100 {
+        for _ in 0..10 {
             if !seen.insert(next.clone()) {
                 return Err(TeamsError::Malformed(
                     "HISTORY-PAGE-001 cursor cíclico (UNVERIFIED)",
@@ -187,6 +199,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_unbounded_top_before_request() {
+        let exec = fake(&[]);
+        assert!(TeamsClient::new(exec.clone())
+            .history("48:notes", 1001)
+            .await
+            .is_err());
+        assert!(exec.ops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_state_only_never_returns_partial_success() {
+        let exec = fake(&[r#"{"messages":[{"id":"1"}],"_metadata":{"syncState":"synthetic"}}"#]);
+        let result = TeamsClient::new(exec).history("48:notes", 2).await;
+        assert!(matches!(result, Err(TeamsError::Malformed(s)) if s.contains("HISTORY-PAGE-001")));
+    }
+
+    #[tokio::test]
     async fn paginates_only_within_the_conversation_and_respects_top() {
         let exec = fake(&[
             r#"{"messages":[{"id":"1"}],"_metadata":{"backwardLink":"/v1/users/ME/conversations/48:notes/messages?cursor=2"}}"#,
@@ -231,7 +260,7 @@ mod tests {
     }
     #[test]
     fn parser_and_cursor_enforce_contract() {
-        let (m, link) = parse(br#"{"messages":[{"id":"1","originalarrivaltime":"today","from":"u","content":"secret"}],"_metadata":{"syncState":"opaque"}}"#).unwrap();
+        let (m, link) = parse(br#"{"messages":[{"id":"1","originalarrivaltime":"today","from":"u","content":"secret"}]}"#).unwrap();
         assert_eq!(m[0].time.as_deref(), Some("today"));
         assert!(link.is_none());
         assert!(parse(br#"{"value":[]}"#).is_err());

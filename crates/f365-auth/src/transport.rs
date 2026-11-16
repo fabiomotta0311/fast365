@@ -59,7 +59,7 @@ impl std::fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpRequest")
             .field("method", &self.method)
-            .field("url", &self.url)
+            .field("url", &self.url.split(['?', '#']).next().unwrap_or(""))
             .field("headers", &redacted_headers(&self.headers))
             .field(
                 "body",
@@ -154,6 +154,19 @@ impl Transport for RustTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_hides_signed_url_query_and_fragment() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: "https://example.test/path?sig=syntheticsecret#syntheticfragment".into(),
+            headers: vec![],
+            body: None,
+        };
+        let debug = format!("{req:?}");
+        assert!(!debug.contains("syntheticsecret"), "{debug}");
+        assert!(!debug.contains("syntheticfragment"), "{debug}");
+    }
 
     #[test]
     fn debug_hides_body_and_auth_headers() {
