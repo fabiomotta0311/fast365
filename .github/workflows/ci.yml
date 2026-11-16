@@ -84,17 +84,28 @@ jobs:
           python crates/f365-cli/tests/windows_icon.py target/debug/f365.exe
 
   msrv:
-    name: MSRV (rust-version do Cargo.toml)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: MSRV (${{ matrix.profile }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: linux-headless
+            os: ubuntu-latest
+            arguments: --workspace --locked
+          - profile: windows-webview
+            os: windows-latest
+            arguments: --workspace --all-features --locked
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Ler rust-version (fonte única = Cargo.toml)
         id: msrv
+        shell: bash
         run: |
-          v=$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].rust_version] | unique | if length == 1 then .[0] else error("rust-version divergente entre crates: \(.)") end')
+          v=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '[.packages[].rust_version] | unique | if length == 1 and .[0] != null and .[0] != "" then .[0] else error("rust-version ausente ou divergente entre crates: \(.)") end')
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -102,7 +113,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --workspace --locked
+      - run: cargo check ${{ matrix.arguments }}
 
   deny:
     # Analisa exatamente o que é distribuído: Windows COM webview e Linux headless SEM ela.
