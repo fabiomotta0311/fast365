@@ -6,8 +6,12 @@
 //!   f365 chats   → troca de tokens + GET chatsvcagg (B, C)
 //!   f365 listen  → Trouter WS (D)
 //!   f365 send    → POST chatsvcagg (E)
+//!
+//! `f365 gate` roda os checkpoints mecanizáveis e grava o registro sanitizado da matriz (§2.4), para
+//! as duas rodadas do Go serem auditáveis (Issue #13).
 
 mod chats_cmd;
+mod gate_cmd;
 mod history_cmd;
 mod listen_cmd;
 mod send_cmd;
@@ -40,6 +44,29 @@ enum Command {
     Chats {
         #[arg(long, default_value_t = 20)]
         top: usize,
+    },
+    /// Roda os checkpoints A–E da matriz §2.4 e grava o registro sanitizado da execução (Issue #13).
+    ///
+    /// Não abre WebView e não declara Go: F exige repetir depois de ≥1 h (ver `docs/GATE-FASE0.md`).
+    Gate {
+        /// Conversa do Checkpoint E (a id sai de `f365 chats`); sem ela, E fica como não executado.
+        #[arg(long)]
+        chat: Option<String>,
+        /// Segundos de espera por um evento no Checkpoint D.
+        #[arg(long, default_value_t = 120)]
+        wait_d: u64,
+        /// Pula o Checkpoint D (não há outro cliente para disparar a mensagem agora).
+        #[arg(long)]
+        skip_d: bool,
+        /// Texto do Checkpoint E (padrão: `ping f365 gate <utc>`).
+        #[arg(long)]
+        text: Option<String>,
+        /// Diretório dos relatórios (`.gitignore` já cobre `gate-reports/`).
+        #[arg(long, default_value = "gate-reports")]
+        out: std::path::PathBuf,
+        /// Commit citado no relatório — `--commit $(git rev-parse --short HEAD)`.
+        #[arg(long)]
+        commit: Option<String>,
     },
     /// Conecta no Trouter (WS) e imprime eventos de novas mensagens.
     Listen {
@@ -81,6 +108,27 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Auth { silent } => session_cmd::auth(silent)?,
         Command::Chats { top } => chats_cmd::chats(top).await?,
+        Command::Gate {
+            chat,
+            wait_d,
+            skip_d,
+            text,
+            out,
+            commit,
+        } => {
+            let opts = gate_cmd::Options {
+                chat,
+                wait_d: std::time::Duration::from_secs(wait_d),
+                skip_d,
+                text,
+                out,
+                commit,
+            };
+            if !gate_cmd::run(opts).await? {
+                // Saída não-zero deixa o runner (ou o CI futuro) reprovar a rodada sem parsear texto.
+                std::process::exit(1);
+            }
+        }
         Command::Listen {
             fetch,
             show_content,

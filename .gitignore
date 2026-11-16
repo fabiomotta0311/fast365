@@ -2,6 +2,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Relatórios de `f365 gate` — evidência local da matriz de aceite, não versionar
+gate-reports/
+
 # Credenciais / sessão capturada — NUNCA versionar
 *.jwt
 *.har
