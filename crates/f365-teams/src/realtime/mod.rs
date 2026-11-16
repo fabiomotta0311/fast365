@@ -23,6 +23,10 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 /// Prazo para o socket confirmar a conexão (`1::`) depois de aberto.
 const CONNECT_CONFIRM: Duration = Duration::from_secs(15);
+/// Prazo total de DNS, TCP, TLS e upgrade WebSocket.
+const WS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Prazo para cada escrita, incluindo flush; após vencê-lo o socket é descartado.
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Keep-alive quando o handshake não informa o heartbeat do servidor.
 const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -113,15 +117,12 @@ impl TeamsClient {
         let ws_url = trouter::ws_url(&info, &hs.session_id, &epid);
         #[cfg(test)]
         let ws_url = self.realtime_test_url.clone().unwrap_or(ws_url);
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async_with_config(ws_url, Some(ws_config()), false)
-                .await
-                .map_err(|e| {
-                    TeamsError::Realtime(format!(
-                        "WebSocket recusado: {} (TROUTER-WS-001)",
-                        ws_error_kind(&e)
-                    ))
-                })?;
+        let (mut ws, _) = tokio::select! {
+            result = tokio_tungstenite::connect_async_with_config(ws_url, Some(ws_config()), false) => result.map_err(|e| {
+                TeamsError::Realtime(format!("WebSocket recusado: {} (TROUTER-WS-001)", ws_error_kind(&e)))
+            })?,
+            () = clock.sleep(WS_UPGRADE_TIMEOUT) => return Err(TeamsError::Realtime("tempo esgotado no upgrade WebSocket (TROUTER-WS-001)".into())),
+        };
         await_connect(&mut ws, clock).await?;
 
         on_event(RealtimeEvent::Step("4/4 registro do endpoint"));
@@ -292,12 +293,13 @@ where
     let writer = async {
         while let Some(message) = outgoing_rx.recv().await {
             let size = message.len();
-            sink.send(message).await.map_err(|e| {
-                TeamsError::Realtime(format!(
-                    "falha ao escrever no socket: {}",
-                    ws_error_kind(&e)
-                ))
-            })?;
+            tokio::select! {
+                biased;
+                () = clock.sleep(WS_WRITE_TIMEOUT) => return Err(TeamsError::Realtime("tempo esgotado na escrita do socket".into())),
+                result = sink.send(message) => result.map_err(|e| {
+                    TeamsError::Realtime(format!("falha ao escrever no socket: {}", ws_error_kind(&e)))
+                })?,
+            }
             pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             pending_bytes.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
         }
@@ -406,6 +408,48 @@ mod tests {
         let result = run_session(&mut ws, &ManualClock::default(), None, &mut |_| {}).await;
         assert!(matches!(result, Err(TeamsError::Realtime(s)) if s.contains("socket caiu")));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_websocket_upgrade_times_out() {
+        use async_trait::async_trait;
+        use f365_auth::{AuthOp, AuthenticatedExecutor, ExecError};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Exec(AtomicUsize);
+        #[async_trait]
+        impl AuthenticatedExecutor for Exec {
+            async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+                let body = match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        r#"{"socketio":"https://test.trouter.teams.microsoft.com/","surl":"synthetic","connectparams":{}}"#
+                    }
+                    1 => "sid:40:60:websocket",
+                    _ => panic!("registration must not happen"),
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: body.as_bytes().to_vec(),
+                })
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TeamsClient::new(Arc::new(Exec(AtomicUsize::new(0))));
+        client.realtime_test_url = Some(format!(
+            "ws://{}?secret=synthetic",
+            listener.local_addr().unwrap()
+        ));
+        let clock = ManualClock::default();
+        let ticker = clock.clone();
+        let task = tokio::spawn(async move { client.listen(&ticker, &mut |_| {}).await });
+        let (_socket, _) = listener.accept().await.unwrap();
+        tokio::task::yield_now().await;
+        clock.advance(Duration::from_secs(600));
+        let result = tokio::time::timeout(Duration::from_millis(250), task).await;
+        assert!(result.is_ok(), "upgrade stalled without a deadline");
+        let error = result.unwrap().unwrap().unwrap_err().to_string();
+        assert!(error.contains("tempo esgotado no upgrade"), "{error}");
+        assert!(!error.contains("synthetic"));
     }
 
     #[tokio::test]
@@ -998,6 +1042,92 @@ mod tests {
             .await;
             assert!(matches!(result, Err(TeamsError::Realtime(s)) if s.contains("id excede")));
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_write_times_out_despite_active_incoming_frames() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Socket {
+            rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+            blocked: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl Stream for Socket {
+            type Item = Result<Message, WsError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.rx.poll_recv(cx).map(|m| m.map(Ok))
+            }
+        }
+        impl Sink<Message> for Socket {
+            type Error = WsError;
+            fn poll_ready(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), WsError>> {
+                if let Some(tx) = self.blocked.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                unreachable!()
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (blocked, blocked_rx) = tokio::sync::oneshot::channel();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let clock = ManualClock::default();
+        let ticker = clock.clone();
+        let mut session = tokio::spawn(async move {
+            run_session(
+                &mut Socket {
+                    rx,
+                    blocked: Some(blocked),
+                },
+                &ticker,
+                Some(Duration::from_secs(40)),
+                &mut |e| {
+                    let _ = events.send(e);
+                },
+            )
+            .await
+        });
+        while clock.pending_sleepers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(35));
+        blocked_rx.await.unwrap();
+        for _ in 0..20 {
+            let _ = tx.send(Message::text(
+                r#"5:::{"name":"trouter.connected","args":[]}"#,
+            ));
+            tokio::select! {
+                result = &mut session => {
+                    assert!(matches!(result.unwrap(), Err(TeamsError::Realtime(s)) if s.contains("escrita") && s.contains("tempo")));
+                    return;
+                }
+                event = received.recv() => {
+                    if event.is_none() {
+                        assert!(matches!(session.await.unwrap(), Err(TeamsError::Realtime(s)) if s.contains("escrita") && s.contains("tempo")));
+                        return;
+                    }
+                }
+            }
+            clock.advance(Duration::from_secs(30));
+        }
+        session.abort();
+        panic!("write stalled for 600 seconds despite active frames");
     }
 
     #[tokio::test]
