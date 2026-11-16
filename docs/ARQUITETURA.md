@@ -17,9 +17,11 @@ embora a ideia original.
 **Por quê trocar:** um mensageiro precisa de seleção parcial de texto, renderização de HTML/RichText,
 reflow fluido, emoji colorido, cópia de trechos e links clicáveis. Em `egui` cada um desses itens é
 reimplementado na unha; em web/React são nativos. Além disso: (a) o `wry`/WebView2 **já** entra no
-projeto na Fase 0 (login MFA), então o Tauri só consolida uma dependência existente; (b) as mensagens
-chegam do `chatsvcagg` como `messagetype: RichText/Html`, que uma UI web renderiza nativamente; (c)
-**Fluent UI v9** é a mesma biblioteca que o Teams oficial usa.
+projeto na Fase 0 (login MFA), então o Tauri só consolida uma dependência existente; (b) é uma
+hipótese **UNVERIFIED** que mensagens recebidas possam conter `messagetype: RichText/Html`; a listagem
+implementada não comprova esse conteúdo e o histórico ainda não foi confirmado, sem fonte atribuída a
+esse formato (ver [matriz de contratos](CONTRATOS-FASE0.md)); uma UI web poderia renderizar HTML após
+sanitização; (c) **Fluent UI v9** é a mesma biblioteca que o Teams oficial usa.
 
 **Trade-offs assumidos (olhos abertos):**
 - **Cold start:** a meta original de < 100 ms **não se aplica** com WebView2. Meta revisada: **~200–400 ms**.
@@ -613,9 +615,12 @@ Fase 0 (GATE)  ── auth + teams + cli ── matriz §2.4 ──▶ Go? ─�
 
 ## 5. Prior Art & Síntese Técnica
 
-Existe um ecossistema de clientes/bibliotecas open-source que já fazem a mesma engenharia reversa
-(skypetoken → `chatsvcagg` → Trouter). Eles **validam a viabilidade** do gate (Fase 0) e são fonte de
-mapeamento de protocolo. Esta é a destilação do melhor de cada um para o Fast365.
+Existe um ecossistema de clientes/bibliotecas open-source que explora protocolos semelhantes. Esses
+projetos são **prior art**, úteis para mapear hipóteses, mas não comprovam o gate do Fast365 nem uma
+cadeia única entre serviços. No código atual, a listagem usa Bearer do recurso `chatsvcagg`, o envio
+usa `Authentication: skypetoken` no chat regional, e o Trouter usa registro HTTP e socket Rust como
+fluxo de tempo real separado (§2.3 e [matriz de contratos](CONTRATOS-FASE0.md)). Relatos históricos e
+testes não substituem nova validação real. Esta é a destilação do melhor de cada projeto para o Fast365.
 
 ### Mapa de projetos → o que cada um resolve
 
