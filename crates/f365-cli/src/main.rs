@@ -8,6 +8,7 @@
 //!   f365 send    → POST chatsvcagg (E)
 
 mod chats_cmd;
+mod history_cmd;
 mod listen_cmd;
 mod send_cmd;
 mod session_cmd;
@@ -41,7 +42,20 @@ enum Command {
         top: usize,
     },
     /// Conecta no Trouter (WS) e imprime eventos de novas mensagens.
-    Listen,
+    Listen {
+        #[arg(long)]
+        fetch: bool,
+        #[arg(long, requires = "fetch")]
+        show_content: bool,
+    },
+    /// Consulta mensagens recentes no serviço regional.
+    History {
+        chat_id: String,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long)]
+        show_content: bool,
+    },
     /// Envia texto puro para uma conversa (chat regional; id vem de `f365 chats`). Checkpoint E.
     Send { chat_id: String, text: String },
     /// Renova em silêncio (sem WebView) e imprime os claims do token — nunca o token (Checkpoint B).
@@ -67,7 +81,15 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Auth { silent } => session_cmd::auth(silent)?,
         Command::Chats { top } => chats_cmd::chats(top).await?,
-        Command::Listen => listen_cmd::listen().await?,
+        Command::Listen {
+            fetch,
+            show_content,
+        } => listen_cmd::listen(fetch, show_content).await?,
+        Command::History {
+            chat_id,
+            top,
+            show_content,
+        } => history_cmd::history(&chat_id, top, show_content).await?,
         Command::Send { chat_id, text } => send_cmd::send(&chat_id, &text).await?,
         Command::Token { resource } => token_cmd::token(resource).await?,
         Command::Whoami { offline } => session_cmd::whoami(offline).await?,

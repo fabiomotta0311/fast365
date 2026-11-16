@@ -47,6 +47,8 @@ pub fn new_client_message_id() -> String {
 /// O id entra no caminho da URL: só caracteres que não mudam a rota.
 pub(crate) fn validate_chat_id(chat_id: &str) -> Result<(), TeamsError> {
     let ok = !chat_id.is_empty()
+        && chat_id != "."
+        && chat_id != ".."
         && chat_id.len() <= MAX_CHAT_ID_LEN
         && chat_id.chars().all(|c| {
             !c.is_whitespace() && !c.is_control() && !matches!(c, '/' | '?' | '#' | '%' | '\\')
