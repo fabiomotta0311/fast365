@@ -115,6 +115,28 @@ impl TeamsClient {
         chat_id: &str,
         top: usize,
     ) -> Result<Vec<HistoryMessage>, TeamsError> {
+        self.history_with_clock(chat_id, top, &f365_auth::SystemClock)
+            .await
+    }
+
+    async fn history_with_clock(
+        &self,
+        chat_id: &str,
+        top: usize,
+        clock: &dyn f365_auth::Clock,
+    ) -> Result<Vec<HistoryMessage>, TeamsError> {
+        tokio::select! {
+            biased;
+            _ = clock.sleep(Duration::from_secs(60)) => Err(TeamsError::Malformed("HISTORY-PAGE-001 prazo total excedido")),
+            result = self.history_pages(chat_id, top) => result,
+        }
+    }
+
+    async fn history_pages(
+        &self,
+        chat_id: &str,
+        top: usize,
+    ) -> Result<Vec<HistoryMessage>, TeamsError> {
         validate_chat_id(chat_id)?;
         if top > 1000 {
             return Err(TeamsError::Malformed("HISTORY-PAGE-001 top excede 1000"));
@@ -135,6 +157,10 @@ impl TeamsClient {
                 ));
             }
             let response = self.exec.execute(op(next)).await?;
+            // Executores alternativos podem ter recebido o corpo inteiro; valide antes do parse.
+            if response.body.len() > 8 * 1024 * 1024 {
+                return Err(TeamsError::Malformed("HISTORY-PAGE-001 corpo excede 8 MiB"));
+            }
             if !(200..300).contains(&response.status) {
                 return Err(TeamsError::Http {
                     service: "chat regional",
@@ -196,6 +222,123 @@ mod tests {
             bodies: Mutex::new(bodies.iter().copied().collect()),
             ops: Mutex::new(vec![]),
         })
+    }
+
+    #[tokio::test]
+    async fn global_deadline_cancels_a_stalled_page() {
+        struct Stalled;
+        #[async_trait]
+        impl AuthenticatedExecutor for Stalled {
+            async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+                std::future::pending().await
+            }
+        }
+        let clock = f365_auth::ManualClock::default();
+        let client = TeamsClient::new(Arc::new(Stalled));
+        let task = tokio::spawn({
+            let clock = clock.clone();
+            async move { client.history_with_clock("48:notes", 1, &clock).await }
+        });
+        tokio::task::yield_now().await;
+        clock.advance(Duration::from_secs(60));
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(TeamsError::Malformed(s)) if s.contains("prazo")));
+    }
+
+    #[tokio::test]
+    async fn deadline_spans_pages_and_never_returns_partial_history() {
+        struct TwoPages(Mutex<usize>, f365_auth::ManualClock);
+        #[async_trait]
+        impl AuthenticatedExecutor for TwoPages {
+            async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+                let n = {
+                    let mut n = self.0.lock().unwrap();
+                    *n += 1;
+                    *n
+                };
+                if n == 1 {
+                    self.1.advance(Duration::from_secs(40));
+                    Ok(HttpResponse { status: 200, headers: vec![], body: br#"{"messages":[{"id":"secret"}],"_metadata":{"backwardLink":"/v1/users/ME/conversations/48:notes/messages?cursor=syntheticsecret"}}"#.to_vec() })
+                } else {
+                    std::future::pending().await
+                }
+            }
+        }
+        let clock = f365_auth::ManualClock::default();
+        let exec = Arc::new(TwoPages(Mutex::new(0), clock.clone()));
+        let client = TeamsClient::new(exec.clone());
+        let task = tokio::spawn({
+            let clock = clock.clone();
+            async move { client.history_with_clock("48:notes", 2, &clock).await }
+        });
+        for _ in 0..100 {
+            if *exec.0.lock().unwrap() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*exec.0.lock().unwrap(), 2);
+        clock.advance(Duration::from_secs(20));
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        match result {
+            Err(e) => {
+                assert!(e.to_string().contains("prazo"));
+                assert!(!e.to_string().contains("secret"));
+            }
+            Ok(_) => panic!("partial history returned"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_page_from_any_executor_fails_without_leaking_content() {
+        struct Oversized;
+        #[async_trait]
+        impl AuthenticatedExecutor for Oversized {
+            async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: vec![b'x'; 8 * 1024 * 1024 + 1],
+                })
+            }
+        }
+        let result = TeamsClient::new(Arc::new(Oversized))
+            .history("48:notes", 1)
+            .await;
+        assert!(
+            matches!(result, Err(TeamsError::Malformed(s)) if s.contains("8 MiB") && !s.contains("xxxx"))
+        );
+    }
+
+    #[tokio::test]
+    async fn page_limit_rejects_continuation_without_partial_history() {
+        struct ManyPages(Mutex<usize>);
+        #[async_trait]
+        impl AuthenticatedExecutor for ManyPages {
+            async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+                let mut n = self.0.lock().unwrap();
+                *n += 1;
+                let body = format!(
+                    r#"{{"messages":[],"_metadata":{{"backwardLink":"/v1/users/ME/conversations/48:notes/messages?cursor={}"}}}}"#,
+                    *n
+                );
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: body.into_bytes(),
+                })
+            }
+        }
+        let exec = Arc::new(ManyPages(Mutex::new(0)));
+        let result = TeamsClient::new(exec.clone()).history("48:notes", 1).await;
+        assert!(matches!(result, Err(TeamsError::Malformed(s)) if s.contains("limite de páginas")));
+        assert_eq!(*exec.0.lock().unwrap(), 10);
     }
 
     #[tokio::test]

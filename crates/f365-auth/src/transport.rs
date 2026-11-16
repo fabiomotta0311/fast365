@@ -110,9 +110,34 @@ impl RustTransport {
     }
 }
 
+fn is_history_request(req: &HttpRequest) -> bool {
+    if req.method != "GET" {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(&req.url) else {
+        return false;
+    };
+    if !url
+        .host_str()
+        .is_some_and(|host| host.ends_with(".teams.microsoft.com"))
+    {
+        return false;
+    }
+    let Some(rest) = url.path().strip_prefix("/v1/users/ME/conversations/") else {
+        return false;
+    };
+    let Some(chat) = rest.strip_suffix("/messages") else {
+        return false;
+    };
+    !chat.is_empty() && !chat.contains('/')
+}
+
 #[async_trait]
 impl Transport for RustTransport {
     async fn send(&self, req: HttpRequest) -> Result<HttpResponse, TransportError> {
+        // A API existente não carrega opções por request. Circunscreve-se o limite
+        // ao GET do endpoint regional de histórico, sem afetar POSTs ou outros hosts.
+        let history = is_history_request(&req);
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| TransportError::Other(e.to_string()))?;
         let mut builder = self.client.request(method, &req.url);
@@ -138,11 +163,22 @@ impl Transport for RustTransport {
                 )
             })
             .collect();
-        let body = resp
-            .bytes()
+        // Conta bytes descomprimidos, inclusive respostas sem Content-Length confiável.
+        const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+        let mut resp = resp;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
             .map_err(|e| TransportError::Other(e.without_url().to_string()))?
-            .to_vec();
+        {
+            if history && chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body.len()) {
+                return Err(TransportError::Other(
+                    "corpo HTTP excede limite de 8 MiB".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(HttpResponse {
             status,
             headers,
@@ -154,6 +190,128 @@ impl Transport for RustTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_transport(addr: std::net::SocketAddr) -> RustTransport {
+        RustTransport {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .resolve("regional.teams.microsoft.com", addr)
+                .build()
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn limit_applies_only_to_regional_history_get() {
+        let mut req = HttpRequest { method: "GET".into(), url: "https://regional.teams.microsoft.com/v1/users/ME/conversations/48:notes/messages?cursor=x".into(), headers: vec![], body: None };
+        assert!(is_history_request(&req));
+        req.method = "POST".into();
+        assert!(!is_history_request(&req));
+        req.method = "GET".into();
+        req.url = "https://other.example/v1/users/ME/conversations/48:notes/messages".into();
+        assert!(!is_history_request(&req));
+        req.url =
+            "https://regional.teams.microsoft.com/v1/users/ME/conversations/48:notes/messages/1"
+                .into();
+        assert!(!is_history_request(&req));
+    }
+
+    #[tokio::test]
+    async fn unrelated_endpoint_accepts_body_larger_than_history_limit() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\n\r\n")
+                .unwrap();
+            let _ = socket.write_all(&vec![b'x'; 8 * 1024 * 1024 + 1]);
+        });
+        let response = RustTransport::new()
+            .unwrap()
+            .send(HttpRequest {
+                method: "GET".into(),
+                url: format!("http://{addr}/other"),
+                headers: vec![],
+                body: None,
+            })
+            .await;
+        server.join().unwrap();
+        assert_eq!(response.unwrap().body.len(), 8 * 1024 * 1024 + 1);
+    }
+
+    #[tokio::test]
+    async fn response_exactly_at_limit_is_accepted() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8388608\r\n\r\n")
+                .unwrap();
+            socket.write_all(&vec![b'x'; 8 * 1024 * 1024]).unwrap();
+        });
+        let response = history_transport(addr)
+            .send(HttpRequest {
+                method: "GET".into(),
+                url: format!("http://regional.teams.microsoft.com:{}/v1/users/ME/conversations/48:notes/messages", addr.port()),
+                headers: vec![],
+                body: None,
+            })
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body.len(), 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_response_is_rejected_without_leaking_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..9 {
+                if socket
+                    .write_all(b"100000\r\n")
+                    .and_then(|_| socket.write_all(&chunk))
+                    .and_then(|_| socket.write_all(b"\r\n"))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n");
+        });
+        let result = history_transport(addr)
+            .send(HttpRequest {
+                method: "GET".into(),
+                url: format!("http://regional.teams.microsoft.com:{}/v1/users/ME/conversations/48:notes/messages?secret=syntheticsecret", addr.port()),
+                headers: vec![],
+                body: None,
+            })
+            .await;
+        server.join().unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("syntheticsecret"));
+        assert!(!error.contains("xxxx"));
+    }
 
     #[test]
     fn debug_hides_signed_url_query_and_fragment() {
