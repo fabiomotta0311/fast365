@@ -17,9 +17,11 @@ embora a ideia original.
 **Por quê trocar:** um mensageiro precisa de seleção parcial de texto, renderização de HTML/RichText,
 reflow fluido, emoji colorido, cópia de trechos e links clicáveis. Em `egui` cada um desses itens é
 reimplementado na unha; em web/React são nativos. Além disso: (a) o `wry`/WebView2 **já** entra no
-projeto na Fase 0 (login MFA), então o Tauri só consolida uma dependência existente; (b) as mensagens
-chegam do `chatsvcagg` como `messagetype: RichText/Html`, que uma UI web renderiza nativamente; (c)
-**Fluent UI v9** é a mesma biblioteca que o Teams oficial usa.
+projeto na Fase 0 (login MFA), então o Tauri só consolida uma dependência existente; (b) é uma
+hipótese **UNVERIFIED** que mensagens recebidas possam conter `messagetype: RichText/Html`; a listagem
+implementada não comprova esse conteúdo e o histórico ainda não foi confirmado, sem fonte atribuída a
+esse formato (ver [matriz de contratos](CONTRATOS-FASE0.md)); uma UI web poderia renderizar HTML após
+sanitização; (c) **Fluent UI v9** é a mesma biblioteca que o Teams oficial usa.
 
 **Trade-offs assumidos (olhos abertos):**
 - **Cold start:** a meta original de < 100 ms **não se aplica** com WebView2. Meta revisada: **~200–400 ms**.
@@ -165,7 +167,7 @@ enum Route {
     InPage,   // fetch na WebView parqueada (contexto genuíno + cookies) — FALLBACK
 }
 // Padrão: Rust; cai para InPage em 401/403/challenge de Conditional Access.
-// WebSocket e chamadas cookie-bound usam InPage sempre.
+// Chamadas cookie-bound podem exigir InPage; o Trouter atual abre o socket no Rust (§3.5).
 ```
 
 ### `Cargo.toml` raiz (workspace)
@@ -368,18 +370,21 @@ serde_json.workspace = true
 [3] Skype/Chat Token + Region/CSA endpoint
         │  descobre o host regional (ex.: {region}.ng.msg.teams.microsoft.com)
         ▼
-[4] Autorização válida em:
-        ├── chatsvcagg (REST)  → Authorization: Bearer / Skype token
-        └── Trouter    (WS)    → registro + URL de socket + headers
+[4] Serviços usados (o token do agregador é resgatado separadamente):
+        ├── chatsvcagg (listagem REST) → Bearer do recurso chatsvcagg
+        ├── chat regional (envio REST)  → Authentication: skypetoken
+        └── Trouter (tempo real)        → registro HTTP + socket Rust
 ```
+
+A listagem obtém separadamente um token para o recurso chatsvcagg; não usa o Skype token.
+O estado e os limites de evidência por campo estão em [Contratos da Fase 0](CONTRATOS-FASE0.md).
 
 > Os nomes exatos de cada `aud`, host regional e o formato do Skype token **devem vir do DevTools**
 > (§3) — o PoC só "copia" o que o cliente web realmente faz. O objetivo do código é **reproduzir**,
 > não adivinhar.
 
 **Dados concretos (dos clientes open-source — ver §5):**
-- **Client ID público first-party do Teams:** `1fec8e78-bce4-4aaf-ab1b-5451cc387264` — reutilize-o e
-  **não** registre app no Entra (fonte: `ic3`).
+- **Client ID público first-party de prior art (não o cliente web observado):** `1fec8e78-bce4-4aaf-ab1b-5451cc387264` (fonte: `ic3`); não é o cliente web capturado no Checkpoint A.
 - **Tríade de tokens confirmada:** `token-teams.jwt`, `token-skype.jwt`, `token-chatsvcagg.jwt`
   (fonte: `fossteams`) — exatamente os passos [2]→[3]→[4] acima.
 - **Alternativa de pairing:** o *device-code flow* (ic3/ost) dispensa a WebView, mas admins **costumam
@@ -409,14 +414,14 @@ serde_json.workspace = true
 
 ```
 f365 auth            # Fase 0-A: abre WebView, captura sessão, grava no keyring. Imprime UPN + validade.
-f365 chats [--top N] # Fase 0-B: troca de tokens + GET chatsvcagg → lista conversas/canais (id + título).
-f365 listen          # Fase 0-C: conecta no Trouter (WS), registra, imprime eventos de novas mensagens.
-f365 send <chatId> <texto>   # Fase 0-D: POST chatsvcagg → envia mensagem. Imprime messageId retornado.
+f365 chats [--top N] # Checkpoint C: troca de tokens + GET chatsvcagg → lista conversas/canais (id + título).
+f365 listen          # Checkpoint D: conecta no Trouter (WS), registra, imprime eventos de novas mensagens.
+f365 send <chatId> <texto>   # Checkpoint E: POST no chat regional → envia texto. Imprime messageId retornado.
 ```
 
 Auxiliares úteis durante a engenharia reversa:
 ```
-f365 token --resource teams     # imprime o access token atual (debug) + claims decodificados (exp/aud/tid)
+f365 token --resource teams     # imprime claims/metadados, nunca o token
 f365 whoami                      # valida sessão: UPN, tenant, região descoberta
 ```
 
@@ -495,13 +500,17 @@ Para **cada** request do `chatsvcagg`, anote e replique:
 - [ ] `User-Agent` — às vezes verificado; copie o do Edge
 - [ ] Cookies enviados junto do Bearer (alguns endpoints exigem ambos)
 
-### 3.4 REST `chatsvcagg` (Fetch/XHR)
+### 3.4 REST: agregador e chat regional (Fetch/XHR)
+
+Estado implementado e evidências: [matriz de contratos](CONTRATOS-FASE0.md). A lista usa `chatsvcagg`; o envio usa chat regional. Histórico e paginação seguem sem confirmação nesta matriz. Os itens abaixo são perguntas históricas, não afirmações de implementação.
 - [ ] **Listar conversas**: GET para algo como `.../csa/api/v1/teams/users/me/...` ou `.../v2/users/me/conversations` — anote path exato, query params (`view`, `pageSize`, `isPaginationEnabled`) e o **shape do JSON** (onde ficam `id`, `topic`/`title`, `lastMessage`)
 - [ ] **Histórico de um chat**: GET `.../conversations/{chatId}/messages?pageSize=...`
-- [ ] **Enviar**: POST `.../conversations/{chatId}/messages` — capture o **body exato**: `content`, `messagetype` (`RichText/Html` vs `Text`), `contenttype`, `clientmessageid` (como é gerado), `imdisplayname`
+- [ ] **Enviar no chat regional**: POST `.../conversations/{chatId}/messages` — comparar o **body**: `content`, `messagetype` (`RichText/Html` vs `Text`), `contenttype`, `clientmessageid` (como é gerado), `imdisplayname`
 
 ### 3.5 WebSocket Trouter (aba WS)
-- [ ] A requisição HTTP de **registro/handshake** antes do WS (`trouter.teams.microsoft.com/.../register` ou similar) — headers e body
+
+O fluxo implementado faz handshake HTTP e abre WebSocket diretamente; não há prova de polling → upgrade nem de primeiro frame subscribe. Detalhes e evidências em [matriz de contratos](CONTRATOS-FASE0.md). Os itens abaixo são perguntas históricas.
+- [ ] Comparar o handshake HTTP e o registro posterior ao WS com a implementação — headers e body
 - [ ] **Versão do protocolo:** o `purple-teams` documenta **socket.io v1 sobre WebSocket** em `go.trouter.teams.microsoft.com` — confirme o handshake (polling → upgrade) e o formato dos frames contra isso (ver §5)
 - [ ] A **URL final do socket** (`wss://...trouter...`) e os query params (ids de sessão, token embutido?)
 - [ ] O **primeiro frame** que o cliente envia após abrir (subscribe/ping) e o **formato dos frames** de mensagem recebida (JSON com `resource`/`body`?)
@@ -606,9 +615,12 @@ Fase 0 (GATE)  ── auth + teams + cli ── matriz §2.4 ──▶ Go? ─�
 
 ## 5. Prior Art & Síntese Técnica
 
-Existe um ecossistema de clientes/bibliotecas open-source que já fazem a mesma engenharia reversa
-(skypetoken → `chatsvcagg` → Trouter). Eles **validam a viabilidade** do gate (Fase 0) e são fonte de
-mapeamento de protocolo. Esta é a destilação do melhor de cada um para o Fast365.
+Existe um ecossistema de clientes/bibliotecas open-source que explora protocolos semelhantes. Esses
+projetos são **prior art**, úteis para mapear hipóteses, mas não comprovam o gate do Fast365 nem uma
+cadeia única entre serviços. No código atual, a listagem usa Bearer do recurso `chatsvcagg`, o envio
+usa `Authentication: skypetoken` no chat regional, e o Trouter usa registro HTTP e socket Rust como
+fluxo de tempo real separado (§2.3 e [matriz de contratos](CONTRATOS-FASE0.md)). Relatos históricos e
+testes não substituem nova validação real. Esta é a destilação do melhor de cada projeto para o Fast365.
 
 ### Mapa de projetos → o que cada um resolve
 
