@@ -35,6 +35,8 @@ pub enum Realtime {
 /// Capacidade `history` por conversa: o cache local está fresco?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationState {
+    /// Conversa conhecida, sem afirmação sobre o frescor do histórico.
+    Known,
     /// Algo mudou e o conteúdo local não é confiável: buscar via REST.
     Dirty,
     Fetching {
@@ -147,6 +149,8 @@ pub struct SyncMachine {
     next_op: u64,
     inflight: BTreeMap<OpId, OpKind>,
     conversations: BTreeMap<ConversationId, ConversationState>,
+    fetch_deadlines: BTreeMap<ConversationId, Instant>,
+    now: Option<Instant>,
     sends: BTreeMap<ClientMessageId, SendState>,
     wake: Option<Instant>,
 }
@@ -160,6 +164,8 @@ impl Default for SyncMachine {
             next_op: 0,
             inflight: BTreeMap::new(),
             conversations: BTreeMap::new(),
+            fetch_deadlines: BTreeMap::new(),
+            now: None,
             sends: BTreeMap::new(),
             wake: None,
         }
@@ -180,6 +186,7 @@ impl SyncMachine {
 
     /// Único ponto de entrada. Função pura sobre o estado: `now` vem do `Clock` do driver.
     pub fn handle(&mut self, now: Instant, event: Event) -> Vec<Decision> {
+        self.now = Some(now);
         let mut out = Vec::new();
         match event {
             Event::SendRequested {
@@ -195,8 +202,15 @@ impl SyncMachine {
                 self.on_finished(now, op, outcome, &mut out)
             }
             Event::ConnectionLost => self.on_connection_lost(now, &mut out),
+            Event::RealtimeLost => {
+                self.realtime = Realtime::Reconnecting;
+                self.schedule(now + self.config.reconnect_retry_after, &mut out);
+            }
             Event::ConnectionRestored => self.on_connection_restored(&mut out),
             Event::WakeUp => self.on_wake(now, &mut out),
+        }
+        if let Some(next) = self.next_deadline() {
+            self.schedule(next, &mut out);
         }
         out
     }
@@ -225,6 +239,15 @@ impl SyncMachine {
 
     pub fn conversation_state(&self, conversation: &ConversationId) -> Option<&ConversationState> {
         self.conversations.get(conversation)
+    }
+
+    /// Registra uma conversa descoberta sem invalidar ou sobrescrever seu estado.
+    pub fn register_conversation(&mut self, conversation: ConversationId) {
+        if !conversation.0.trim().is_empty() {
+            self.conversations
+                .entry(conversation)
+                .or_insert(ConversationState::Known);
+        }
     }
 
     /// Próximo prazo que o driver deve respeitar (último [`Decision::ScheduleWake`] emitido).
@@ -402,14 +425,20 @@ impl SyncMachine {
         match outcome {
             // O conteúdo local pode ser considerado fresco — mas isso **não** confirma envio nenhum:
             // entrega é confirmada por [`Event::MessageObserved`].
-            Outcome::Succeeded | Outcome::Failed { retryable: false } => {
+            Outcome::Succeeded => {
                 self.conversations
                     .insert(conversation.clone(), ConversationState::Fresh);
+            }
+            Outcome::Failed { retryable: false } => {
+                self.conversations
+                    .insert(conversation.clone(), ConversationState::Known);
             }
             Outcome::Failed { retryable: true } | Outcome::Lost => {
                 self.conversations
                     .insert(conversation.clone(), ConversationState::Dirty);
-                self.schedule(now + self.config.fetch_retry_after, out);
+                let deadline = now + self.config.fetch_retry_after;
+                self.fetch_deadlines.insert(conversation.clone(), deadline);
+                self.schedule(deadline, out);
             }
         }
 
@@ -452,7 +481,9 @@ impl SyncMachine {
         let stale: Vec<ConversationId> = self
             .conversations
             .iter()
-            .filter(|(_, state)| matches!(state, ConversationState::Fresh))
+            .filter(|(_, state)| {
+                matches!(state, ConversationState::Fresh | ConversationState::Known)
+            })
             .map(|(conversation, _)| conversation.clone())
             .collect();
         for conversation in stale {
@@ -576,6 +607,14 @@ impl SyncMachine {
     }
 
     fn start_fetch(&mut self, conversation: &ConversationId, out: &mut Vec<Decision>) {
+        if self
+            .fetch_deadlines
+            .get(conversation)
+            .is_some_and(|deadline| self.now.is_some_and(|now| now < *deadline))
+        {
+            return;
+        }
+        self.fetch_deadlines.remove(conversation);
         if matches!(
             self.conversations.get(conversation),
             Some(ConversationState::Fetching { .. })
@@ -684,6 +723,12 @@ impl SyncMachine {
                 SendState::Reconciling { deadline, .. } => Some(*deadline),
                 _ => None,
             })
+            .chain(
+                self.fetch_deadlines
+                    .values()
+                    .copied()
+                    .filter(|_| self.connectivity != Connectivity::Down),
+            )
             .min()
     }
 }
@@ -746,6 +791,122 @@ mod tests {
             .iter()
             .any(|d| matches!(d, Decision::Publish { conversation: c } if c == conversation));
         persist && publish
+    }
+
+    #[test]
+    fn unrelated_wake_does_not_advance_history_retry() {
+        let clock = ManualClock::default();
+        let mut machine = SyncMachine::new();
+        let d = machine.handle(
+            clock.now(),
+            Event::Invalidated {
+                conversation: conv(),
+            },
+        );
+        let op = fetch_op(&d);
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op,
+                outcome: Outcome::Failed { retryable: true },
+            },
+        );
+        machine.handle(clock.now(), Event::RealtimeLost);
+        clock.advance(Duration::from_secs(2));
+        let d = machine.handle(clock.now(), Event::WakeUp);
+        assert!(!d.iter().any(|d| matches!(d, Decision::FetchHistory { .. })));
+        clock.advance(Duration::from_secs(3));
+        fetch_op(&machine.handle(clock.now(), Event::WakeUp));
+    }
+
+    #[test]
+    fn independent_fetch_deadlines_survive_invalidations_and_reconnect() {
+        let clock = ManualClock::default();
+        let mut machine = SyncMachine::new();
+        let a = conv();
+        let b = ConversationId("19:other@thread.v2".into());
+        let first = fetch_op(&machine.handle(
+            clock.now(),
+            Event::Invalidated {
+                conversation: a.clone(),
+            },
+        ));
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op: first,
+                outcome: Outcome::Lost,
+            },
+        );
+        clock.advance(Duration::from_secs(1));
+        let second = fetch_op(&machine.handle(
+            clock.now(),
+            Event::Invalidated {
+                conversation: b.clone(),
+            },
+        ));
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op: second,
+                outcome: Outcome::Lost,
+            },
+        );
+        assert!(!machine
+            .handle(
+                clock.now(),
+                Event::Invalidated {
+                    conversation: a.clone()
+                }
+            )
+            .iter()
+            .any(|d| matches!(d, Decision::FetchHistory { .. })));
+        machine.handle(clock.now(), Event::ConnectionLost);
+        let restored = machine.handle(clock.now(), Event::ConnectionRestored);
+        assert!(!restored
+            .iter()
+            .any(|d| matches!(d, Decision::FetchHistory { .. })));
+        clock.advance(Duration::from_secs(4));
+        let due = machine.handle(clock.now(), Event::WakeUp);
+        assert!(due.iter().any(
+            |d| matches!(d, Decision::FetchHistory { conversation, .. } if *conversation == a)
+        ));
+        assert!(!due.iter().any(
+            |d| matches!(d, Decision::FetchHistory { conversation, .. } if *conversation == b)
+        ));
+        assert_eq!(
+            machine.next_wake(),
+            Some(clock.now() + Duration::from_secs(1))
+        );
+        clock.advance(Duration::from_secs(1));
+        let due = machine.handle(clock.now(), Event::WakeUp);
+        assert!(due.iter().any(
+            |d| matches!(d, Decision::FetchHistory { conversation, .. } if *conversation == b)
+        ));
+    }
+
+    #[test]
+    fn terminal_fetch_failure_never_marks_history_fresh() {
+        let clock = ManualClock::default();
+        let mut machine = SyncMachine::new();
+        let decisions = machine.handle(
+            clock.now(),
+            Event::Invalidated {
+                conversation: conv(),
+            },
+        );
+        let op = fetch_op(&decisions);
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op,
+                outcome: Outcome::Failed { retryable: false },
+            },
+        );
+        assert_ne!(
+            machine.conversation_state(&conv()),
+            Some(&ConversationState::Fresh)
+        );
     }
 
     #[test]
