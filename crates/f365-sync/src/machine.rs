@@ -276,14 +276,24 @@ impl SyncMachine {
         client_id: &ClientMessageId,
         out: &mut Vec<Decision>,
     ) {
-        let confirms = matches!(
-            self.sends.get(client_id),
-            Some(SendState::Pending { .. })
-                | Some(SendState::InFlight { .. })
-                | Some(SendState::Reconciling { .. })
-        );
+        // Só confirma o envio **daquela** conversa, e só se ele já saiu: um id igual em outro chat
+        // (ou um envio nunca tentado) não é prova de entrega.
+        let confirms = match self.sends.get(client_id) {
+            Some(
+                SendState::InFlight {
+                    conversation: sent, ..
+                }
+                | SendState::Reconciling {
+                    conversation: sent, ..
+                }
+                | SendState::Uncertain {
+                    conversation: sent, ..
+                },
+            ) => sent == conversation,
+            _ => false,
+        };
         if !confirms {
-            return; // mensagem de outra origem, ou envio já resolvido
+            return;
         }
         self.sends.insert(
             client_id.clone(),
@@ -1070,6 +1080,83 @@ mod tests {
             .iter()
             .any(|d| matches!(d, Decision::ScheduleWake { .. })));
         assert_eq!(attempts(&decisions), 0);
+    }
+
+    #[test]
+    fn observation_from_another_conversation_is_not_proof() {
+        let clock = ManualClock::default();
+        let mut machine = SyncMachine::new();
+
+        let decisions = machine.handle(
+            clock.now(),
+            Event::SendRequested {
+                conversation: conv(),
+                client_id: cid(),
+            },
+        );
+        let op = send_op(&decisions);
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op,
+                outcome: Outcome::Lost,
+            },
+        );
+
+        // Mesmo `clientmessageid`, outra conversa: não confirma nada.
+        machine.handle(
+            clock.now(),
+            Event::MessageObserved {
+                conversation: ConversationId("19:outra@thread.v2".into()),
+                client_id: cid(),
+            },
+        );
+        assert!(matches!(
+            machine.send_state(&cid()),
+            Some(SendState::Reconciling { .. })
+        ));
+    }
+
+    #[test]
+    fn evidence_arriving_after_the_deadline_corrects_uncertain() {
+        let clock = ManualClock::default();
+        let mut machine = SyncMachine::new();
+
+        let decisions = machine.handle(
+            clock.now(),
+            Event::SendRequested {
+                conversation: conv(),
+                client_id: cid(),
+            },
+        );
+        let op = send_op(&decisions);
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op,
+                outcome: Outcome::Lost,
+            },
+        );
+        clock.advance(Duration::from_secs(61));
+        machine.handle(clock.now(), Event::WakeUp);
+        assert!(matches!(
+            machine.send_state(&cid()),
+            Some(SendState::Uncertain { .. })
+        ));
+
+        // Prova que chegou depois: corrigir para entregue é evidência, não invenção.
+        let decisions = machine.handle(
+            clock.now(),
+            Event::MessageObserved {
+                conversation: conv(),
+                client_id: cid(),
+            },
+        );
+        assert!(matches!(
+            machine.send_state(&cid()),
+            Some(SendState::Delivered { .. })
+        ));
+        assert!(persisted_and_published(&decisions, &conv()));
     }
 
     #[test]
