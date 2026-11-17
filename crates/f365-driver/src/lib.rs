@@ -26,10 +26,16 @@ use f365_teams::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Quantas transições o driver aceita executar num único `drive` (guarda contra laço infinito).
 const MAX_STEPS: usize = 64;
+
+/// Primeira renovação silenciosa: o access token dura ~1 h, então renovamos com folga.
+const REFRESH_FIRST: Duration = Duration::from_secs(30 * 60);
+/// Backoff de renovação que falhou (dobra até o teto) — nunca fica martelando o login.
+const REFRESH_BACKOFF_MIN: Duration = Duration::from_secs(5);
+const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// Falha de uma operação, já classificada para o motor e para o modelo de capacidade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +116,12 @@ pub enum Effect {
     ReconnectAttempt,
     /// Lista de conversas atualizada no cache.
     ConversationsRefreshed(usize),
+    /// Token renovado em silêncio (sem WebView).
+    TokenRefreshed,
+    /// Renovação falhou de forma retentável; o driver reagendou.
+    TokenRefreshFailed { retry_in: Duration },
+    /// A sessão precisa de login novo: tudo voltou a `NeedsAuth`.
+    SessionExpired,
 }
 
 /// Resultado de uma rodada: efeitos + próximos passos para quem chama.
@@ -138,6 +150,36 @@ impl Realtime for NoRealtime {
     }
 }
 
+/// Renovação silenciosa do token (sem WebView). O driver só agenda; quem renova é o keeper.
+#[async_trait::async_trait]
+pub trait TokenKeeper: Send + Sync {
+    /// Renova agora e diz quanto tempo até a próxima renovação.
+    async fn refresh(&self) -> std::result::Result<Duration, RefreshError>;
+}
+
+/// Falha de renovação. `retryable = false` significa "só login do dono resolve".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshError {
+    pub retryable: bool,
+    pub reason: String,
+}
+
+impl RefreshError {
+    pub fn retryable(reason: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn needs_login(reason: impl Into<String>) -> Self {
+        Self {
+            retryable: false,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Quem é avisado quando uma conversa muda (UI, IPC, log).
 pub trait Notifier: Send + Sync {
     fn published(&self, conversation: &ConversationId);
@@ -162,6 +204,10 @@ pub struct Driver {
     top: usize,
     /// Texto por envio. Some no restart — e então o envio fica sem como sair (ver `send`).
     pending_text: BTreeMap<ClientMessageId, String>,
+    /// Renovação silenciosa de token: o driver só agenda, quem renova é o keeper.
+    token_keeper: Option<Arc<dyn TokenKeeper>>,
+    refresh_at: Option<Instant>,
+    refresh_backoff: Duration,
 }
 
 impl Driver {
@@ -177,8 +223,19 @@ impl Driver {
             generation: 1,
             top: 30,
             pending_text: BTreeMap::new(),
+            token_keeper: None,
+            refresh_at: None,
+            refresh_backoff: REFRESH_BACKOFF_MIN,
             clock,
         }
+    }
+
+    /// Liga a renovação em background (primeira antes do `exp` do access token).
+    pub fn with_token_keeper(mut self, keeper: Arc<dyn TokenKeeper>) -> Self {
+        let now = self.clock.now();
+        self.token_keeper = Some(keeper);
+        self.refresh_at = Some(now + REFRESH_FIRST);
+        self
     }
 
     pub fn with_config(mut self, config: Config) -> Self {
@@ -345,6 +402,8 @@ impl Driver {
             }
         }
 
+        self.maybe_refresh(&mut round).await;
+
         let now = self.clock.now();
         self.capabilities.project(now, &self.machine);
         round.capabilities = self.capabilities.summary();
@@ -455,6 +514,49 @@ impl Driver {
         Ok(())
     }
 
+    /// Renova o token antes do `exp`, com backoff em erro — sem abrir WebView (quem decide é o
+    /// keeper). Falha não-retentável é sessão expirada: invalida a geração, como manda o §2.5.
+    async fn maybe_refresh(&mut self, round: &mut Round) {
+        let Some(keeper) = self.token_keeper.clone() else {
+            return;
+        };
+        let Some(due) = self.refresh_at else {
+            return;
+        };
+        let now = self.clock.now();
+        if now < due {
+            note_earliest(&mut round.wake_at, due);
+            return;
+        }
+        match keeper.refresh().await {
+            Ok(interval) => {
+                let next = now + interval;
+                self.refresh_backoff = REFRESH_BACKOFF_MIN;
+                self.refresh_at = Some(next);
+                round.effects.push(Effect::TokenRefreshed);
+                note_earliest(&mut round.wake_at, next);
+            }
+            Err(error) if error.retryable => {
+                let wait = self.refresh_backoff;
+                self.refresh_backoff = (wait * 2).min(REFRESH_BACKOFF_MAX);
+                let next = now + wait;
+                self.refresh_at = Some(next);
+                round
+                    .effects
+                    .push(Effect::TokenRefreshFailed { retry_in: wait });
+                note_earliest(&mut round.wake_at, next);
+            }
+            Err(_) => {
+                // Sem renovação silenciosa, só o dono resolve.
+                self.refresh_at = None;
+                self.generation += 1;
+                self.capabilities
+                    .invalidate_session(now, SessionGeneration(self.generation));
+                round.effects.push(Effect::SessionExpired);
+            }
+        }
+    }
+
     fn uncertain_sends(&self) -> Vec<(ConversationId, ClientMessageId)> {
         self.machine
             .sends()
@@ -490,6 +592,14 @@ impl Driver {
             .map(|elapsed| elapsed.as_millis() as i64)
             .unwrap_or(0)
     }
+}
+
+/// Guarda o prazo **mais cedo** entre os já pedidos na rodada.
+fn note_earliest(slot: &mut Option<Instant>, at: Instant) {
+    *slot = Some(match *slot {
+        Some(current) if current <= at => current,
+        _ => at,
+    });
 }
 
 fn stored_conversation(conversation: &TeamsConversation, now_ms: i64) -> StoredConversation {
@@ -645,6 +755,36 @@ mod tests {
     #[derive(Default)]
     struct RecordingNotifier {
         published: Mutex<Vec<ConversationId>>,
+    }
+
+    struct FakeKeeper {
+        reply: Mutex<std::collections::VecDeque<Result<Duration, RefreshError>>>,
+        calls: Mutex<usize>,
+    }
+
+    impl FakeKeeper {
+        fn new(reply: Vec<Result<Duration, RefreshError>>) -> Arc<Self> {
+            Arc::new(Self {
+                reply: Mutex::new(reply.into_iter().collect()),
+                calls: Mutex::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("calls")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenKeeper for FakeKeeper {
+        async fn refresh(&self) -> std::result::Result<Duration, RefreshError> {
+            *self.calls.lock().expect("calls") += 1;
+            self.reply
+                .lock()
+                .expect("reply")
+                .pop_front()
+                .unwrap_or(Ok(Duration::from_secs(1_800)))
+        }
     }
 
     impl Notifier for RecordingNotifier {
@@ -1013,5 +1153,99 @@ mod tests {
             round.wake_at.is_some(),
             "reconciliação sem prazo nunca viraria 'incerto'"
         );
+    }
+
+    #[tokio::test]
+    async fn token_is_refreshed_before_it_expires() {
+        let exec = FakeExec::replying(vec![]);
+        let (clock, driver) = driver(exec);
+        let keeper = FakeKeeper::new(vec![Ok(Duration::from_secs(1_800))]);
+        let mut driver = driver.with_token_keeper(keeper.clone());
+
+        // Antes do prazo não renova, mas o prazo é reportado a quem chama.
+        let round = driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 0);
+        assert!(
+            round.wake_at.is_some(),
+            "quem chama precisa saber quando voltar"
+        );
+
+        clock.advance(REFRESH_FIRST);
+        let round = driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 1);
+        assert!(round.effects.contains(&Effect::TokenRefreshed));
+
+        // Reagendou: não martela o login a cada rodada.
+        driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn retryable_refresh_failure_backs_off_and_recovers() {
+        let exec = FakeExec::replying(vec![]);
+        let (clock, driver) = driver(exec);
+        let keeper = FakeKeeper::new(vec![
+            Err(RefreshError::retryable("rede")),
+            Err(RefreshError::retryable("rede")),
+            Ok(Duration::from_secs(1_800)),
+        ]);
+        let mut driver = driver.with_token_keeper(keeper.clone());
+
+        clock.advance(REFRESH_FIRST);
+        let round = driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 1);
+        assert!(round.effects.contains(&Effect::TokenRefreshFailed {
+            retry_in: REFRESH_BACKOFF_MIN
+        }));
+
+        // Antes do backoff, não tenta.
+        driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 1);
+
+        // Depois do backoff, tenta de novo — e o próximo intervalo dobrou.
+        clock.advance(REFRESH_BACKOFF_MIN);
+        let round = driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 2);
+        assert!(round.effects.contains(&Effect::TokenRefreshFailed {
+            retry_in: REFRESH_BACKOFF_MIN * 2
+        }));
+
+        // Metade do novo backoff: ainda não.
+        clock.advance(REFRESH_BACKOFF_MIN);
+        driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 2);
+
+        // Completou: renova e o backoff volta ao mínimo.
+        clock.advance(REFRESH_BACKOFF_MIN);
+        let round = driver.drive(Event::WakeUp).await.expect("acorda");
+        assert_eq!(keeper.calls(), 3);
+        assert!(round.effects.contains(&Effect::TokenRefreshed));
+    }
+
+    #[tokio::test]
+    async fn refresh_without_silent_renewal_needs_the_owner() {
+        let exec = FakeExec::replying(vec![]);
+        let (clock, driver) = driver(exec);
+        let keeper = FakeKeeper::new(vec![Err(RefreshError::needs_login("RT vencido"))]);
+        let mut driver = driver.with_token_keeper(keeper.clone());
+
+        clock.advance(REFRESH_FIRST);
+        let round = driver.drive(Event::WakeUp).await.expect("acorda");
+
+        assert!(round.effects.contains(&Effect::SessionExpired));
+        assert!(
+            round
+                .capabilities
+                .iter()
+                .all(|line| line.contains("exige novo login")),
+            "sem renovação silenciosa, tudo depende do dono: {:?}",
+            round.capabilities
+        );
+        assert_eq!(driver.capabilities().generation(), SessionGeneration(2));
+
+        // Não fica tentando sozinho depois de exigir login.
+        let round = driver.drive(Event::WakeUp).await.expect("acorda");
+        assert!(round.effects.is_empty());
+        assert_eq!(keeper.calls(), 1);
     }
 }

@@ -428,13 +428,38 @@ impl SyncMachine {
 
     fn finish_reconnect(&mut self, now: Instant, outcome: Outcome, out: &mut Vec<Decision>) {
         match outcome {
-            Outcome::Succeeded => self.realtime = Realtime::Connected,
+            Outcome::Succeeded => {
+                self.realtime = Realtime::Connected;
+                self.replay_gap(out);
+            }
             // A capacidade `realtime` falhar **não** afeta histórico nem envio (§2.5).
             Outcome::Failed { .. } | Outcome::Lost => {
                 self.realtime = Realtime::Reconnecting;
                 self.schedule(now + self.config.reconnect_retry_after, out);
             }
         }
+    }
+
+    /// `REALTIME-GAP-001` (UNVERIFIED): entre a queda e a volta, as invalidações do Trouter que
+    /// chegaram nesse intervalo **se perdem** — o registro do endpoint é refeito, mas o que passou
+    /// não volta.
+    ///
+    /// Enquanto o cursor de replay (`lastSyncToken`) não tiver evidência, o caminho seguro é
+    /// re-buscar tudo que estava fresco: os upserts são idempotentes, então refazer não duplica nem
+    /// inventa mensagem. Custa uma busca por conversa aberta e nunca perde dado — a troca certa
+    /// enquanto o protocolo é hipótese.
+    fn replay_gap(&mut self, out: &mut Vec<Decision>) {
+        let stale: Vec<ConversationId> = self
+            .conversations
+            .iter()
+            .filter(|(_, state)| matches!(state, ConversationState::Fresh))
+            .map(|(conversation, _)| conversation.clone())
+            .collect();
+        for conversation in stale {
+            self.conversations
+                .insert(conversation, ConversationState::Dirty);
+        }
+        self.flush(out);
     }
 
     fn on_connection_lost(&mut self, now: Instant, out: &mut Vec<Decision>) {
@@ -1157,6 +1182,49 @@ mod tests {
             Some(SendState::Delivered { .. })
         ));
         assert!(persisted_and_published(&decisions, &conv()));
+    }
+
+    #[test]
+    fn reconnect_replays_the_gap_by_refetching_what_was_fresh() {
+        let clock = ManualClock::default();
+        let mut machine = SyncMachine::new();
+
+        // Uma conversa fresca (buscada com sucesso).
+        let decisions = machine.handle(
+            clock.now(),
+            Event::Invalidated {
+                conversation: conv(),
+            },
+        );
+        let fetch = fetch_op(&decisions);
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op: fetch,
+                outcome: Outcome::Succeeded,
+            },
+        );
+        assert!(matches!(
+            machine.conversation_state(&conv()),
+            Some(ConversationState::Fresh)
+        ));
+
+        // Queda e volta; a reconexão dá certo (o registro do endpoint é refeito por baixo).
+        machine.handle(clock.now(), Event::ConnectionLost);
+        let decisions = machine.handle(clock.now(), Event::ConnectionRestored);
+        let op = reconnect_op(&decisions);
+        let decisions = machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op,
+                outcome: Outcome::Succeeded,
+            },
+        );
+
+        // O que estava fresco volta a ser buscado: invalidação perdida na queda não fica em
+        // silêncio (`REALTIME-GAP-001`).
+        fetch_op(&decisions);
+        assert_eq!(machine.realtime(), Realtime::Connected);
     }
 
     #[test]
