@@ -171,6 +171,11 @@ impl TeamsClient {
             let (messages, link) = parse(&response.body)?;
             if let Some(link) = &link {
                 validate_cursor(link, &path)?;
+                if seen.contains(link) {
+                    return Err(TeamsError::Malformed(
+                        "HISTORY-PAGE-001 cursor cíclico (UNVERIFIED)",
+                    ));
+                }
             }
             out.extend(messages);
             if out.len() >= top {
@@ -414,6 +419,29 @@ mod tests {
             .await
             .is_err());
         assert_eq!(exec.ops.lock().unwrap().len(), 2);
+    }
+
+    async fn rejects_cycle_at_top(body: &'static str) {
+        let exec = fake(&[body, body]);
+        let result = TeamsClient::new(exec.clone()).history("48:notes", 2).await;
+        match result {
+            Err(e) => {
+                assert!(e.to_string().contains("cursor cíclico"));
+                assert!(!e.to_string().contains("syntheticsecret"));
+            }
+            Ok(_) => panic!("cyclic cursor returned success at top"),
+        }
+        assert_eq!(exec.ops.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn backward_link_cycle_at_top_fails() {
+        rejects_cycle_at_top(r#"{"messages":[{"id":"1"}],"_metadata":{"backwardLink":"/v1/users/ME/conversations/48:notes/messages?cursor=syntheticsecret"}}"#).await;
+    }
+
+    #[tokio::test]
+    async fn sync_state_cycle_at_top_fails() {
+        rejects_cycle_at_top(r#"{"messages":[{"id":"1"}],"_metadata":{"syncState":"/v1/users/ME/conversations/48:notes/messages?cursor=syntheticsecret"}}"#).await;
     }
 
     #[test]
