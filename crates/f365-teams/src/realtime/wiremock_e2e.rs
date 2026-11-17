@@ -157,10 +157,10 @@ async fn trouter_wiremock_websocket_recorder_end_to_end() {
         "https://private.invalid/SURL_MARKER"
     );
     assert_eq!(body["registrationId"], params["epid"]);
-    let bundle = serde_json::to_string(&recorder.bundle()).unwrap();
+    let bundle = recorder.bundle().export_json().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&bundle).unwrap();
     let events = parsed["events"].as_array().unwrap();
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 6);
     assert!(events
         .iter()
         .any(|e| e["contract"] == "TROUTER-WS-001" && e["outcome"] == "session_error"));
@@ -188,4 +188,64 @@ async fn trouter_wiremock_websocket_recorder_end_to_end() {
     ] {
         assert!(!bundle.contains(secret));
     }
+}
+
+#[tokio::test]
+async fn malformed_connect_records_http_and_protocol_outcomes_without_body() {
+    let http = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v4/a"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("SECRET_MALFORMED"))
+        .mount(&http)
+        .await;
+    let recorder = Arc::new(Recorder::new(Arc::new(LoopbackExecutor {
+        base: http.uri(),
+        http: reqwest::Client::new(),
+    })));
+    let client = TeamsClient::with_recorder(recorder.clone());
+    assert!(client
+        .listen(&ManualClock::default(), &mut |_| {})
+        .await
+        .is_err());
+    let bundle = recorder.bundle().export_json().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&bundle).unwrap();
+    let events = value["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e["contract"] == "TROUTER-CONNECT-001" && e["outcome"] == "http_success"));
+    assert!(events
+        .iter()
+        .any(|e| e["contract"] == "TROUTER-CONNECT-001" && e["outcome"] == "protocol_error"));
+    assert!(!bundle.contains("SECRET_MALFORMED"));
+}
+
+#[tokio::test]
+async fn malformed_handshake_records_protocol_error_without_body() {
+    let http = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v4/a")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "socketio":"https://test.trouter.teams.microsoft.com/", "surl":"https://private.invalid/secret", "ccid":"ccid", "registrarUrl":"https://communications.svc.cloud.microsoft/registrar/test/v3/registrations", "connectparams":{}
+    }))).mount(&http).await;
+    Mock::given(method("GET"))
+        .and(path("/socket.io/1/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("SECRET_HANDSHAKE"))
+        .mount(&http)
+        .await;
+    let recorder = Arc::new(Recorder::new(Arc::new(LoopbackExecutor {
+        base: http.uri(),
+        http: reqwest::Client::new(),
+    })));
+    let client = TeamsClient::with_recorder(recorder.clone());
+    assert!(client
+        .listen(&ManualClock::default(), &mut |_| {})
+        .await
+        .is_err());
+    let bundle = recorder.bundle().export_json().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&bundle).unwrap();
+    let events = value["events"].as_array().unwrap();
+    for outcome in ["http_success", "protocol_error"] {
+        assert!(events
+            .iter()
+            .any(|e| e["contract"] == "TROUTER-HANDSHAKE-001" && e["outcome"] == outcome));
+    }
+    assert!(!bundle.contains("SECRET_HANDSHAKE"));
 }

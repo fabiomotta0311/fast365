@@ -70,7 +70,12 @@ impl TeamsClient {
                 status: resp.status,
             });
         }
-        let mut all = chats::parse(&resp.body)?;
+        let start = std::time::Instant::now();
+        let parsed = chats::parse(&resp.body);
+        if let Some(recorder) = &self.recorder {
+            recorder.response_protocol(false, parsed.is_ok(), start);
+        }
+        let mut all = parsed?;
         all.truncate(top);
         Ok(all)
     }

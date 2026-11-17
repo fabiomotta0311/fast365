@@ -29,7 +29,9 @@ enum Contract {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Outcome {
-    Success,
+    HttpSuccess,
+    ProtocolSuccess,
+    ProtocolError,
     HttpError,
     Authentication,
     Timeout,
@@ -58,10 +60,23 @@ pub struct RecordedBundle {
     schema_version: u8,
     events: Vec<RecordedEvent>,
     truncated: bool,
+    truncated_count: u64,
+}
+impl RecordedBundle {
+    /// Serialize this bounded, typed snapshot as JSON. This performs no I/O and does not share it.
+    ///
+    /// Collection requires explicitly constructing a [`Recorder`] and attaching it to the
+    /// client. Callers must obtain consent before exporting or sharing, choose the destination
+    /// explicitly, and protect any saved file with owner-only permissions appropriate to the OS.
+    /// The bundle contains only contract, outcome and duration categories, not raw values.
+    pub fn export_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
 }
 struct Log {
     events: Vec<RecordedEvent>,
     truncated: bool,
+    truncated_count: u64,
 }
 /// The recorder does not itself access a token store, network, or filesystem.
 pub struct Recorder {
@@ -75,15 +90,17 @@ impl Recorder {
             log: Mutex::new(Log {
                 events: Vec::new(),
                 truncated: false,
+                truncated_count: 0,
             }),
         }
     }
     pub fn bundle(&self) -> RecordedBundle {
         let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
         RecordedBundle {
-            schema_version: 1,
+            schema_version: 2,
             events: log.events.clone(),
             truncated: log.truncated,
+            truncated_count: log.truncated_count,
         }
     }
 }
@@ -105,6 +122,34 @@ impl Recorder {
         self.record(Contract::TrouterWs, outcome, start);
     }
 
+    pub(crate) fn trouter_protocol(&self, handshake: bool, success: bool, start: Instant) {
+        let contract = if handshake {
+            Contract::TrouterHandshake
+        } else {
+            Contract::TrouterConnect
+        };
+        let outcome = if success {
+            Outcome::ProtocolSuccess
+        } else {
+            Outcome::ProtocolError
+        };
+        self.record(contract, outcome, start);
+    }
+
+    pub(crate) fn response_protocol(&self, history: bool, success: bool, start: Instant) {
+        let contract = if history {
+            Contract::History
+        } else {
+            Contract::Conversations
+        };
+        let outcome = if success {
+            Outcome::ProtocolSuccess
+        } else {
+            Outcome::ProtocolError
+        };
+        self.record(contract, outcome, start);
+    }
+
     fn record(&self, contract: Contract, outcome: Outcome, start: Instant) {
         let duration = if start.elapsed().as_secs() < 1 {
             DurationBucket::UnderOneSecond
@@ -114,15 +159,16 @@ impl Recorder {
             DurationBucket::Longer
         };
         let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
-        if log.events.len() < MAX_EVENTS {
-            log.events.push(RecordedEvent {
-                contract,
-                outcome,
-                duration,
-            });
-        } else {
+        if log.events.len() == MAX_EVENTS {
+            log.events.remove(0);
             log.truncated = true;
+            log.truncated_count = log.truncated_count.saturating_add(1);
         }
+        log.events.push(RecordedEvent {
+            contract,
+            outcome,
+            duration,
+        });
     }
 }
 
@@ -159,7 +205,7 @@ impl AuthenticatedExecutor for Recorder {
         let start = Instant::now();
         let result = self.inner.execute(op).await;
         let outcome = match &result {
-            Ok(r) if (200..300).contains(&r.status) => Outcome::Success,
+            Ok(r) if (200..300).contains(&r.status) => Outcome::HttpSuccess,
             Ok(_) => Outcome::HttpError,
             Err(ExecError::NotPaired | ExecError::Auth(_)) => Outcome::Authentication,
             Err(ExecError::Transport(_)) => Outcome::Network,
@@ -170,5 +216,33 @@ impl AuthenticatedExecutor for Recorder {
         };
         self.record(contract, outcome, start);
         result
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    struct Noop;
+    #[async_trait]
+    impl AuthenticatedExecutor for Noop {
+        async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn late_websocket_failure_is_retained_and_evictions_counted() {
+        let recorder = Recorder::new(Arc::new(Noop));
+        for _ in 0..256 {
+            recorder.record(Contract::Other, Outcome::HttpSuccess, Instant::now());
+        }
+        recorder.websocket_failure(WebSocketFailure::Session, Instant::now());
+        let v = serde_json::to_value(recorder.bundle()).unwrap();
+        assert_eq!(v["events"].as_array().unwrap().len(), 256);
+        assert_eq!(v["truncated_count"], 1);
+        assert!(v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["contract"] == "TROUTER-WS-001" && e["outcome"] == "session_error"));
     }
 }

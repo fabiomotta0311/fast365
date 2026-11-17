@@ -33,8 +33,13 @@ alterações à versão numérica no caminho authsvc. O teste sintético
 `runtime_profile_changes_real_executor_authsvc_request` exercita o executor real.
 
 `diagnostics::Recorder::new` envolve explicitamente o executor e `TeamsClient::with_recorder`
-acrescenta falhas WebSocket ao mesmo bundle limitado, com campos tipados, sem corpos, URLs ou
-IDs. Testes sintéticos cobrem REST, handshake e WebSocket local; não validam o serviço real.
+acrescenta eventos de protocolo e falhas WebSocket ao mesmo bundle limitado, com campos tipados,
+sem corpos, URLs ou IDs. O JSON v2 distingue resultados HTTP de resultados de protocolo: HTTP
+2xx não significa que a resposta passou na validação. `truncated_count` conta eventos expulsos
+(saturando em u64); `truncated` indica que houve expulsão. Somente os 256 eventos mais recentes
+são mantidos: um incidente também pode ser expulso após 256 eventos posteriores. A exportação
+`bundle().export_json()` é opt-in, em memória; quem a chama é responsável por consentimento e
+proteção do destino. Testes sintéticos cobrem REST, handshake e WebSocket local; não validam o serviço real.
 **Lacuna:** a CLI não oferece ativação ou exportação deste bundle; apenas integradores da
 biblioteca podem utilizá-lo. Não se garante segurança de logs ou de outros consumidores.
 Authorize/PKCE e outros pontos sem captura permanecem UNVERIFIED; nenhuma sessão ou conta

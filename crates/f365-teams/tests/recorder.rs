@@ -84,4 +84,33 @@ async fn recorder_caps_events_and_sets_truncated() {
     let json = serde_json::to_value(recorder.bundle()).unwrap();
     assert_eq!(json["events"].as_array().unwrap().len(), 256);
     assert_eq!(json["truncated"], true);
+    assert_eq!(json["truncated_count"], 4);
+}
+
+struct Status(u16);
+#[async_trait]
+impl AuthenticatedExecutor for Status {
+    async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+        Ok(HttpResponse {
+            status: self.0,
+            headers: vec![],
+            body: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn http_status_boundaries_are_classified() {
+    for (status, outcome) in [
+        (199, "http_error"),
+        (200, "http_success"),
+        (299, "http_success"),
+        (300, "http_error"),
+    ] {
+        let recorder = Arc::new(Recorder::new(Arc::new(Status(status))));
+        let client = TeamsClient::new(recorder.clone());
+        let _ = client.send_text("19:synthetic", "test", "123").await;
+        let json = serde_json::to_value(recorder.bundle()).unwrap();
+        assert_eq!(json["events"][0]["outcome"], outcome, "status {status}");
+    }
 }

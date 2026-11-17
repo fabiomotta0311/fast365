@@ -160,6 +160,11 @@ impl TeamsClient {
             let response = self.exec.execute(op(next)).await?;
             // Executores alternativos podem ter recebido o corpo inteiro; valide antes do parse.
             if response.body.len() > 8 * 1024 * 1024 {
+                if (200..300).contains(&response.status) {
+                    if let Some(recorder) = &self.recorder {
+                        recorder.response_protocol(true, false, std::time::Instant::now());
+                    }
+                }
                 return Err(TeamsError::Malformed("HISTORY-PAGE-001 corpo excede 8 MiB"));
             }
             if !(200..300).contains(&response.status) {
@@ -168,15 +173,23 @@ impl TeamsClient {
                     status: response.status,
                 });
             }
-            let (messages, link) = parse(&response.body)?;
-            if let Some(link) = &link {
-                validate_cursor(link, &path)?;
-                if seen.contains(link) {
-                    return Err(TeamsError::Malformed(
-                        "HISTORY-PAGE-001 cursor cíclico (UNVERIFIED)",
-                    ));
+            let start = std::time::Instant::now();
+            let parsed = (|| {
+                let (messages, link) = parse(&response.body)?;
+                if let Some(link) = &link {
+                    validate_cursor(link, &path)?;
+                    if seen.contains(link) {
+                        return Err(TeamsError::Malformed(
+                            "HISTORY-PAGE-001 cursor cíclico (UNVERIFIED)",
+                        ));
+                    }
                 }
+                Ok((messages, link))
+            })();
+            if let Some(recorder) = &self.recorder {
+                recorder.response_protocol(true, parsed.is_ok(), start);
             }
+            let (messages, link) = parsed?;
             out.extend(messages);
             if out.len() >= top {
                 out.truncate(top);

@@ -93,7 +93,12 @@ impl TeamsClient {
         let resp = self.exec.execute(trouter::connect_op(&epid)).await?;
         ensure_2xx("Trouter (conexão)", &resp)?;
         tracing::debug!(campos = ?trouter::shape(&resp.body), "Trouter: formato da resposta de conexão");
-        let mut info = trouter::parse_connect(&resp.body)?;
+        let parse_start = Instant::now();
+        let parsed = trouter::parse_connect(&resp.body);
+        if let Some(recorder) = &self.recorder {
+            recorder.trouter_protocol(false, parsed.is_ok(), parse_start);
+        }
+        let mut info = parsed?;
         let ms = clock
             .utc_now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -107,13 +112,18 @@ impl TeamsClient {
             .execute(trouter::handshake_op(&info, &epid))
             .await?;
         ensure_2xx("Trouter (handshake)", &resp)?;
-        let hs = std::str::from_utf8(&resp.body)
+        let parse_start = Instant::now();
+        let parsed = std::str::from_utf8(&resp.body)
             .ok()
             .and_then(socketio::parse_handshake)
             .filter(|h| h.transports.iter().any(|t| t == "websocket"))
             .ok_or(TeamsError::Malformed(
                 "Trouter: handshake socket.io inesperado (TROUTER-HANDSHAKE-001)",
-            ))?;
+            ));
+        if let Some(recorder) = &self.recorder {
+            recorder.trouter_protocol(true, parsed.is_ok(), parse_start);
+        }
+        let hs = parsed?;
 
         on_event(RealtimeEvent::Step("3/4 WebSocket"));
         let ws_url = trouter::ws_url(&info, &hs.session_id, &epid);
