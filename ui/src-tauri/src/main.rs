@@ -121,6 +121,12 @@ async fn run_core(app: AppHandle, mut requests: mpsc::Receiver<Request>) {
         Err(why) => return serve_failing(&mut requests, why).await,
     };
 
+    // Busca fresca na abertura: sem isso a janela abriria só com o cache, e o nome de um 1:1 só
+    // apareceria ao clicar na conversa. Falhar aqui não é fatal — a UI mostra as capacidades.
+    if let Ok(round) = core.refresh_conversations().await {
+        emit_round(&app, &round);
+    }
+
     // Sobe o tempo real (o `RealtimeLink` inicia o laço do Trouter e alimenta a `pump`).
     if let Ok(round) = core.connection_restored().await {
         emit_round(&app, &round);

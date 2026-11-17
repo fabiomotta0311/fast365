@@ -363,6 +363,28 @@ mod tests {
             .expect("histórico");
     }
 
+    /// O caminho que a janela usa: **um** `refresh` já devolve o 1:1 com nome, sem abrir nada.
+    #[tokio::test]
+    async fn refresh_brings_the_one_on_one_name() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:dm@unq.gbl.spaces","title":null,
+            "isOneOnOne":true,"isLastMessageFromMe":true,
+            "lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        const HISTORY: &str = r#"{"messages":[
+            {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
+        ]}"#;
+        let (_clock, mut shell) =
+            shell(FakeExec::replying(vec![ok(200, LISTING), ok(200, HISTORY)]));
+
+        shell.refresh_conversations().await.expect("atualiza");
+
+        let list = shell.conversations(10).expect("lista");
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].title, "Ana",
+            "o Atualizar já traz o nome do outro lado"
+        );
+    }
+
     #[tokio::test]
     async fn conversations_come_from_the_cache_without_touching_the_network() {
         let exec = FakeExec::replying(vec![ok(200, CHATS)]);

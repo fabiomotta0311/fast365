@@ -9,16 +9,12 @@ use f365_auth::{AuthenticatedExecutor, Clock, SystemClock};
 use f365_teams::{RealtimeEvent, TeamsClient};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Quanto esperar o canal ficar pronto na primeira conexão.
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Implementação de `f365_driver::Realtime` que sobe o laço do Trouter **uma vez** e alimenta o
 /// [`PumpHandle`] do runtime.
 ///
 /// O laço do provider já repete e resubscreve sozinho a cada queda; aqui a responsabilidade é só
-/// reportar o estado ao runtime e responder se o canal está de pé quando o motor pedir reconexão.
+/// reportar o estado ao runtime e dizer se o canal está de pé quando o motor pedir reconexão.
 pub struct RealtimeLink {
     exec: Arc<dyn AuthenticatedExecutor>,
     pump: PumpHandle,
@@ -36,20 +32,22 @@ impl RealtimeLink {
         }
     }
 
-    /// Sobe o laço em background, sinalizando `ready` no primeiro `Ready`.
-    fn spawn(&self, ready: tokio::sync::oneshot::Sender<()>) {
+    /// Sobe o laço em background.
+    ///
+    /// Não espera o canal ficar pronto: o estado chega pelo [`PumpHandle`] (`Realtime { connected }`)
+    /// e prender o motor até o handshake atrasaria os comandos da UI na abertura.
+    fn spawn(&self) {
         let exec = self.exec.clone();
         let pump = self.pump.clone();
         let connected = self.connected.clone();
         tokio::spawn(async move {
             let client = TeamsClient::new(exec);
             let clock: SystemClock = SystemClock;
-            let mut ready = Some(ready);
             // O callback toma alça+flag; o laço guarda cópias para marcar a queda no fim.
             let pump_for_events = pump.clone();
             let connected_for_events = connected.clone();
             let mut on_event = move |event: RealtimeEvent| {
-                forward(&pump_for_events, &connected_for_events, &event, &mut ready);
+                forward(&pump_for_events, &connected_for_events, &event);
             };
             let _ = client.listen(&clock as &dyn Clock, &mut on_event).await;
             connected.store(false, Ordering::SeqCst);
@@ -62,12 +60,8 @@ impl RealtimeLink {
 impl f365_driver::Realtime for RealtimeLink {
     async fn reconnect(&self) -> Result<(), String> {
         if !self.spawned.swap(true, Ordering::SeqCst) {
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            self.spawn(ready_tx);
-            return match tokio::time::timeout(READY_TIMEOUT, ready_rx).await {
-                Ok(Ok(())) => Ok(()),
-                _ => Err("tempo real não ficou pronto a tempo".into()),
-            };
+            self.spawn();
+            return Ok(());
         }
         if self.connected.load(Ordering::SeqCst) {
             Ok(())
@@ -78,18 +72,10 @@ impl f365_driver::Realtime for RealtimeLink {
 }
 
 /// Traduz um evento do provider em estado para o runtime. Função pura, testável sem socket.
-fn forward(
-    pump: &PumpHandle,
-    connected: &AtomicBool,
-    event: &RealtimeEvent,
-    ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
-) {
+fn forward(pump: &PumpHandle, connected: &AtomicBool, event: &RealtimeEvent) {
     match event {
         RealtimeEvent::Ready => {
             connected.store(true, Ordering::SeqCst);
-            if let Some(tx) = ready.take() {
-                let _ = tx.send(());
-            }
             let _ = pump.realtime(true);
         }
         RealtimeEvent::Reconnecting { .. } => {
@@ -110,12 +96,12 @@ fn forward(
 mod tests {
     use super::*;
     use crate::{channel, Inbound};
+    use std::time::Duration;
 
     #[test]
     fn changed_becomes_an_invalidation_without_content() {
         let (pump, mut inbox) = channel();
         let connected = AtomicBool::new(false);
-        let mut ready = None;
 
         forward(
             &pump,
@@ -123,7 +109,6 @@ mod tests {
             &RealtimeEvent::Changed {
                 conversation: Some("19:a@thread.v2".into()),
             },
-            &mut ready,
         );
 
         assert_eq!(
@@ -138,9 +123,8 @@ mod tests {
     fn ready_and_reconnecting_move_the_channel_state() {
         let (pump, mut inbox) = channel();
         let connected = AtomicBool::new(false);
-        let mut ready = None;
 
-        forward(&pump, &connected, &RealtimeEvent::Ready, &mut ready);
+        forward(&pump, &connected, &RealtimeEvent::Ready);
         assert!(connected.load(Ordering::SeqCst));
         assert_eq!(
             inbox.try_recv(),
@@ -154,7 +138,6 @@ mod tests {
                 attempt: 2,
                 after: Duration::from_secs(4),
             },
-            &mut ready,
         );
         assert!(!connected.load(Ordering::SeqCst));
         assert_eq!(
@@ -167,14 +150,13 @@ mod tests {
     fn progress_and_unnamed_changes_are_ignored() {
         let (pump, mut inbox) = channel();
         let connected = AtomicBool::new(false);
-        let mut ready = None;
 
         for event in [
             RealtimeEvent::Step("2/4 handshake"),
             RealtimeEvent::Signal("trouter.connected".into()),
             RealtimeEvent::Changed { conversation: None },
         ] {
-            forward(&pump, &connected, &event, &mut ready);
+            forward(&pump, &connected, &event);
         }
 
         assert_eq!(inbox.try_recv(), None, "nada de conteúdo nem de progresso");
