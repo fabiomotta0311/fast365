@@ -96,6 +96,11 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Escopo reservado em `sync_state` para o nome do próprio usuário.
+///
+/// Ids de conversa começam com `19:`/`48:`, então `__self__` não colide.
+const MY_NAME_SCOPE: &str = "__self__";
+
 impl Store {
     /// Abre (ou cria) o banco, liga o WAL/migrações e devolve o cache pronto.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -367,6 +372,34 @@ impl Store {
             params![scope, value, now_ms],
         )?;
         Ok(())
+    }
+
+    /// Nome de exibição do próprio usuário, aprendido da listagem.
+    ///
+    /// Mora em `sync_state` com escopo reservado (`__self__` não colide com id de conversa, que
+    /// começa com `19:`/`48:`). Serve para descobrir a outra pessoa de um 1:1 sem endpoint novo.
+    pub fn my_display_name(&self) -> Result<Option<String>> {
+        self.sync_token(MY_NAME_SCOPE)
+    }
+
+    pub fn set_my_display_name(&self, name: &str, now_ms: i64) -> Result<()> {
+        self.set_sync_token(MY_NAME_SCOPE, name, now_ms)
+    }
+
+    /// Remetentes de uma conversa, do mais frequente para o menos (empate pelo nome).
+    ///
+    /// É o que revela a outra pessoa de um 1:1: excluindo quem sou eu, sobra o outro lado.
+    pub fn senders(&self, conversation_id: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sender, COUNT(*) AS n FROM messages
+             WHERE conversation_id = ?1 AND sender IS NOT NULL
+             GROUP BY sender
+             ORDER BY n DESC, sender",
+        )?;
+        let rows = stmt.query_map(params![conversation_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     // ---- drafts ----
@@ -681,6 +714,44 @@ mod tests {
         assert_eq!(
             store.sync_token("19:a@thread.v2").expect("lê").as_deref(),
             Some("token-2")
+        );
+    }
+
+    #[test]
+    fn my_name_and_senders_survive_a_restart() {
+        let mut store = store();
+        assert_eq!(store.my_display_name().expect("vazio"), None);
+        store.set_my_display_name("Fabio Motta", 10).expect("grava");
+        assert_eq!(
+            store.my_display_name().expect("lê").as_deref(),
+            Some("Fabio Motta"),
+            "o nome tem de sobreviver ao restart, senão o 1:1 volta a ficar sem nome"
+        );
+
+        store
+            .upsert_conversation(&Conversation::new("19:a@thread.v2", "1:1 · abc", "chat"))
+            .expect("conversa");
+        let batch = vec![
+            Message {
+                sender: Some("Ana".into()),
+                ..Message::text("19:a@thread.v2", "m1", "oi", 1)
+            },
+            Message {
+                sender: Some("Ana".into()),
+                ..Message::text("19:a@thread.v2", "m2", "oi 2", 2)
+            },
+            Message {
+                sender: Some("Fabio Motta".into()),
+                ..Message::text("19:a@thread.v2", "m3", "meu", 3)
+            },
+        ];
+        store.upsert_messages(&batch).expect("mensagens");
+
+        // Mais frequente primeiro: é assim que o driver acha o outro lado do 1:1.
+        let senders = store.senders("19:a@thread.v2").expect("remetentes");
+        assert_eq!(
+            senders,
+            vec![("Ana".to_string(), 2), ("Fabio Motta".to_string(), 1)]
         );
     }
 

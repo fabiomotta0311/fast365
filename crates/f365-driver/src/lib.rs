@@ -40,6 +40,9 @@ const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 /// Prefixo do título provisório de 1:1 (o provider usa `1:1 · <sufixo>` quando não há nome).
 const ONE_ON_ONE_TITLE_PREFIX: &str = "1:1 · ";
 
+/// Teto de conversas varridas ao completar títulos a partir do cache.
+const TITLE_REPAIR_LIMIT: usize = 500;
+
 /// Falha de uma operação, já classificada para o motor e para o modelo de capacidade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpFailure {
@@ -219,6 +222,8 @@ pub struct Driver {
 impl Driver {
     pub fn new(exec: Arc<dyn AuthenticatedExecutor>, store: Store, clock: Arc<dyn Clock>) -> Self {
         let now = clock.now();
+        // Nome aprendido numa execução anterior: sem isso o 1:1 volta a ficar sem nome.
+        let my_display_name = store.my_display_name().ok().flatten();
         Self {
             machine: SyncMachine::new(),
             store,
@@ -232,7 +237,7 @@ impl Driver {
             token_keeper: None,
             refresh_at: None,
             refresh_backoff: REFRESH_BACKOFF_MIN,
-            my_display_name: None,
+            my_display_name,
             clock,
         }
     }
@@ -318,11 +323,24 @@ impl Driver {
         match self.client.list_conversations(self.top).await {
             Ok(listing) => {
                 let now_ms = self.now_ms();
-                self.my_display_name = listing.my_display_name;
-                for conversation in &listing.conversations {
-                    self.store
-                        .upsert_conversation(&stored_conversation(conversation, now_ms))?;
+                if let Some(name) = listing.my_display_name.clone() {
+                    self.store.set_my_display_name(&name, now_ms)?;
+                    self.my_display_name = Some(name);
                 }
+                for conversation in &listing.conversations {
+                    let mut stored = stored_conversation(conversation, now_ms);
+                    // Não rebaixar: um nome aprendido do histórico sobrevive ao `Atualizar`.
+                    if stored.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+                        if let Ok(Some(existing)) = self.store.conversation(&stored.id) {
+                            if !existing.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+                                stored.title = existing.title;
+                            }
+                        }
+                    }
+                    self.store.upsert_conversation(&stored)?;
+                }
+                // Completa o que o cache já permite saber, sem esperar alguém abrir a conversa.
+                self.repair_titles()?;
                 self.capabilities
                     .observe_ok(now, Capability::ListConversations);
                 round
@@ -457,6 +475,31 @@ impl Driver {
                 Ok((OpFailure::classify(&error).outcome(), Vec::new()))
             }
         }
+    }
+
+    /// Completa títulos provisórios de 1:1 usando **o que já está no cache**.
+    ///
+    /// Roda na carga (a casca chama antes do primeiro frame), depois de cada `refresh` e depois de
+    /// cada busca. Sem isso o nome só aparecia na conversa recém-aberta — e o `Atualizar` apagava o
+    /// que tinha sido aprendido.
+    pub fn repair_titles(&self) -> Result<usize, DriverError> {
+        let Some(mine) = self.store.my_display_name()? else {
+            return Ok(0);
+        };
+        let mut repaired = 0;
+        for mut conversation in self.store.list_conversations(TITLE_REPAIR_LIMIT)? {
+            if !conversation.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+                continue;
+            }
+            let senders = self.store.senders(&conversation.id)?;
+            let Some((name, _)) = senders.iter().find(|(sender, _)| sender != &mine) else {
+                continue;
+            };
+            conversation.title = name.clone();
+            self.store.upsert_conversation(&conversation)?;
+            repaired += 1;
+        }
+        Ok(repaired)
     }
 
     /// Completa o título de um 1:1 sem nome usando o histórico.
@@ -1072,6 +1115,75 @@ mod tests {
             .expect("busca")
             .expect("mensagem no cache");
         assert_eq!(stored.id, "m1");
+    }
+
+    /// Aprender o nome não pode ser desfeito pelo `Atualizar` (que traz o título provisório).
+    #[tokio::test]
+    async fn refresh_does_not_downgrade_a_learned_name() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        const HISTORY: &str = r#"{"messages":[
+            {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
+        ]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, HISTORY), ok(200, LISTING)]);
+        let (_clock, mut driver) = driver(exec);
+
+        driver.refresh_conversations().await.expect("listagem");
+        driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+        assert_eq!(title(&driver), "Ana");
+
+        // `Atualizar` de novo: o provider volta a mandar `1:1 · …`.
+        driver.refresh_conversations().await.expect("listagem");
+        assert_eq!(
+            title(&driver),
+            "Ana",
+            "o nome aprendido sobrevive ao refresh"
+        );
+    }
+
+    /// Na carga, o nome sai do cache — sem abrir a conversa e sem rede.
+    #[tokio::test]
+    async fn repair_titles_completes_from_the_cache_alone() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        const HISTORY: &str = r#"{"messages":[
+            {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
+        ]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, HISTORY)]);
+        let (_clock, mut driver) = driver(exec);
+        driver.refresh_conversations().await.expect("listagem");
+        driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+
+        // Simula o cache de uma sessão anterior, quando o título ainda era provisório.
+        let mut stale = driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache");
+        stale.title = "1:1 · abc123".into();
+        driver.store().upsert_conversation(&stale).expect("grava");
+
+        assert_eq!(driver.repair_titles().expect("repara"), 1);
+        assert_eq!(title(&driver), "Ana");
+    }
+
+    fn title(driver: &Driver) -> String {
+        driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache")
+            .title
     }
 
     /// 1:1 sem nome na listagem ganha o nome do outro lado depois de buscar o histórico.

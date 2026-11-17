@@ -271,6 +271,8 @@ fn build_core(pump: PumpHandle) -> Result<App, String> {
     let driver = Driver::new(exec, store, clock.clone())
         .with_top(50)
         .with_realtime(realtime);
+    // Nome dos 1:1 já no primeiro frame: usa o cache, sem rede.
+    let _ = driver.repair_titles();
     let shell = Shell::new(driver, clock.clone());
     Ok(App::new(shell, clock))
 }
