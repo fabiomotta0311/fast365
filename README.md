@@ -18,6 +18,7 @@ Abordagem: **emular o cliente web oficial** (sem Graph API, sem aprovação de a
 | Documento | Para quê |
 |-----------|----------|
 | [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) | Plano de arquitetura e execução (o "porquê" de cada decisão). |
+| [`docs/GATE-FASE0.md`](docs/GATE-FASE0.md) | Protocolo e registro da decisão Go/No-Go (matriz A–F). |
 | [`AGENTS.md`](AGENTS.md) | Regras estáveis "sempre/nunca" para qualquer agente que contribuir. |
 | [`README-DEV-VPS.md`](README-DEV-VPS.md) | Ambiente de dev headless na VPS (core sem GUI). |
 | [`docs/onboarding/`](docs/onboarding/) | Prompts para integrar Hermes/Antigravity/DSH à memória compartilhada. |
@@ -26,6 +27,11 @@ Abordagem: **emular o cliente web oficial** (sem Graph API, sem aprovação de a
 
 **Fase 0 — Gate de viabilidade (em aberto).** Nada de UI, persistência ou features começa antes do
 **Go** da matriz de aceite (`docs/ARQUITETURA.md` §2.4). Esqueleto do workspace no ar e CI verde.
+
+A **rodada 1** da matriz (A–F) está registrada nos comentários da
+[#13](https://github.com/fabiomotta0311/fast365/issues/13); falta a **rodada 2** independente e o bloco
+de decisão. `f365 gate` roda os checkpoints mecanizáveis e grava o relatório sanitizado de cada rodada
+([protocolo](docs/GATE-FASE0.md)).
 
 ## Roadmap (por fase → Issues)
 
