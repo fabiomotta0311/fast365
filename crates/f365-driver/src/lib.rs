@@ -43,6 +43,29 @@ const ONE_ON_ONE_TITLE_PREFIX: &str = "1:1 · ";
 /// Teto de conversas varridas ao completar títulos a partir do cache.
 const TITLE_REPAIR_LIMIT: usize = 500;
 
+/// Buscas de histórico por `refresh` para descobrir o nome de um 1:1 (uma por conversa pendente).
+const NAMES_FETCH_LIMIT: usize = 25;
+
+/// Mensagens lidas para descobrir o nome do outro lado.
+const NAMES_FETCH_TOP: usize = 20;
+
+/// O outro lado de um 1:1: o remetente mais frequente que **não** sou eu.
+///
+/// Empate resolvido pelo nome, para o resultado não depender da ordem da página.
+fn counterpart<'a>(senders: impl Iterator<Item = &'a str>, mine: &str) -> Option<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for sender in senders {
+        if sender == mine {
+            continue;
+        }
+        *counts.entry(sender).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(name, _)| name.to_string())
+}
+
 /// Falha de uma operação, já classificada para o motor e para o modelo de capacidade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpFailure {
@@ -341,6 +364,10 @@ impl Driver {
                 }
                 // Completa o que o cache já permite saber, sem esperar alguém abrir a conversa.
                 self.repair_titles()?;
+                // Para os que ainda estão sem nome, busca o histórico agora: o `Atualizar` já
+                // devolve a lista com nome, não só na próxima vez.
+                let filled = self.fill_missing_names().await;
+                round.effects.extend(filled);
                 self.capabilities
                     .observe_ok(now, Capability::ListConversations);
                 round
@@ -492,14 +519,61 @@ impl Driver {
                 continue;
             }
             let senders = self.store.senders(&conversation.id)?;
-            let Some((name, _)) = senders.iter().find(|(sender, _)| sender != &mine) else {
+            let Some(name) = counterpart(senders.iter().map(|(sender, _)| sender.as_str()), &mine)
+            else {
                 continue;
             };
-            conversation.title = name.clone();
+            conversation.title = name;
             self.store.upsert_conversation(&conversation)?;
             repaired += 1;
         }
         Ok(repaired)
+    }
+
+    /// Busca o histórico dos 1:1 que **ainda** estão sem nome, para o `Atualizar` já trazer tudo.
+    ///
+    /// Limitado de propósito: é uma requisição por conversa pendente e a lista tende a ser curta.
+    /// Falha de uma conversa não derruba o refresh.
+    async fn fill_missing_names(&mut self) -> Vec<Effect> {
+        let Some(mine) = self.store.my_display_name().ok().flatten() else {
+            return Vec::new();
+        };
+        let Ok(conversations) = self.store.list_conversations(TITLE_REPAIR_LIMIT) else {
+            return Vec::new();
+        };
+        let pending: Vec<String> = conversations
+            .into_iter()
+            .filter(|conversation| conversation.title.starts_with(ONE_ON_ONE_TITLE_PREFIX))
+            .map(|conversation| conversation.id)
+            .take(NAMES_FETCH_LIMIT)
+            .collect();
+
+        let now = self.clock.now();
+        let mut effects = Vec::new();
+        for id in pending {
+            let Ok(messages) = self.client.history(&id, NAMES_FETCH_TOP).await else {
+                continue;
+            };
+            let Some(name) = counterpart(
+                messages
+                    .iter()
+                    .filter_map(|message| message.sender.as_deref()),
+                &mine,
+            ) else {
+                continue;
+            };
+            let Ok(Some(mut stored)) = self.store.conversation(&id) else {
+                continue;
+            };
+            stored.title = name;
+            if self.store.upsert_conversation(&stored).is_ok() {
+                effects.push(Effect::Persisted(ConversationId(id)));
+            }
+        }
+        if !effects.is_empty() {
+            self.capabilities.observe_ok(now, Capability::ReadHistory);
+        }
+        effects
     }
 
     /// Completa o título de um 1:1 sem nome usando o histórico.
@@ -513,8 +587,13 @@ impl Driver {
         batch: &[StoredMessage],
         round: &mut Round,
     ) {
-        let Some(mine) = self.my_display_name.as_deref() else {
-            return;
+        // O nome pode ter vindo da listagem nesta execução ou de uma execução anterior (cache).
+        let mine = match self.my_display_name.clone() {
+            Some(name) => name,
+            None => match self.store.my_display_name() {
+                Ok(Some(name)) => name,
+                _ => return,
+            },
         };
         let Ok(Some(mut stored)) = self.store.conversation(&conversation.0) else {
             return;
@@ -523,24 +602,13 @@ impl Driver {
         if !stored.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
             return;
         }
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for message in batch {
-            let Some(sender) = message.sender.as_deref() else {
-                continue;
-            };
-            if sender == mine {
-                continue;
-            }
-            *counts.entry(sender).or_default() += 1;
-        }
-        // Mais frequente; empate pelo nome, para o resultado não depender da ordem da página.
-        let Some((name, _)) = counts
-            .iter()
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-        else {
+        let Some(name) = counterpart(
+            batch.iter().filter_map(|message| message.sender.as_deref()),
+            &mine,
+        ) else {
             return;
         };
-        stored.title = (*name).to_owned();
+        stored.title = name;
         if self.store.upsert_conversation(&stored).is_ok() {
             round.effects.push(Effect::Persisted(conversation.clone()));
         }
@@ -1129,13 +1197,7 @@ mod tests {
         let (_clock, mut driver) = driver(exec);
 
         driver.refresh_conversations().await.expect("listagem");
-        driver
-            .drive(Event::Invalidated {
-                conversation: conv(),
-            })
-            .await
-            .expect("busca");
-        assert_eq!(title(&driver), "Ana");
+        assert_eq!(title(&driver), "Ana", "o refresh já traz o nome");
 
         // `Atualizar` de novo: o provider volta a mandar `1:1 · …`.
         driver.refresh_conversations().await.expect("listagem");
@@ -1151,12 +1213,18 @@ mod tests {
     async fn repair_titles_completes_from_the_cache_alone() {
         const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
             "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        // O refresh não consegue o nome (histórico vazio); a busca depois traz as mensagens.
+        const EMPTY: &str = r#"{"messages":[]}"#;
         const HISTORY: &str = r#"{"messages":[
             {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
         ]}"#;
-        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, HISTORY)]);
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, EMPTY), ok(200, HISTORY)]);
         let (_clock, mut driver) = driver(exec);
         driver.refresh_conversations().await.expect("listagem");
+        assert!(
+            title(&driver).starts_with("1:1 · "),
+            "sem histórico, sem nome"
+        );
         driver
             .drive(Event::Invalidated {
                 conversation: conv(),
@@ -1177,6 +1245,26 @@ mod tests {
         assert_eq!(title(&driver), "Ana");
     }
 
+    /// O `Atualizar` já traz o nome: busca o histórico dos 1:1 ainda sem nome, sem ninguém abrir.
+    #[tokio::test]
+    async fn refresh_fetches_history_of_an_unnamed_one_on_one() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        const HISTORY: &str = r#"{"messages":[
+            {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
+        ]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, HISTORY)]);
+        let (_clock, mut driver) = driver(exec);
+
+        driver.refresh_conversations().await.expect("refresh");
+
+        assert_eq!(
+            title(&driver),
+            "Ana",
+            "o Atualizar completa o nome sem abrir a conversa"
+        );
+    }
+
     fn title(driver: &Driver) -> String {
         driver
             .store()
@@ -1195,6 +1283,8 @@ mod tests {
                 r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
                     "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#,
             ),
+            // O refresh não resolve (histórico vazio no primeiro momento).
+            ok(200, r#"{"messages":[]}"#),
             ok(
                 200,
                 r#"{"messages":[

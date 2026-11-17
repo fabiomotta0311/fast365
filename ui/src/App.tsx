@@ -122,6 +122,18 @@ export default function App() {
     };
   }, [applyRound]);
 
+  // O título é completado pelo motor depois do primeiro frame: mantém a conversa aberta em
+  // sincronia com a lista, senão o cabeçalho fica no `1:1 · …` antigo.
+  useEffect(() => {
+    const current = selectedRef.current;
+    if (!current) return;
+    const fresh = conversations.find((conversation) => conversation.id === current.id);
+    if (fresh && fresh.title !== current.title) {
+      selectedRef.current = fresh;
+      setSelected(fresh);
+    }
+  }, [conversations]);
+
   const select = useCallback(
     async (conversation: Conversation) => {
       selectedRef.current = conversation;
