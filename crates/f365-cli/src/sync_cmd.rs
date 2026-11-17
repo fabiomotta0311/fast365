@@ -71,14 +71,15 @@ pub async fn sync(options: Options) -> anyhow::Result<()> {
     print_round(&round, &mut last_caps);
     println!("Tempo real e cache ativos. Ctrl+C encerra.\n");
 
+    let mut wake = round.wake_at;
     loop {
-        let wake = round.wake_at;
         tokio::select! {
             event = events_rx.recv() => {
                 let Some(event) = event else { break };
                 round = driver.drive(event).await?;
             }
             () = sleep_until(clock.clone(), wake) => {
+                wake = None;
                 round = driver.drive(Event::WakeUp).await?;
             }
             _ = tokio::signal::ctrl_c() => {
@@ -86,9 +87,17 @@ pub async fn sync(options: Options) -> anyhow::Result<()> {
                 break;
             }
         }
+        wake = next_deadline(wake, round.wake_at);
         print_round(&round, &mut last_caps);
     }
     Ok(())
+}
+
+fn next_deadline(previous: Option<Instant>, current: Option<Instant>) -> Option<Instant> {
+    match (previous, current) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Expectativa de `WakeUp`: dorme até o prazo pedido (ou para sempre, se não há prazo).
@@ -150,8 +159,7 @@ fn db_path(override_path: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(dir.join("f365-cache.db"))
 }
 
-/// Só `Changed` vira evento do motor: `Step`/`Signal` são progresso, e `Ready`/`Reconnecting`
-/// mexem no estado do canal — não no dado.
+/// Traduz mudanças de canal e invalidações; sinais de progresso não são dados.
 fn event_from_realtime(event: &RealtimeEvent) -> Option<Event> {
     match event {
         RealtimeEvent::Changed { conversation } => {
@@ -159,6 +167,8 @@ fn event_from_realtime(event: &RealtimeEvent) -> Option<Event> {
                 conversation: ConversationId(id.clone()),
             })
         }
+        RealtimeEvent::Ready => Some(Event::ConnectionRestored),
+        RealtimeEvent::Reconnecting { .. } => Some(Event::ConnectionLost),
         _ => None,
     }
 }
@@ -168,7 +178,7 @@ struct Listener {
     exec: Arc<dyn AuthenticatedExecutor>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     connected: Arc<AtomicBool>,
-    spawned: AtomicBool,
+    spawned: Arc<AtomicBool>,
 }
 
 impl Listener {
@@ -180,7 +190,7 @@ impl Listener {
             exec,
             events,
             connected: Arc::new(AtomicBool::new(false)),
-            spawned: AtomicBool::new(false),
+            spawned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -189,6 +199,7 @@ impl Listener {
         let exec = self.exec.clone();
         let events = self.events.clone();
         let connected = self.connected.clone();
+        let spawned = self.spawned.clone();
         tokio::spawn(async move {
             let client = TeamsClient::new(exec);
             let clock = SystemClock;
@@ -212,6 +223,7 @@ impl Listener {
             };
             let _ = client.listen(&clock, &mut on_event).await;
             connected.store(false, Ordering::SeqCst);
+            spawned.store(false, Ordering::SeqCst);
         });
     }
 }
@@ -289,20 +301,60 @@ mod tests {
         );
         // Sem id legível não há o que invalidar.
         assert!(event_from_realtime(&RealtimeEvent::Changed { conversation: None }).is_none());
-        assert!(event_from_realtime(&RealtimeEvent::Ready).is_none());
+        assert_eq!(
+            event_from_realtime(&RealtimeEvent::Ready),
+            Some(Event::ConnectionRestored)
+        );
         assert!(event_from_realtime(&RealtimeEvent::Step("1/4")).is_none());
         assert!(event_from_realtime(&RealtimeEvent::Signal("trouter.connected".into())).is_none());
-        assert!(event_from_realtime(&RealtimeEvent::Reconnecting {
-            attempt: 1,
-            after: Duration::from_secs(2)
-        })
-        .is_none());
+        assert_eq!(
+            event_from_realtime(&RealtimeEvent::Reconnecting {
+                attempt: 1,
+                after: Duration::from_secs(2)
+            }),
+            Some(Event::ConnectionLost)
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_retries_after_initial_failure() {
+        use f365_auth::transport::HttpResponse;
+        use f365_auth::{AuthOp, ExecError};
+        use std::sync::atomic::AtomicUsize;
+        struct Failing(AtomicUsize);
+        #[async_trait::async_trait]
+        impl AuthenticatedExecutor for Failing {
+            async fn execute(&self, _: AuthOp) -> Result<HttpResponse, ExecError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }
+        }
+        let exec = Arc::new(Failing(AtomicUsize::new(0)));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = Listener::new(exec.clone(), tx);
+        assert!(listener.reconnect().await.is_err());
+        let first = exec.0.load(Ordering::SeqCst);
+        assert!(first > 0);
+        assert!(listener.reconnect().await.is_err());
+        assert!(exec.0.load(Ordering::SeqCst) > first);
     }
 
     #[test]
     fn db_path_honours_the_override() {
         let path = PathBuf::from(r"C:\temp\cache.db");
         assert_eq!(db_path(Some(&path)).expect("caminho"), path);
+    }
+
+    #[test]
+    fn earlier_pending_deadline_survives_later_event() {
+        let earlier = Instant::now();
+        let later = earlier + Duration::from_secs(5);
+        assert_eq!(next_deadline(Some(earlier), Some(later)), Some(earlier));
+        assert_eq!(next_deadline(Some(earlier), None), Some(earlier));
     }
 
     #[tokio::test]

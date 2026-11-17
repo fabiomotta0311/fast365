@@ -314,6 +314,8 @@ impl Driver {
                 for conversation in &list {
                     self.store
                         .upsert_conversation(&stored_conversation(conversation, now_ms))?;
+                    self.machine
+                        .register_conversation(ConversationId(conversation.id.clone()));
                 }
                 self.capabilities
                     .observe_ok(now, Capability::ListConversations);
@@ -853,6 +855,91 @@ mod tests {
         );
         assert_eq!(epoch_ms_from_rfc3339("ontem"), None);
         assert_eq!(epoch_ms_from_rfc3339("2024-13-01T00:00:00Z"), None);
+    }
+
+    #[tokio::test]
+    async fn startup_conversations_are_known_without_fetching_history() {
+        let exec = FakeExec::replying(vec![ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#)]);
+        let (_clock, mut driver) = driver(exec.clone());
+        driver.refresh_conversations().await.expect("lista");
+        assert!(driver.machine().conversation_state(&conv()).is_some());
+        assert_eq!(exec.calls(), 1, "registrar não busca histórico");
+    }
+
+    #[tokio::test]
+    async fn duplicate_list_entries_do_not_reset_a_fresh_conversation() {
+        let exec = FakeExec::replying(vec![
+            ok(
+                200,
+                r#"{"chats":[{"id":"19:abc@thread.v2"},{"id":"19:abc@thread.v2"},{"id":""}]}"#,
+            ),
+            ok(200, r#"{"messages":[]}"#),
+            ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#),
+        ]);
+        let (_, driver) = driver(exec.clone());
+        let mut driver = driver.with_realtime(Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        }));
+        driver.refresh_conversations().await.unwrap();
+        assert!(driver
+            .machine()
+            .conversation_state(&ConversationId(String::new()))
+            .is_none());
+        driver.drive(Event::ConnectionRestored).await.unwrap();
+        assert!(matches!(
+            driver.machine().conversation_state(&conv()),
+            Some(f365_sync::ConversationState::Fresh)
+        ));
+        driver.refresh_conversations().await.unwrap();
+        assert!(matches!(
+            driver.machine().conversation_state(&conv()),
+            Some(f365_sync::ConversationState::Fresh)
+        ));
+        assert_eq!(exec.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn startup_then_reconnect_replays_gap_and_retries_rest() {
+        let exec = FakeExec::replying(vec![
+            ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#),
+            ok(200, r#"{"messages":[]}"#),
+            ok(503, ""),
+            ok(200, r#"{"messages":[{"id":"m1","content":"gap"}]}"#),
+        ]);
+        let (clock, driver) = driver(exec.clone());
+        let realtime = Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        });
+        let mut driver = driver.with_realtime(realtime);
+        driver.refresh_conversations().await.expect("lista");
+        driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("ready");
+        assert!(driver
+            .store()
+            .page_messages(&conv().0, None, 10)
+            .unwrap()
+            .is_empty());
+        driver.drive(Event::ConnectionLost).await.expect("queda");
+        let retry = driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("volta");
+        assert!(retry.wake_at.is_some());
+        assert!(driver
+            .store()
+            .page_messages(&conv().0, None, 10)
+            .unwrap()
+            .is_empty());
+        clock.advance(Duration::from_secs(60));
+        driver.drive(Event::WakeUp).await.expect("retry");
+        let messages = driver.store().page_messages(&conv().0, None, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "m1");
+        assert_eq!(exec.calls(), 4);
     }
 
     #[tokio::test]

@@ -35,6 +35,8 @@ pub enum Realtime {
 /// Capacidade `history` por conversa: o cache local está fresco?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationState {
+    /// Conversa conhecida, sem afirmação sobre o frescor do histórico.
+    Known,
     /// Algo mudou e o conteúdo local não é confiável: buscar via REST.
     Dirty,
     Fetching {
@@ -225,6 +227,15 @@ impl SyncMachine {
 
     pub fn conversation_state(&self, conversation: &ConversationId) -> Option<&ConversationState> {
         self.conversations.get(conversation)
+    }
+
+    /// Registra uma conversa descoberta sem invalidar ou sobrescrever seu estado.
+    pub fn register_conversation(&mut self, conversation: ConversationId) {
+        if !conversation.0.trim().is_empty() {
+            self.conversations
+                .entry(conversation)
+                .or_insert(ConversationState::Known);
+        }
     }
 
     /// Próximo prazo que o driver deve respeitar (último [`Decision::ScheduleWake`] emitido).
@@ -452,7 +463,9 @@ impl SyncMachine {
         let stale: Vec<ConversationId> = self
             .conversations
             .iter()
-            .filter(|(_, state)| matches!(state, ConversationState::Fresh))
+            .filter(|(_, state)| {
+                matches!(state, ConversationState::Fresh | ConversationState::Known)
+            })
             .map(|(conversation, _)| conversation.clone())
             .collect();
         for conversation in stale {
