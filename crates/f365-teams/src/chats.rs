@@ -68,14 +68,30 @@ pub(crate) fn parse(body: &[u8]) -> Result<Vec<Conversation>, TeamsError> {
     for chat in chats.into_iter().flatten() {
         let Some(id) = text(chat, "id") else { continue };
         let chat_type = text(chat, "chatType").map(str::to_owned);
-        // 1:1 se reconhece pelo id: o `chatType` vem `chat` também em grupo (TEAMS-CSA-SHAPE-001).
-        let title = text(chat, "title").map(str::to_owned).unwrap_or_else(|| {
-            if id.ends_with(ONE_ON_ONE_SUFFIX) {
-                "(conversa 1:1 sem título)".into()
-            } else {
-                "(chat sem título)".into()
-            }
-        });
+        // 1:1 se reconhece pelo id **ou** pelo `isOneOnOne`; `chatType` vem `chat` também em grupo.
+        let one_on_one = id.ends_with(ONE_ON_ONE_SUFFIX)
+            || chat
+                .get("isOneOnOne")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let title = text(chat, "title")
+            .map(str::to_owned)
+            .or_else(|| {
+                if one_on_one {
+                    counterpart_name(chat)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                if one_on_one {
+                    // Sem nome disponível: um sufixo estável distingue as conversas entre si
+                    // (antes todas caíam no mesmo texto fixo).
+                    format!("1:1 · {}", short_suffix(id))
+                } else {
+                    "(chat sem título)".to_string()
+                }
+            });
         out.push(Conversation {
             id: id.to_owned(),
             title,
@@ -117,6 +133,28 @@ fn text<'a>(o: &'a Value, k: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// Nome do outro lado num 1:1 — **só** quando a última mensagem não é minha.
+///
+/// `title` vem vazio e `members[]` traz apenas `mri`/`objectId`, sem nome (`TEAMS-CSA-SHAPE-001`).
+/// O único nome no payload é `lastMessage.imDisplayName`, que é do **remetente**: serve quando o
+/// remetente é a outra pessoa e mentiria quando sou eu — daí o `isLastMessageFromMe`.
+fn counterpart_name(chat: &Value) -> Option<String> {
+    let mine = chat
+        .get("isLastMessageFromMe")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if mine {
+        return None;
+    }
+    text(chat.get("lastMessage")?, "imDisplayName").map(str::to_owned)
+}
+
+/// Sufixo curto e estável do id, para distinguir 1:1 sem nome conhecido.
+fn short_suffix(id: &str) -> String {
+    let hex = id.trim_start_matches("19:").split('@').next().unwrap_or(id);
+    hex.chars().take(6).collect()
 }
 
 /// Nomes de campo do primeiro item de `chats[]` (e de `lastMessage`/`members`), **sem valores**.
@@ -216,7 +254,7 @@ mod tests {
 
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].title, "Projeto X");
-        assert_eq!(got[1].title, "(conversa 1:1 sem título)");
+        assert_eq!(got[1].title, "1:1 · dm", "sem nome: sufixo estável");
         assert_eq!(got[2].title, "Engenharia › Geral");
         assert_eq!(
             got[2].kind,
@@ -224,6 +262,40 @@ mod tests {
                 team: "Engenharia".into()
             }
         );
+    }
+
+    /// O único nome no payload é o do remetente da última mensagem — serve só quando não sou eu.
+    #[test]
+    fn one_on_one_uses_the_counterpart_from_the_last_message() {
+        let got = parse(&body(json!({"chats": [
+            {
+                "id": "19:dm1@unq.gbl.spaces",
+                "title": null,
+                "isOneOnOne": true,
+                "isLastMessageFromMe": false,
+                "lastMessage": {"imDisplayName": "Ana Souza", "content": "oi"}
+            },
+            {
+                "id": "19:dm2@unq.gbl.spaces",
+                "title": null,
+                "isOneOnOne": true,
+                "isLastMessageFromMe": true,
+                "lastMessage": {"imDisplayName": "Eu Mesmo", "content": "tchau"}
+            },
+            {
+                "id": "19:dm3@unq.gbl.spaces",
+                "title": "",
+                "isOneOnOne": true,
+                "members": [{"mri": "8:orgid:x", "objectId": "00000000-0000"}]
+            }
+        ]})))
+        .unwrap();
+
+        assert_eq!(got[0].title, "Ana Souza");
+        // Nunca usar o meu próprio nome como título da conversa.
+        assert_eq!(got[1].title, "1:1 · dm2");
+        // `members[]` não traz nome: cai no sufixo, mas cada conversa fica distinguível.
+        assert_eq!(got[2].title, "1:1 · dm3");
     }
 
     /// Visto no Checkpoint C: `chatType` é `chat` em 1:1 e em grupo; o 1:1 sem título se reconhece
@@ -236,7 +308,7 @@ mod tests {
             {"id": "19:meeting_x@thread.v2", "title": "Reunião", "chatType": "meeting"}
         ]})))
         .unwrap();
-        assert_eq!(got[0].title, "(conversa 1:1 sem título)");
+        assert_eq!(got[0].title, "1:1 · a_b");
         assert_eq!(got[1].title, "(chat sem título)");
         assert_eq!(
             got[0].kind,
