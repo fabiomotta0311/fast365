@@ -6,10 +6,12 @@
 //! `history/`.
 
 pub mod chats;
+pub mod history;
 pub mod realtime;
 pub mod send;
 
 pub use chats::{Conversation, ConversationKind};
+pub use history::HistoryMessage;
 pub use realtime::RealtimeEvent;
 pub use send::{new_client_message_id, SendReceipt};
 
@@ -180,6 +182,19 @@ mod tests {
         let ops = exec.ops.lock().unwrap();
         assert_eq!(ops.len(), 1);
         assert!(!ops[0].idempotent);
+    }
+
+    #[tokio::test]
+    async fn history_rejects_dot_segments_before_calling_executor() {
+        let exec = FakeExec::replying(Err(ExecError::NotPaired));
+        let client = TeamsClient::new(exec.clone());
+        for id in [".", "..", "a/b", "a?b", "a#b", "a%b", "a\\b", "a b", "a\n"] {
+            assert!(matches!(
+                client.history(id, 1).await,
+                Err(TeamsError::InvalidInput(_))
+            ));
+        }
+        assert!(exec.ops.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
