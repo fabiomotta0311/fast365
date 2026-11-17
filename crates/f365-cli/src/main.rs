@@ -44,6 +44,9 @@ enum Command {
     Chats {
         #[arg(long, default_value_t = 20)]
         top: usize,
+        /// Diagnóstico de forma: imprime só os nomes de campo do primeiro chat (sem valores).
+        #[arg(long)]
+        fields: bool,
     },
     /// Roda os checkpoints A–E da matriz §2.4 e grava o registro sanitizado da execução (Issue #13).
     ///
@@ -107,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Auth { silent } => session_cmd::auth(silent)?,
-        Command::Chats { top } => chats_cmd::chats(top).await?,
+        Command::Chats { top, fields } => chats_cmd::chats(top, fields).await?,
         Command::Gate {
             chat,
             wait_d,

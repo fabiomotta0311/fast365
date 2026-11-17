@@ -61,6 +61,21 @@ impl TeamsClient {
         client
     }
 
+    /// Corpo cru da listagem — **só** para o diagnóstico de campos (`f365 chats --fields`).
+    ///
+    /// Serve para descobrir de onde tirar o nome de um 1:1 (`TEAMS-CSA-SHAPE-001`). Quem imprime
+    /// usa [`chats::field_names`], que mostra apenas nomes de campo: valores nunca saem daqui.
+    pub async fn list_raw(&self) -> Result<Vec<u8>, TeamsError> {
+        let resp = self.exec.execute(chats::list_op()).await?;
+        if !(200..300).contains(&resp.status) {
+            return Err(TeamsError::Http {
+                service: "chatsvcagg",
+                status: resp.status,
+            });
+        }
+        Ok(resp.body)
+    }
+
     /// Conversas e canais visíveis para o usuário (no máximo `top`, na ordem da API).
     pub async fn list_conversations(&self, top: usize) -> Result<Vec<Conversation>, TeamsError> {
         let resp = self.exec.execute(chats::list_op()).await?;

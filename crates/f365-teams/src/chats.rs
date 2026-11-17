@@ -119,6 +119,42 @@ fn text<'a>(o: &'a Value, k: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Nomes de campo do primeiro item de `chats[]` (e de `lastMessage`/`members`), **sem valores**.
+///
+/// Diagnóstico de `TEAMS-CSA-SHAPE-001`: um 1:1 costuma vir sem `title`, e o nome da pessoa está
+/// em algum campo que ainda não mapeamos. Nomes de campo não são dado de tenant — valores sim, e
+/// eles nunca saem daqui.
+pub fn field_names(body: &[u8]) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(chat) = value
+        .get("chats")
+        .and_then(Value::as_array)
+        .and_then(|chats| chats.first())
+    else {
+        return Vec::new();
+    };
+    if let Some(object) = chat.as_object() {
+        names.extend(object.keys().cloned());
+    }
+    for nested in ["lastMessage", "members"] {
+        match chat.get(nested) {
+            Some(Value::Array(items)) => {
+                if let Some(first) = items.first().and_then(Value::as_object) {
+                    names.extend(first.keys().map(|key| format!("{nested}[].{key}")));
+                }
+            }
+            Some(Value::Object(object)) => {
+                names.extend(object.keys().map(|key| format!("{nested}.{key}")));
+            }
+            _ => {}
+        }
+    }
+    names.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +177,26 @@ mod tests {
             .headers
             .iter()
             .all(|(k, _)| !k.eq_ignore_ascii_case("authorization")));
+    }
+
+    /// Diagnóstico de forma: mostra caminho de campo e **nunca** o valor.
+    #[test]
+    fn field_names_never_leak_values() {
+        let names = field_names(&body(json!({
+            "chats": [{
+                "id": "19:dm@unq.gbl.spaces",
+                "title": null,
+                "chatType": "oneOnOne",
+                "lastMessage": {"imdisplayname": "Pessoa Secreta", "content": "texto privado"},
+                "members": [{"mri": "8:orgid:x", "friendlyName": "Pessoa Secreta"}]
+            }]
+        })));
+        let joined = names.join(",");
+        assert!(names.contains(&"id".to_string()));
+        assert!(names.contains(&"lastMessage.imdisplayname".to_string()));
+        assert!(names.contains(&"members[].friendlyName".to_string()));
+        assert!(!joined.contains("Pessoa Secreta"), "{joined}");
+        assert!(!joined.contains("texto privado"), "{joined}");
     }
 
     #[test]
