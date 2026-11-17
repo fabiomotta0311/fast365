@@ -6,6 +6,7 @@
 //! `history/`.
 
 pub mod chats;
+pub mod diagnostics;
 pub mod history;
 pub mod realtime;
 pub mod send;
