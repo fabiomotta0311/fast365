@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "_comment": "Protocol profile do Teams Web (docs/ARQUITETURA.md §Fase 2 'perfil declarativo'). Sem segredos. Cada valor tem ID de contrato; ver profile.rs.",
   "token_endpoint": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
   "spa_origin": "https://teams.cloud.microsoft",

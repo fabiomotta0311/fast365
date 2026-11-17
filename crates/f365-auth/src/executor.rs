@@ -349,11 +349,13 @@ mod tests {
     struct FakeIdentity {
         redeemed: AtomicUsize,
         skype_issued: AtomicUsize,
+        seen: Mutex<Vec<String>>,
     }
 
     #[async_trait]
     impl Transport for FakeIdentity {
         async fn send(&self, req: HttpRequest) -> Result<HttpResponse, TransportError> {
+            self.seen.lock().unwrap().push(req.url.clone());
             let body = if req.url.contains("/oauth2/v2.0/token") {
                 let n = self.redeemed.fetch_add(1, Ordering::SeqCst) + 1;
                 json!({"access_token": format!("at-{n}"), "expires_in": 3600, "refresh_token": format!("rt-{n}")})
@@ -428,6 +430,14 @@ mod tests {
     }
 
     fn harness(rust: Arc<FakeApi>, in_page: Option<Arc<FakeApi>>) -> Harness {
+        harness_with_profile(rust, in_page, None)
+    }
+
+    fn harness_with_profile(
+        rust: Arc<FakeApi>,
+        in_page: Option<Arc<FakeApi>>,
+        profile: Option<crate::profile::Profile>,
+    ) -> Harness {
         let store = MemoryStore::default();
         let vault = Vault::with_store(store);
         let session = CapturedSession {
@@ -452,11 +462,11 @@ mod tests {
         let identity = Arc::new(FakeIdentity::default());
         let clock =
             ManualClock::starting_at(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100));
-        let broker = Arc::new(TokenBroker::new(
-            vault,
-            identity.clone(),
-            Arc::new(clock.clone()),
-        ));
+        let mut broker = TokenBroker::new(vault, identity.clone(), Arc::new(clock.clone()));
+        if let Some(profile) = profile {
+            broker = broker.with_profile(profile).unwrap();
+        }
+        let broker = Arc::new(broker);
         let in_page = in_page.map(|t| t as Arc<dyn Transport>);
         let exec = SessionExecutor::new(broker, rust, in_page, Arc::new(clock.clone()));
         Harness {
@@ -486,6 +496,33 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    #[tokio::test]
+    async fn runtime_profile_changes_real_executor_authsvc_request() {
+        let path = std::env::temp_dir().join(format!(
+            "f365-profile-{}-{}.json",
+            std::process::id(),
+            "runtime"
+        ));
+        let json = include_str!("profile/teams-web.json")
+            .replace("/authsvc/v1.0/authz", "/authsvc/v2.0/authz");
+        std::fs::write(&path, json).unwrap();
+        let profile = crate::profile::Profile::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let api = FakeApi::script(vec![Step::Status(200, vec![])]);
+        let h = harness_with_profile(api, None, Some(profile));
+        h.exec
+            .execute(op(Resource::ChatService, CHAT))
+            .await
+            .unwrap();
+        assert!(h
+            .identity
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url == "https://teams.microsoft.com/api/authsvc/v2.0/authz"));
     }
 
     #[tokio::test]

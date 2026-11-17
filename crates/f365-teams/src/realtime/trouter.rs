@@ -135,11 +135,29 @@ pub(crate) fn shape(body: &[u8]) -> Vec<String> {
     let Ok(Value::Object(top)) = serde_json::from_slice::<Value>(body) else {
         return vec!["<não é objeto JSON>".into()];
     };
-    let mut out: Vec<String> = top.keys().cloned().collect();
+    const TOP: &[&str] = &[
+        "socketio",
+        "surl",
+        "ccid",
+        "registrarUrl",
+        "connectparams",
+        "curlb",
+        "healthUrl",
+        "id",
+        "ttl",
+        "url",
+    ];
+    const PARAMS: &[&str] = &["issuer", "scae", "se", "sig", "sp", "sr", "st"];
+    let mut out: Vec<String> = TOP
+        .iter()
+        .filter(|k| top.contains_key(**k))
+        .map(|k| (*k).to_owned())
+        .collect();
     if let Some(Value::Object(cp)) = top.get("connectparams") {
         out.extend(
-            cp.iter()
-                .map(|(k, v)| format!("connectparams.{k}:{}", kind(v))),
+            PARAMS
+                .iter()
+                .filter_map(|k| cp.get(*k).map(|v| format!("connectparams.{k}:{}", kind(v)))),
         );
     }
     out
@@ -409,10 +427,11 @@ mod tests {
 
     #[test]
     fn diagnostics_show_field_names_never_values() {
-        let shape = shape(&connect_body());
-        assert!(shape.contains(&"socketio".to_owned()));
+        let hostile = json!({"token=secret": "anything", "connectparams": {"private_cookie": "x", "sig": "secret"}});
+        let shape = shape(hostile.to_string().as_bytes());
         assert!(shape.contains(&"connectparams.sig:str".to_owned()));
-        assert!(!format!("{shape:?}").contains("SEGREDO"));
+        assert!(!format!("{shape:?}").contains("secret"));
+        assert!(!format!("{shape:?}").contains("private"));
     }
 
     #[test]

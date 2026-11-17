@@ -156,6 +156,14 @@ impl TokenBroker {
         }
     }
 
+    /// Usa um perfil externo validado, antes de qualquer operação ou preenchimento do cache.
+    pub fn with_profile(mut self, profile: Profile) -> Result<Self, crate::profile::ProfileError> {
+        profile.validate()?;
+        self.profile = profile;
+        self.cache = Mutex::default();
+        Ok(self)
+    }
+
     /// Liga o re-pareamento automático quando o Entra recusar o RT.
     pub fn with_repair(mut self, repair: Arc<dyn SessionRepair>) -> Self {
         self.repair = Some(repair);
@@ -275,7 +283,10 @@ impl TokenBroker {
         );
         let req = HttpRequest {
             method: "POST".into(),
-            url: self.profile.token_url(&session.account.tenant_id),
+            url: self
+                .profile
+                .token_url(&session.account.tenant_id)
+                .ok_or(TokenError::Malformed("tenant"))?,
             headers: vec![
                 (
                     "Content-Type".into(),

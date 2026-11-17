@@ -9,13 +9,18 @@ Esta tabela registra um subconjunto dos contratos e não altera o status dos dem
 | HISTORY-PAGE-001 | UNVERIFIED: backwardLink ou syncState indica próxima página | [history.rs](../crates/f365-teams/src/history.rs); fixtures sintéticas apenas | Rejeitar cursor inválido ou cíclico; não retornar sucesso parcial. |
 | TROUTER-HANDSHAKE-001 | Handshake socket.io e con_num conforme implementação | [matriz](CONTRATOS-FASE0.md#6--trouter), relato histórico #45, limitado ao caso observado | Falhar a conexão; não divulgar URL assinada. |
 
-O tipo `f365_teams::diagnostics::Bundle` serializa apenas eventos tipados, sem campos
-textuais arbitrários; ele ainda não está conectado à coleta operacional, não tem
-pseudonimização nem implementa captura de conteúdo. Campos numéricos são reservados a
-medições verdadeiras; não devem ser usados para transportar dados arbitrários. A cobertura
+O recorder operacional descrito abaixo possui bundle próprio com campos tipados. A cobertura
 atual não demonstra segurança de integrações ou logs fora desse tipo.
 
-O profile de autenticação continua embutido na compilação, parcial e sem alteração. Os
-campos de authorize/PKCE e os demais pontos não capturados continuam UNVERIFIED; não foi
-feita captura de sessão ou teste com conta real. Harness wiremock, profile externo em
-runtime, catálogo completo e integração operacional do diagnóstico continuam pendentes.
+O integrador pode carregar um arquivo explicitamente com `f365_auth::Profile::load(path)`
+e aplicar o resultado a `TokenBroker::with_profile(profile)` antes de construir o executor.
+O padrão continua embutido; não há seleção pela CLI nem recarga automática. A validação
+restringe alterações à versão numérica no caminho authsvc. O teste sintético
+`runtime_profile_changes_real_executor_authsvc_request` exercita o executor real.
+
+`diagnostics::Recorder::new` envolve explicitamente o executor e `bundle()` retorna somente
+eventos HTTP tipados, sem corpos, URLs ou IDs. O teste `wiremock_incident` cobre REST e falha
+de handshake sintéticos, mas não WebSocket local nem suas falhas. A segurança de logs e
+outros consumidores não é garantida pelo bundle. O catálogo completo e a integração de
+WebSocket permanecem pendentes. Authorize/PKCE e outros pontos sem captura permanecem
+UNVERIFIED; nenhuma sessão ou conta real foi acessada.
