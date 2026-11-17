@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+pub mod realtime;
+pub use realtime::RealtimeLink;
+
 /// Acontecimento que entra no runtime vindo do tempo real (ou de um teste).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
@@ -60,28 +63,49 @@ impl PumpHandle {
     }
 }
 
+/// Lado receptor do canal. Fica com **quem possui o runtime** (a casca ou um teste).
+#[derive(Debug)]
+pub struct Inbox(UnboundedReceiver<Inbound>);
+
+impl Inbox {
+    /// Espera o próximo acontecimento (cancel-safe: nada se perde ao cancelar).
+    pub async fn recv(&mut self) -> Option<Inbound> {
+        self.0.recv().await
+    }
+
+    /// Versão sem espera, para teste.
+    pub fn try_recv(&mut self) -> Option<Inbound> {
+        self.0.try_recv().ok()
+    }
+}
+
+/// Canal entre quem produz acontecimentos (tempo real, testes) e o runtime.
+///
+/// Separado do [`App`] de propósito: o [`RealtimeLink`] precisa da alça **antes** de o `Driver`
+/// existir, e o `Inbox` alimenta o runtime depois.
+pub fn channel() -> (PumpHandle, Inbox) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (PumpHandle(tx), Inbox(rx))
+}
+
 /// Runtime do app: uma fachada única para o frontend.
+///
+/// Não possui o canal de entrada de propósito: quem orquestra (a casca) precisa esperar por um
+/// acontecimento **e** por um comando do frontend ao mesmo tempo, e isso exige emprestar o canal e
+/// o runtime separadamente.
 pub struct App {
     shell: Shell,
     clock: Arc<dyn Clock>,
-    rx: UnboundedReceiver<Inbound>,
     wake_at: Option<Instant>,
 }
 
 impl App {
-    /// Cria o runtime e devolve a alça que a casca usa para alimentá-lo.
-    ///
-    /// A alça fica **com quem chama**: se o runtime guardasse uma cópia do sender, o canal nunca
-    /// fecharia e `next_event` nunca terminaria.
-    pub fn new(shell: Shell, clock: Arc<dyn Clock>) -> (Self, PumpHandle) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let app = Self {
+    pub fn new(shell: Shell, clock: Arc<dyn Clock>) -> Self {
+        Self {
             shell,
             clock,
-            rx,
             wake_at: None,
-        };
-        (app, PumpHandle(tx))
+        }
     }
 
     // ---- leitura (cache, sem rede) ----
@@ -136,19 +160,41 @@ impl App {
         Ok(round)
     }
 
+    /// Espera o próximo acontecimento **sem** tocar no motor.
+    ///
+    /// É o que a casca usa num `select!`: `recv` é cancel-safe, então esperar por um comando do
+    /// frontend ao mesmo tempo não aborta nenhuma operação em voo.
+    pub fn wake_at(&self) -> Option<Instant> {
+        self.wake_at
+    }
+
+    /// Aplica um acontecimento no motor e devolve a rodada. Pode fazer I/O — chame fora de
+    /// `select!`.
+    pub async fn apply(&mut self, inbound: Inbound) -> Result<RoundDto, IpcError> {
+        match inbound {
+            Inbound::Invalidated { conversation } => {
+                let round = self.shell.invalidated(&conversation).await?;
+                self.note(&round);
+                Ok(round)
+            }
+            // Estado do canal não mexe no motor: quem desenha isso é o frontend.
+            Inbound::Realtime { .. } => Ok(RoundDto::default()),
+        }
+    }
+
     /// Próximo acontecimento para o frontend: um evento do tempo real **ou** o prazo que o motor
     /// pediu (reconciliação/renovação). `None` = o runtime foi encerrado.
-    pub async fn next_event(&mut self) -> Option<UiEvent> {
+    ///
+    /// Conveniência para consumidor único. A casca usa `inbox.recv()` + [`apply`](Self::apply) +
+    /// [`wake`](Self::wake) num `select!`, para não prender o motor enquanto espera.
+    pub async fn next_event(&mut self, inbox: &mut Inbox) -> Option<UiEvent> {
         let wake = self.wake_at;
         tokio::select! {
-            inbound = self.rx.recv() => {
-                let inbound = inbound?;
-                match inbound {
+            inbound = inbox.recv() => {
+                match inbound? {
                     Inbound::Realtime { connected } => Some(UiEvent::Realtime { connected }),
-                    Inbound::Invalidated { conversation } => {
-                        let round = self.shell.invalidated(&conversation).await.ok()?;
-                        self.note(&round);
-                        Some(UiEvent::Round(round))
+                    inbound @ Inbound::Invalidated { .. } => {
+                        Some(UiEvent::Round(self.apply(inbound).await.ok()?))
                     }
                 }
             }
@@ -227,24 +273,24 @@ mod tests {
         })
     }
 
-    fn app(replies: Vec<Result<HttpResponse, ExecError>>) -> (ManualClock, App, PumpHandle) {
+    fn app(replies: Vec<Result<HttpResponse, ExecError>>) -> (ManualClock, App, PumpHandle, Inbox) {
         let clock = ManualClock::default();
         let exec = FakeExec::replying(replies);
         let store = Store::open_in_memory().expect("banco");
         let clock_arc: Arc<dyn Clock> = Arc::new(clock.clone());
         let driver = Driver::new(exec, store, clock_arc.clone());
         let shell = Shell::new(driver, clock_arc.clone());
-        let (app, pump) = App::new(shell, clock_arc);
-        (clock, app, pump)
+        let (pump, inbox) = channel();
+        (clock, App::new(shell, clock_arc), pump, inbox)
     }
 
     #[tokio::test]
     async fn invalidation_from_the_pump_drives_the_machine() {
-        let (_clock, mut app, pump) = app(vec![ok(200, CHATS), ok(200, HISTORY)]);
+        let (_clock, mut app, pump, mut inbox) = app(vec![ok(200, CHATS), ok(200, HISTORY)]);
         app.refresh_conversations().await.expect("conversas");
 
         pump.invalidate("19:a@thread.v2").expect("entrega");
-        let event = app.next_event().await.expect("evento");
+        let event = app.next_event(&mut inbox).await.expect("evento");
 
         match event {
             UiEvent::Round(round) => {
@@ -262,28 +308,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_reports_the_round_and_the_next_wake() {
+        let (_clock, mut app, _pump, _inbox) = app(vec![ok(200, CHATS), ok(200, HISTORY)]);
+        app.refresh_conversations().await.expect("conversas");
+
+        let round = app
+            .apply(Inbound::Invalidated {
+                conversation: "19:a@thread.v2".into(),
+            })
+            .await
+            .expect("aplica");
+
+        assert!(format!("{:?}", round.effects).contains("Fetched"));
+        // Estado do canal não mexe no motor.
+        let noop = app
+            .apply(Inbound::Realtime { connected: true })
+            .await
+            .expect("aplica");
+        assert!(noop.effects.is_empty());
+    }
+
+    #[tokio::test]
     async fn realtime_state_is_surfaced_without_touching_the_machine() {
-        let (_clock, mut app, pump) = app(vec![]);
+        let (_clock, mut app, pump, mut inbox) = app(vec![]);
 
         pump.realtime(false).expect("entrega");
         assert_eq!(
-            app.next_event().await.expect("evento"),
+            app.next_event(&mut inbox).await.expect("evento"),
             UiEvent::Realtime { connected: false }
         );
 
         pump.realtime(true).expect("entrega");
         assert_eq!(
-            app.next_event().await.expect("evento"),
+            app.next_event(&mut inbox).await.expect("evento"),
             UiEvent::Realtime { connected: true }
         );
     }
 
     #[tokio::test]
     async fn closing_the_pump_ends_the_event_loop() {
-        let (_clock, mut app, pump) = app(vec![]);
+        let (_clock, mut app, pump, mut inbox) = app(vec![]);
         drop(pump);
         // Sem alça e sem prazo pendente, o laço termina em vez de girar.
-        let closed = tokio::time::timeout(Duration::from_secs(1), app.next_event()).await;
+        let closed = tokio::time::timeout(Duration::from_secs(1), app.next_event(&mut inbox)).await;
         assert!(
             matches!(closed, Ok(None)),
             "esperava encerramento, veio {closed:?}"
@@ -292,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_frame_comes_from_the_cache() {
-        let (_clock, mut app, _pump) = app(vec![ok(200, CHATS)]);
+        let (_clock, mut app, _pump, _inbox) = app(vec![ok(200, CHATS)]);
         app.refresh_conversations().await.expect("conversas");
 
         let list = app.conversations(10).expect("lista");

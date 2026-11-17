@@ -920,6 +920,7 @@ dependencies = [
  "f365-ipc",
  "f365-storage",
  "f365-ui",
+ "serde",
  "tauri",
  "tauri-build",
  "tokio",
@@ -987,11 +988,13 @@ dependencies = [
 name = "f365-ui"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "f365-auth",
  "f365-driver",
  "f365-ipc",
  "f365-storage",
  "f365-sync",
+ "f365-teams",
  "thiserror 2.0.21",
  "tokio",
 ]

@@ -895,6 +895,7 @@ dependencies = [
  "f365-ipc",
  "f365-storage",
  "f365-sync",
+ "f365-teams",
  "thiserror 2.0.21",
  "tokio",
 ]

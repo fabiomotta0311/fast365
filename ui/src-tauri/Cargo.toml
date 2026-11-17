@@ -19,4 +19,5 @@ f365-driver = { path = "../../crates/f365-driver" }
 f365-ipc = { path = "../../crates/f365-ipc" }
 f365-storage = { path = "../../crates/f365-storage" }
 f365-ui = { path = "../../crates/f365-ui" }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
