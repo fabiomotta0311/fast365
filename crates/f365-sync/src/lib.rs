@@ -12,8 +12,10 @@
 //! **reconcilia** por `clientmessageid`; sem evidência o estado é [`SendState::Uncertain`] — nunca
 //! "entregue".
 
+pub mod capability;
 pub mod machine;
 
+pub use capability::{Capabilities, Capability, DegradedReason, Route, SessionGeneration};
 pub use f365_auth::{AuthenticatedExecutor, Clock, ManualClock, SystemClock};
 pub use machine::{
     Config, Connectivity, ConversationState, Realtime, SendState, SyncMachine, UncertainReason,
