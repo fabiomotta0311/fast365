@@ -197,6 +197,10 @@ impl SyncMachine {
                 self.on_finished(now, op, outcome, &mut out)
             }
             Event::ConnectionLost => self.on_connection_lost(now, &mut out),
+            Event::RealtimeLost => {
+                self.realtime = Realtime::Reconnecting;
+                self.schedule(now + self.config.reconnect_retry_after, &mut out);
+            }
             Event::ConnectionRestored => self.on_connection_restored(&mut out),
             Event::WakeUp => self.on_wake(now, &mut out),
         }
@@ -413,9 +417,13 @@ impl SyncMachine {
         match outcome {
             // O conteúdo local pode ser considerado fresco — mas isso **não** confirma envio nenhum:
             // entrega é confirmada por [`Event::MessageObserved`].
-            Outcome::Succeeded | Outcome::Failed { retryable: false } => {
+            Outcome::Succeeded => {
                 self.conversations
                     .insert(conversation.clone(), ConversationState::Fresh);
+            }
+            Outcome::Failed { retryable: false } => {
+                self.conversations
+                    .insert(conversation.clone(), ConversationState::Known);
             }
             Outcome::Failed { retryable: true } | Outcome::Lost => {
                 self.conversations
@@ -759,6 +767,30 @@ mod tests {
             .iter()
             .any(|d| matches!(d, Decision::Publish { conversation: c } if c == conversation));
         persist && publish
+    }
+
+    #[test]
+    fn terminal_fetch_failure_never_marks_history_fresh() {
+        let clock = ManualClock::default();
+        let mut machine = SyncMachine::new();
+        let decisions = machine.handle(
+            clock.now(),
+            Event::Invalidated {
+                conversation: conv(),
+            },
+        );
+        let op = fetch_op(&decisions);
+        machine.handle(
+            clock.now(),
+            Event::OperationFinished {
+                op,
+                outcome: Outcome::Failed { retryable: false },
+            },
+        );
+        assert_ne!(
+            machine.conversation_state(&conv()),
+            Some(&ConversationState::Fresh)
+        );
     }
 
     #[test]

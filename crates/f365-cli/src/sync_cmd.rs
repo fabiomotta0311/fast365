@@ -74,13 +74,14 @@ pub async fn sync(options: Options) -> anyhow::Result<()> {
     let mut wake = round.wake_at;
     loop {
         tokio::select! {
-            event = events_rx.recv() => {
-                let Some(event) = event else { break };
-                round = driver.drive(event).await?;
-            }
+            biased;
             () = sleep_until(clock.clone(), wake) => {
                 wake = None;
                 round = driver.drive(Event::WakeUp).await?;
+            }
+            event = events_rx.recv() => {
+                let Some(event) = event else { break };
+                round = driver.drive(event).await?;
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("\nEncerrado.");
@@ -106,12 +107,10 @@ async fn sleep_until(clock: Arc<dyn Clock>, at: Option<Instant>) {
         std::future::pending::<()>().await;
         return;
     };
-    let now = clock.now();
-    // Piso curto: prazo já vencido não pode virar laço quente.
-    let wait = at
-        .saturating_duration_since(now)
-        .max(Duration::from_millis(50));
-    clock.sleep(wait).await
+    let wait = at.saturating_duration_since(clock.now());
+    if !wait.is_zero() {
+        clock.sleep(wait).await;
+    }
 }
 
 fn print_round(round: &Round, last_caps: &mut Vec<String>) {
@@ -168,7 +167,7 @@ fn event_from_realtime(event: &RealtimeEvent) -> Option<Event> {
             })
         }
         RealtimeEvent::Ready => Some(Event::ConnectionRestored),
-        RealtimeEvent::Reconnecting { .. } => Some(Event::ConnectionLost),
+        RealtimeEvent::Reconnecting { .. } => Some(Event::RealtimeLost),
         _ => None,
     }
 }
@@ -290,6 +289,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn socket_loss_does_not_block_rest_send() {
+        let mut machine = f365_sync::SyncMachine::new();
+        let now = Instant::now();
+        let event = event_from_realtime(&RealtimeEvent::Reconnecting {
+            attempt: 1,
+            after: Duration::from_secs(2),
+        })
+        .unwrap();
+        machine.handle(now, event);
+        let decisions = machine.handle(
+            now,
+            Event::SendRequested {
+                conversation: ConversationId("test".into()),
+                client_id: f365_sync::ClientMessageId("1".into()),
+            },
+        );
+        assert!(decisions
+            .iter()
+            .any(|d| matches!(d, f365_sync::Decision::AttemptSend { .. })));
+    }
+
+    #[test]
     fn only_changed_becomes_a_machine_event() {
         assert_eq!(
             event_from_realtime(&RealtimeEvent::Changed {
@@ -312,7 +333,7 @@ mod tests {
                 attempt: 1,
                 after: Duration::from_secs(2)
             }),
-            Some(Event::ConnectionLost)
+            Some(Event::RealtimeLost)
         );
     }
 
@@ -355,6 +376,38 @@ mod tests {
         let later = earlier + Duration::from_secs(5);
         assert_eq!(next_deadline(Some(earlier), Some(later)), Some(earlier));
         assert_eq!(next_deadline(Some(earlier), None), Some(earlier));
+    }
+
+    #[tokio::test]
+    async fn continuous_events_do_not_postpone_absolute_wake() {
+        let manual = f365_auth::ManualClock::default();
+        let clock: Arc<dyn Clock> = Arc::new(manual.clone());
+        let deadline = clock.now() + Duration::from_millis(100);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..20 {
+            tx.send(()).unwrap();
+        }
+        let mut events = 0;
+        loop {
+            tokio::select! {
+                biased;
+                () = sleep_until(clock.clone(), Some(deadline)) => break,
+                Some(()) = rx.recv() => { events += 1; manual.advance(Duration::from_millis(10)); }
+            }
+        }
+        assert_eq!(events, 10);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_fires_without_restarting_floor() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let past = clock.now() - Duration::from_millis(1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), sleep_until(clock, Some(past)))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

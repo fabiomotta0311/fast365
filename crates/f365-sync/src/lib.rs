@@ -73,6 +73,8 @@ pub enum Event {
     OperationFinished { op: OpId, outcome: Outcome },
     /// A conectividade caiu.
     ConnectionLost,
+    /// Apenas o canal de tempo real caiu; REST pode continuar disponível.
+    RealtimeLost,
     /// A conectividade voltou.
     ConnectionRestored,
     /// Venceu o prazo pedido em [`Decision::ScheduleWake`].

@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// Quantas transições o driver aceita executar num único `drive` (guarda contra laço infinito).
+/// Profundidade máxima de uma cadeia causal; operações independentes não consomem o orçamento umas das outras.
 const MAX_STEPS: usize = 64;
 
 /// Primeira renovação silenciosa: o access token dura ~1 h, então renovamos com folga.
@@ -64,7 +64,9 @@ impl OpFailure {
             TeamsError::Exec(ExecError::Transport(_) | ExecError::TimedOut(_)) => OpFailure::Lost,
             TeamsError::Exec(ExecError::NotPaired | ExecError::Auth(_)) => OpFailure::Auth,
             TeamsError::Exec(_) => OpFailure::Refused,
-            TeamsError::Http { status, .. } if *status >= 500 => OpFailure::Retryable,
+            TeamsError::Http { status, .. } if *status >= 500 || *status == 429 => {
+                OpFailure::Retryable
+            }
             TeamsError::Http { .. } => OpFailure::Refused,
             TeamsError::Realtime(_) => OpFailure::Retryable,
             TeamsError::Malformed(_) | TeamsError::InvalidInput(_) => OpFailure::Refused,
@@ -308,7 +310,8 @@ impl Driver {
     pub async fn refresh_conversations(&mut self) -> Result<Round, DriverError> {
         let now = self.clock.now();
         let mut round = Round::default();
-        match self.client.list_conversations(self.top).await {
+        // `top` limita mensagens, não a lista retornada pelo provider (sem paginação aqui).
+        match self.client.list_conversations(usize::MAX).await {
             Ok(list) => {
                 let now_ms = self.now_ms();
                 for conversation in &list {
@@ -336,17 +339,15 @@ impl Driver {
     /// Alimenta o motor e executa as decisões até estabilizar.
     pub async fn drive(&mut self, event: Event) -> Result<Round, DriverError> {
         let mut round = Round::default();
-        let mut queue = vec![event];
-        let mut steps = 0;
+        let mut queue = vec![(event, 0usize)];
         let uncertain_before: Vec<ClientMessageId> = self
             .uncertain_sends()
             .into_iter()
             .map(|(_, client_id)| client_id)
             .collect();
 
-        while let Some(event) = queue.pop() {
-            steps += 1;
-            if steps > MAX_STEPS {
+        while let Some((event, depth)) = queue.pop() {
+            if depth > MAX_STEPS {
                 return Err(DriverError::NotConverged);
             }
             let decisions = self.machine.handle(self.clock.now(), event);
@@ -370,12 +371,15 @@ impl Driver {
                         let (outcome, observed) = self.fetch(&conversation, &mut round).await?;
                         // A fila é LIFO: empilha a operação primeiro para as observações serem
                         // processadas antes — o fato observado vale mais que o resultado do request.
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                         for client_id in observed {
-                            queue.push(Event::MessageObserved {
-                                conversation: conversation.clone(),
-                                client_id,
-                            });
+                            queue.push((
+                                Event::MessageObserved {
+                                    conversation: conversation.clone(),
+                                    client_id,
+                                },
+                                depth + 1,
+                            ));
                         }
                     }
                     Decision::AttemptSend {
@@ -384,11 +388,11 @@ impl Driver {
                         client_id,
                     } => {
                         let outcome = self.send(&conversation, &client_id, &mut round).await;
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                     }
                     Decision::Reconnect { op } => {
                         let outcome = self.reconnect(&mut round).await;
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                     }
                 }
             }
@@ -833,6 +837,91 @@ mod tests {
     }
 
     // ---- testes ----
+
+    #[tokio::test]
+    async fn socket_loss_wakes_reconnect_without_blocking_send() {
+        let exec = FakeExec::replying(vec![ok(201, "{}")]);
+        let (clock, mut driver) = driver(exec.clone());
+        let realtime = Arc::new(FakeRealtime {
+            result: Err("offline".into()),
+            calls: Mutex::new(0),
+        });
+        driver.realtime = realtime.clone();
+        let round = driver.drive(Event::RealtimeLost).await.unwrap();
+        assert!(round.wake_at.is_some());
+        let sent = driver.send_message(&conv(), "hello").await.unwrap();
+        assert!(sent
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendAttempted { .. })));
+        clock.advance(Duration::from_secs(2));
+        driver.drive(Event::WakeUp).await.unwrap();
+        assert_eq!(*realtime.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_limit_does_not_truncate_conversations() {
+        let exec = FakeExec::replying(vec![ok(
+            200,
+            r#"{"chats":[{"id":"chat-a"},{"id":"chat-b"}]}"#,
+        )]);
+        let (_, driver) = driver(exec);
+        let mut driver = driver.with_top(1);
+        let round = driver.refresh_conversations().await.unwrap();
+        assert!(round.effects.contains(&Effect::ConversationsRefreshed(2)));
+    }
+
+    #[tokio::test]
+    async fn replay_of_more_than_64_conversations_converges() {
+        let exec = FakeExec::replying((0..70).map(|_| ok(200, r#"{"messages":[]}"#)).collect());
+        let (_, mut driver) = driver(exec.clone());
+        driver.realtime = Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        });
+        for i in 0..70 {
+            driver
+                .machine
+                .register_conversation(ConversationId(format!("chat-{i}")));
+        }
+        let round = driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("replay must converge");
+        assert_eq!(
+            round
+                .effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Fetched { .. }))
+                .count(),
+            70
+        );
+        assert_eq!(exec.calls(), 70);
+    }
+
+    #[tokio::test]
+    async fn throttled_history_is_retried_not_fresh() {
+        let exec = FakeExec::replying(vec![ok(429, "throttled"), ok(200, r#"{"messages":[]}"#)]);
+        let (clock, mut driver) = driver(exec.clone());
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .unwrap();
+        assert!(round.wake_at.is_some());
+        assert_eq!(
+            driver.machine().conversation_state(&conv()),
+            Some(&f365_sync::ConversationState::Dirty)
+        );
+        clock.advance(Duration::from_secs(5));
+        driver.drive(Event::WakeUp).await.unwrap();
+        assert_eq!(exec.calls(), 2);
+        assert_eq!(
+            driver.machine().conversation_state(&conv()),
+            Some(&f365_sync::ConversationState::Fresh)
+        );
+    }
 
     #[test]
     fn rfc3339_is_converted_to_epoch_millis() {
