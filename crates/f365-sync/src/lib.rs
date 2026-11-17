@@ -7,26 +7,36 @@
 //! determinístico. Fronteira garantida por: `Cargo.toml` sem dependências de I/O (teste
 //! `boundary`) e `clippy.toml` proibindo ler o relógio/dormir.
 //!
-//! Fase 0: só os tipos. A lógica de transição é entregue na Fase 2.
+//! Fase 2 (#15): as transições estão em [`machine`] — FSM síncrona, sem relógio (`now` entra por
+//! parâmetro). Invariante de envio (`SEND-RECONCILE-001`, UNVERIFIED): resposta perdida
+//! **reconcilia** por `clientmessageid`; sem evidência o estado é [`SendState::Uncertain`] — nunca
+//! "entregue".
 
+pub mod capability;
+pub mod machine;
+
+pub use capability::{Capabilities, Capability, DegradedReason, Route, SessionGeneration};
 pub use f365_auth::{AuthenticatedExecutor, Clock, ManualClock, SystemClock};
+pub use machine::{
+    Config, Connectivity, ConversationState, Realtime, SendState, SyncMachine, UncertainReason,
+};
 
 use std::time::Instant;
 
 /// Identificador de conversa/canal no provider.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConversationId(pub String);
 
 /// `clientmessageid` gerado localmente antes do envio — chave de reconciliação.
 ///
 /// `SEND-RECONCILE-001` (UNVERIFIED): o servidor devolve o `clientmessageid` na mensagem criada, o
 /// que permite reconhecer um envio cuja resposta se perdeu em vez de reenviá-lo.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientMessageId(pub String);
 
 /// Correlaciona uma [`Decision`] que pede uma operação com o [`Event::OperationFinished`] que
 /// traz o resultado dela.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OpId(pub u64);
 
 /// Resultado de uma operação, como o driver o observou.
@@ -51,6 +61,14 @@ pub enum Event {
     },
     /// O canal de tempo real sinalizou mudança. Invalidação, não dado: o conteúdo vem via REST.
     Invalidated { conversation: ConversationId },
+    /// O conteúdo buscado mostrou esta `clientmessageid` no servidor: prova de entrega.
+    ///
+    /// É o outro lado de `SEND-RECONCILE-001`: sem esse fato o motor **não** conclui entrega —
+    /// [`Outcome::Succeeded`] só prova que o request foi aceito.
+    MessageObserved {
+        conversation: ConversationId,
+        client_id: ClientMessageId,
+    },
     /// Terminou uma operação pedida por uma [`Decision`].
     OperationFinished { op: OpId, outcome: Outcome },
     /// A conectividade caiu.
@@ -83,49 +101,6 @@ pub enum Decision {
     ScheduleWake { at: Instant },
     /// Avisar a UI que a conversa mudou.
     Publish { conversation: ConversationId },
-}
-
-/// Máquina de estados do motor.
-#[derive(Debug, Default)]
-pub struct SyncMachine {
-    _state: (),
-}
-
-impl SyncMachine {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Único ponto de entrada. Função pura sobre o estado: `now` vem do [`Clock`] do driver.
-    pub fn handle(&mut self, now: Instant, event: Event) -> Vec<Decision> {
-        let _ = (now, event);
-        Vec::new() // Fase 2: transições.
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[test]
-    fn machine_is_driven_by_an_injected_clock() {
-        let manual = ManualClock::default();
-        let clock: Arc<dyn Clock> = Arc::new(manual.clone()); // o que o driver recebe
-        let mut machine = SyncMachine::new();
-
-        let t0 = clock.now();
-        assert!(
-            machine.handle(t0, Event::ConnectionLost).is_empty(),
-            "sem lógica na Fase 0"
-        );
-
-        manual.advance(Duration::from_secs(3_600)); // "suspensão" de 1h, sem esperar de verdade
-        let t1 = clock.now();
-        assert_eq!(t1 - t0, Duration::from_secs(3_600));
-        assert!(machine.handle(t1, Event::WakeUp).is_empty());
-    }
 }
 
 #[cfg(test)]
