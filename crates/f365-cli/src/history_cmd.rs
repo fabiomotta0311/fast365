@@ -42,6 +42,7 @@ mod tests {
     #[test]
     fn remote_fields_are_safe_for_terminal_with_and_without_content() {
         let m = HistoryMessage {
+            client_message_id: None,
             id: "id\x1b[31m".into(),
             time: Some("t\n".into()),
             sender: Some("s\r".into()),

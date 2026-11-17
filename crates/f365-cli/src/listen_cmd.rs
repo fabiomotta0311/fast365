@@ -240,6 +240,7 @@ mod tests {
         history_worker(rx, &out, false, |id| async move {
             if id == "chat\n1" {
                 Ok(vec![HistoryMessage {
+                    client_message_id: None,
                     id: "msg".into(),
                     time: None,
                     sender: None,
@@ -384,6 +385,7 @@ mod tests {
     #[test]
     fn content_is_opt_in_and_fields_are_escaped() {
         let m = HistoryMessage {
+            client_message_id: None,
             id: "id\n".into(),
             time: Some(
                 "t

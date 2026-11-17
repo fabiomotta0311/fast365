@@ -30,7 +30,7 @@ use std::time::Duration;
 const CONNECT_URL: &str = "https://go.trouter.teams.microsoft.com/v4/a";
 const REGISTRAR_URL: &str = "https://teams.microsoft.com/registrar/prod/V2/registrations";
 const TROUTER_SUFFIX: &str = ".trouter.teams.microsoft.com";
-/// Identificação de cliente que o Trouter espera em `tc` (valores do cliente web; UNVERIFIED).
+/// `TROUTER-HANDSHAKE-001`: valores de identificação de cliente em `tc` são UNVERIFIED.
 const CLIENT_TC: &str = r#"{"cv":"2024.23.01.2","ua":"TeamsCDL","hr":"","v":"1415/24062722442"}"#;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -135,11 +135,29 @@ pub(crate) fn shape(body: &[u8]) -> Vec<String> {
     let Ok(Value::Object(top)) = serde_json::from_slice::<Value>(body) else {
         return vec!["<não é objeto JSON>".into()];
     };
-    let mut out: Vec<String> = top.keys().cloned().collect();
+    const TOP: &[&str] = &[
+        "socketio",
+        "surl",
+        "ccid",
+        "registrarUrl",
+        "connectparams",
+        "curlb",
+        "healthUrl",
+        "id",
+        "ttl",
+        "url",
+    ];
+    const PARAMS: &[&str] = &["issuer", "scae", "se", "sig", "sp", "sr", "st"];
+    let mut out: Vec<String> = TOP
+        .iter()
+        .filter(|k| top.contains_key(**k))
+        .map(|k| (*k).to_owned())
+        .collect();
     if let Some(Value::Object(cp)) = top.get("connectparams") {
         out.extend(
-            cp.iter()
-                .map(|(k, v)| format!("connectparams.{k}:{}", kind(v))),
+            PARAMS
+                .iter()
+                .filter_map(|k| cp.get(*k).map(|v| format!("connectparams.{k}:{}", kind(v)))),
         );
     }
     out
@@ -409,10 +427,11 @@ mod tests {
 
     #[test]
     fn diagnostics_show_field_names_never_values() {
-        let shape = shape(&connect_body());
-        assert!(shape.contains(&"socketio".to_owned()));
+        let hostile = json!({"token=secret": "anything", "connectparams": {"private_cookie": "x", "sig": "secret"}});
+        let shape = shape(hostile.to_string().as_bytes());
         assert!(shape.contains(&"connectparams.sig:str".to_owned()));
-        assert!(!format!("{shape:?}").contains("SEGREDO"));
+        assert!(!format!("{shape:?}").contains("secret"));
+        assert!(!format!("{shape:?}").contains("private"));
     }
 
     #[test]

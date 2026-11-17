@@ -349,11 +349,13 @@ mod tests {
     struct FakeIdentity {
         redeemed: AtomicUsize,
         skype_issued: AtomicUsize,
+        seen: Mutex<Vec<String>>,
     }
 
     #[async_trait]
     impl Transport for FakeIdentity {
         async fn send(&self, req: HttpRequest) -> Result<HttpResponse, TransportError> {
+            self.seen.lock().unwrap().push(req.url.clone());
             let body = if req.url.contains("/oauth2/v2.0/token") {
                 let n = self.redeemed.fetch_add(1, Ordering::SeqCst) + 1;
                 json!({"access_token": format!("at-{n}"), "expires_in": 3600, "refresh_token": format!("rt-{n}")})
@@ -428,6 +430,14 @@ mod tests {
     }
 
     fn harness(rust: Arc<FakeApi>, in_page: Option<Arc<FakeApi>>) -> Harness {
+        harness_with_path(rust, in_page, None).unwrap()
+    }
+
+    fn harness_with_path(
+        rust: Arc<FakeApi>,
+        in_page: Option<Arc<FakeApi>>,
+        path: Option<&std::path::Path>,
+    ) -> Result<Harness, crate::profile::ProfileError> {
         let store = MemoryStore::default();
         let vault = Vault::with_store(store);
         let session = CapturedSession {
@@ -452,18 +462,19 @@ mod tests {
         let identity = Arc::new(FakeIdentity::default());
         let clock =
             ManualClock::starting_at(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100));
-        let broker = Arc::new(TokenBroker::new(
+        let broker = Arc::new(TokenBroker::new_with_profile_path(
             vault,
             identity.clone(),
             Arc::new(clock.clone()),
-        ));
+            path,
+        )?);
         let in_page = in_page.map(|t| t as Arc<dyn Transport>);
         let exec = SessionExecutor::new(broker, rust, in_page, Arc::new(clock.clone()));
-        Harness {
+        Ok(Harness {
             exec,
             identity,
             clock,
-        }
+        })
     }
 
     fn op(resource: Resource, url: &str) -> AuthOp {
@@ -486,6 +497,68 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    #[tokio::test]
+    async fn runtime_profile_changes_real_executor_authsvc_request() {
+        let path = std::env::temp_dir().join(format!(
+            "f365-profile-{}-{}.json",
+            std::process::id(),
+            "runtime"
+        ));
+        let json = include_str!("profile/teams-web.json")
+            .replace("/authsvc/v1.0/authz", "/authsvc/v2.0/authz");
+        std::fs::write(&path, json).unwrap();
+        let api = FakeApi::script(vec![Step::Status(200, vec![])]);
+        let h = harness_with_path(api, None, Some(&path)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        h.exec
+            .execute(op(Resource::ChatService, CHAT))
+            .await
+            .unwrap();
+        assert!(h
+            .identity
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url == "https://teams.microsoft.com/api/authsvc/v2.0/authz"));
+    }
+
+    #[tokio::test]
+    async fn runtime_profile_defaults_and_rejects_credential_redirection() {
+        let api = FakeApi::script(vec![Step::Status(200, vec![])]);
+        let h = harness_with_path(api, None, None).unwrap();
+        h.exec
+            .execute(op(Resource::ChatService, CHAT))
+            .await
+            .unwrap();
+        assert!(h
+            .identity
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url == "https://teams.microsoft.com/api/authsvc/v1.0/authz"));
+
+        let path =
+            std::env::temp_dir().join(format!("f365-profile-{}-attack.json", std::process::id()));
+        let json = include_str!("profile/teams-web.json").replace(
+            "https://teams.microsoft.com/api/authsvc/",
+            "https://evil.example/api/authsvc/",
+        );
+        std::fs::write(&path, json).unwrap();
+        let api = FakeApi::script(vec![]);
+        let result = harness_with_path(api.clone(), None, Some(&path));
+        std::fs::remove_file(&path).unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("perfil malicioso aceito"),
+        };
+        assert!(!error
+            .to_string()
+            .contains(&path.to_string_lossy().to_string()));
+        assert!(api.seen().is_empty());
     }
 
     #[tokio::test]
