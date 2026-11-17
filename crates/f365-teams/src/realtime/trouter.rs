@@ -30,7 +30,7 @@ use std::time::Duration;
 const CONNECT_URL: &str = "https://go.trouter.teams.microsoft.com/v4/a";
 const REGISTRAR_URL: &str = "https://teams.microsoft.com/registrar/prod/V2/registrations";
 const TROUTER_SUFFIX: &str = ".trouter.teams.microsoft.com";
-/// Identificação de cliente que o Trouter espera em `tc` (valores do cliente web; UNVERIFIED).
+/// `TROUTER-HANDSHAKE-001`: valores de identificação de cliente em `tc` são UNVERIFIED.
 const CLIENT_TC: &str = r#"{"cv":"2024.23.01.2","ua":"TeamsCDL","hr":"","v":"1415/24062722442"}"#;
 const TIMEOUT: Duration = Duration::from_secs(30);
 

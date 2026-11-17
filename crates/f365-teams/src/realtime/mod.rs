@@ -11,6 +11,8 @@
 
 mod socketio;
 mod trouter;
+#[cfg(test)]
+mod wiremock_e2e;
 
 use crate::{TeamsClient, TeamsError};
 use f365_auth::transport::HttpResponse;
@@ -117,13 +119,25 @@ impl TeamsClient {
         let ws_url = trouter::ws_url(&info, &hs.session_id, &epid);
         #[cfg(test)]
         let ws_url = self.realtime_test_url.clone().unwrap_or(ws_url);
+        let ws_start = Instant::now();
         let (mut ws, _) = tokio::select! {
             result = tokio_tungstenite::connect_async_with_config(ws_url, Some(ws_config()), false) => result.map_err(|e| {
+                if let Some(recorder) = &self.recorder { recorder.websocket_failure(crate::diagnostics::WebSocketFailure::Upgrade, ws_start); }
                 TeamsError::Realtime(format!("WebSocket recusado: {} (TROUTER-WS-001)", ws_error_kind(&e)))
             })?,
-            () = clock.sleep(WS_UPGRADE_TIMEOUT) => return Err(TeamsError::Realtime("tempo esgotado no upgrade WebSocket (TROUTER-WS-001)".into())),
+            () = clock.sleep(WS_UPGRADE_TIMEOUT) => {
+                if let Some(recorder) = &self.recorder { recorder.websocket_failure(crate::diagnostics::WebSocketFailure::UpgradeTimeout, ws_start); }
+                return Err(TeamsError::Realtime("tempo esgotado no upgrade WebSocket (TROUTER-WS-001)".into()));
+            },
         };
-        await_connect(&mut ws, clock).await?;
+        await_connect(&mut ws, clock).await.inspect_err(|_| {
+            if let Some(recorder) = &self.recorder {
+                recorder.websocket_failure(
+                    crate::diagnostics::WebSocketFailure::Confirmation,
+                    ws_start,
+                );
+            }
+        })?;
 
         on_event(RealtimeEvent::Step("4/4 registro do endpoint"));
         let resp = self
@@ -134,7 +148,14 @@ impl TeamsClient {
 
         *ever_ready = true;
         on_event(RealtimeEvent::Ready);
-        run_session(&mut ws, clock, hs.heartbeat, on_event).await
+        run_session(&mut ws, clock, hs.heartbeat, on_event)
+            .await
+            .inspect_err(|_| {
+                if let Some(recorder) = &self.recorder {
+                    recorder
+                        .websocket_failure(crate::diagnostics::WebSocketFailure::Session, ws_start);
+                }
+            })
     }
 }
 

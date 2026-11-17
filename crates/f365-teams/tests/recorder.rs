@@ -32,6 +32,56 @@ async fn actual_send_records_only_allowlisted_data_despite_hostile_input_and_err
     ] {
         assert!(!json.contains(forbidden), "leaked {forbidden}: {json}");
     }
-    assert!(json.contains("SEND-RECONCILE-001"));
+    assert!(json.contains("SEND-PATH-001"));
+    assert!(!json.contains("SEND-RECONCILE-001"));
     assert!(json.contains("authentication"));
+}
+
+#[tokio::test]
+async fn unrelated_chat_requests_are_not_classified_as_message_contracts() {
+    use f365_auth::{transport::HttpRequest, Resource};
+    use std::time::Duration;
+    let recorder = Recorder::new(Arc::new(Hostile));
+    for method in ["GET", "POST"] {
+        let _ = recorder
+            .execute(AuthOp {
+                resource: Resource::ChatService,
+                request: HttpRequest {
+                    method: method.into(),
+                    url: "/v1/users/ME/profile?token=secret".into(),
+                    headers: vec![],
+                    body: None,
+                },
+                needs_page_context: false,
+                idempotent: method == "GET",
+                timeout: Duration::from_secs(1),
+            })
+            .await;
+    }
+    let json = serde_json::to_string(&recorder.bundle()).unwrap();
+    assert!(!json.contains("SEND-"), "{json}");
+    assert!(!json.contains("HISTORY-"), "{json}");
+    assert!(!json.contains("secret"));
+}
+
+#[tokio::test]
+async fn actual_history_uses_path_contract_not_pagination_contract() {
+    let recorder = Arc::new(Recorder::new(Arc::new(Hostile)));
+    let client = TeamsClient::new(recorder.clone());
+    assert!(client.history("19:synthetic", 1).await.is_err());
+    let json = serde_json::to_string(&recorder.bundle()).unwrap();
+    assert!(json.contains("HISTORY-PATH-001"));
+    assert!(!json.contains("HISTORY-PAGE-001"));
+}
+
+#[tokio::test]
+async fn recorder_caps_events_and_sets_truncated() {
+    let recorder = Arc::new(Recorder::new(Arc::new(Hostile)));
+    let client = TeamsClient::new(recorder.clone());
+    for _ in 0..260 {
+        let _ = client.send_text("19:synthetic", "private", "123").await;
+    }
+    let json = serde_json::to_value(recorder.bundle()).unwrap();
+    assert_eq!(json["events"].as_array().unwrap().len(), 256);
+    assert_eq!(json["truncated"], true);
 }
