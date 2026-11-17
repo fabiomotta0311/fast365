@@ -46,7 +46,10 @@ const TITLE_REPAIR_LIMIT: usize = 500;
 /// Buscas de histórico por `refresh` para descobrir o nome de um 1:1 (uma por conversa pendente).
 const NAMES_FETCH_LIMIT: usize = 25;
 
-/// Mensagens lidas para descobrir o nome do outro lado.
+/// Piso de mensagens lidas ao descobrir o nome do outro lado.
+///
+/// Tem de acompanhar o `top` do driver: com janela menor que a da conversa aberta, um 1:1 em que as
+/// últimas N mensagens são todas minhas fica sem nome no `refresh` e só se resolve ao clicar.
 const NAMES_FETCH_TOP: usize = 20;
 
 /// O outro lado de um 1:1: o remetente mais frequente que **não** sou eu.
@@ -550,8 +553,12 @@ impl Driver {
 
         let now = self.clock.now();
         let mut effects = Vec::new();
+        // Mesma janela da conversa aberta (`top`): o resultado não pode depender de quem clicou
+        // primeiro. Se as últimas N mensagens forem todas minhas, o nome sai na próxima vez que a
+        // janela alcançar a outra pessoa.
+        let top = self.top.max(NAMES_FETCH_TOP);
         for id in pending {
-            let Ok(messages) = self.client.history(&id, NAMES_FETCH_TOP).await else {
+            let Ok(messages) = self.client.history(&id, top).await else {
                 continue;
             };
             let Some(name) = counterpart(
@@ -887,6 +894,15 @@ mod tests {
                 .expect("ops")
                 .iter()
                 .map(|op| op.request.method.clone())
+                .collect()
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.ops
+                .lock()
+                .expect("ops")
+                .iter()
+                .map(|op| op.request.url.clone())
                 .collect()
         }
     }
@@ -1262,6 +1278,28 @@ mod tests {
             title(&driver),
             "Ana",
             "o Atualizar completa o nome sem abrir a conversa"
+        );
+    }
+
+    /// A busca de nome lê a **mesma** janela da conversa aberta (`top`).
+    ///
+    /// Com uma janela menor, um 1:1 cujas últimas mensagens são todas minhas ficaria sem nome no
+    /// `Atualizar` e só se resolveria ao clicar.
+    #[tokio::test]
+    async fn name_fetch_uses_the_same_window_as_the_open_chat() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, r#"{"messages":[]}"#)]);
+        let clock = ManualClock::default();
+        let store = Store::open_in_memory().expect("banco em memória");
+        let mut driver = Driver::new(exec.clone(), store, Arc::new(clock)).with_top(50);
+
+        driver.refresh_conversations().await.expect("refresh");
+
+        let urls = exec.urls();
+        assert!(
+            urls.iter().any(|url| url.contains("pageSize=50")),
+            "esperava a busca de nome com pageSize=50, veio {urls:?}"
         );
     }
 
