@@ -61,8 +61,15 @@ Vale para **qualquer** agente (Claude, GPT/Codex, Hermes, Antigravity, DSH), inc
 - `cargo clippy --workspace -- -D warnings`
 - `cargo check --workspace` e `cargo test --workspace`
 - No Windows, validar o gate com `--features webview`.
-- O CI (`.github/workflows/ci.yml`) é a régua final: roda tudo acima com `--locked`, mais MSRV,
-  `cargo deny` (licenças/vulnerabilidades/origens) e cobertura. PR só conclui com CI verde.
+- O CI (`.github/workflows/ci.yml`) roda tudo acima com `--locked`, mais MSRV, `cargo deny`
+  (licenças/vulnerabilidades/origens) e cobertura.
+- **Régua de conclusão:** PR conclui com a régua **disponível** verde. Com o CI rodando, é ele. Se os
+  jobs **não iniciarem por billing da conta** (o GitHub devolve "The job was not started because
+  recent account payments have failed…"), a régua é a suíte **local** equivalente, rodada na máquina
+  do dono: os comandos acima **mais** `cargo +1.89 check --workspace --all-features --locked` (MSRV)
+  e `-p f365-cli --features webview`. Nesse caso, registre na descrição do PR os comandos e o
+  resultado, e diga explicitamente que o CI não executou — nunca apresente um run vermelho por
+  billing como falha de código.
 - **MSRV:** `rust-version` no `Cargo.toml` é contrato. Se uma dependência exigir Rust mais novo, suba o
   `rust-version` no mesmo PR (o job `msrv` falha caso contrário).
 - **`deny.toml`:** nunca afrouxar para passar. Ignorar advisory exige ID RUSTSEC + motivo + prazo;
