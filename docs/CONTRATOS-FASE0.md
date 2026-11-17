@@ -17,6 +17,8 @@ O [profile JSON](../crates/f365-auth/src/profile/teams-web.json) é **parcial**:
 
 ## #5 — REST
 
+[Roteiro de validação pelo dono](VALIDACAO-REST-DONO.md): comparações controladas de headers, observação de formato e múltiplas páginas, com limites de autorização e sanitização. Não é evidência de execução.
+
 | Campo / contrato | Fonte implementada | Estado e evidência / lacuna |
 |---|---|---|
 | Listagem: método, path, query | [chats.rs](../crates/f365-teams/src/chats.rs) | `TEAMS-CSA-LIST-001`: GET `/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true` no agregador; HTTP 200 relatado no [#43](https://github.com/fabiomotta0311/fast365/pull/43). `--top` limita localmente; não demonstra paginação no servidor. |

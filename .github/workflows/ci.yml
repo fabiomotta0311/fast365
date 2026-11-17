@@ -23,6 +23,17 @@ env:
 # Cache: só a main grava (PRs leem), para não poluir/estourar o cache com branches.
 
 jobs:
+  catalogo:
+    name: Catálogo de evidências
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verificar cobertura e testes do catálogo
+        run: python3 docs/test_catalogo_evidencias.py
+
   fmt:
     name: Formatação
     runs-on: ubuntu-latest
