@@ -270,7 +270,8 @@ pub async fn run(opts: Options) -> anyhow::Result<bool> {
 
     let started = Instant::now();
     let (status, detail) = match client.list_conversations(5).await {
-        Ok(list) => {
+        Ok(listing) => {
+            let list = listing.conversations;
             let chats = list
                 .iter()
                 .filter(|c| matches!(c.kind, ConversationKind::Chat { .. }))

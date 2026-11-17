@@ -34,7 +34,7 @@ pub async fn chats(top: usize, fields: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let conversations = client.list_conversations(top).await?;
+    let conversations = client.list_conversations(top).await?.conversations;
 
     if conversations.is_empty() {
         println!("Nenhuma conversa retornada (HTTP 200, lista vazia).");

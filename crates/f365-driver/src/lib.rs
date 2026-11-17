@@ -37,6 +37,9 @@ const REFRESH_FIRST: Duration = Duration::from_secs(30 * 60);
 const REFRESH_BACKOFF_MIN: Duration = Duration::from_secs(5);
 const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 
+/// Prefixo do título provisório de 1:1 (o provider usa `1:1 · <sufixo>` quando não há nome).
+const ONE_ON_ONE_TITLE_PREFIX: &str = "1:1 · ";
+
 /// Falha de uma operação, já classificada para o motor e para o modelo de capacidade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpFailure {
@@ -208,6 +211,9 @@ pub struct Driver {
     token_keeper: Option<Arc<dyn TokenKeeper>>,
     refresh_at: Option<Instant>,
     refresh_backoff: Duration,
+    /// Meu nome de exibição, inferido da listagem (`f365_teams::Listing`): é o que permite
+    /// descobrir a outra pessoa de um 1:1 cruzando com os remetentes do histórico.
+    my_display_name: Option<String>,
 }
 
 impl Driver {
@@ -226,6 +232,7 @@ impl Driver {
             token_keeper: None,
             refresh_at: None,
             refresh_backoff: REFRESH_BACKOFF_MIN,
+            my_display_name: None,
             clock,
         }
     }
@@ -309,9 +316,10 @@ impl Driver {
         let now = self.clock.now();
         let mut round = Round::default();
         match self.client.list_conversations(self.top).await {
-            Ok(list) => {
+            Ok(listing) => {
                 let now_ms = self.now_ms();
-                for conversation in &list {
+                self.my_display_name = listing.my_display_name;
+                for conversation in &listing.conversations {
                     self.store
                         .upsert_conversation(&stored_conversation(conversation, now_ms))?;
                 }
@@ -319,7 +327,7 @@ impl Driver {
                     .observe_ok(now, Capability::ListConversations);
                 round
                     .effects
-                    .push(Effect::ConversationsRefreshed(list.len()));
+                    .push(Effect::ConversationsRefreshed(listing.conversations.len()));
             }
             Err(error) => {
                 self.on_failure(now, Capability::ListConversations, &error);
@@ -436,6 +444,7 @@ impl Driver {
                     .collect();
                 // Atômico e idempotente: repetir uma busca interrompida não inventa mensagem.
                 self.store.upsert_messages(&batch)?;
+                self.refine_one_on_one_title(conversation, &batch, round);
                 self.capabilities.observe_ok(now, Capability::ReadHistory);
                 round.effects.push(Effect::Fetched {
                     conversation: conversation.clone(),
@@ -447,6 +456,50 @@ impl Driver {
                 self.on_failure(now, Capability::ReadHistory, &error);
                 Ok((OpFailure::classify(&error).outcome(), Vec::new()))
             }
+        }
+    }
+
+    /// Completa o título de um 1:1 sem nome usando o histórico.
+    ///
+    /// A listagem não traz o nome do outro lado (`members[]` só tem `mri`/`objectId`), mas revela
+    /// **quem sou eu** quando alguma conversa mostra a última mensagem minha. Cruzando isso com os
+    /// remetentes do histórico, o outro remetente é a outra pessoa — sem endpoint novo.
+    fn refine_one_on_one_title(
+        &self,
+        conversation: &ConversationId,
+        batch: &[StoredMessage],
+        round: &mut Round,
+    ) {
+        let Some(mine) = self.my_display_name.as_deref() else {
+            return;
+        };
+        let Ok(Some(mut stored)) = self.store.conversation(&conversation.0) else {
+            return;
+        };
+        // Só completa o que ficou no sufixo; título real não é sobrescrito.
+        if !stored.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+            return;
+        }
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for message in batch {
+            let Some(sender) = message.sender.as_deref() else {
+                continue;
+            };
+            if sender == mine {
+                continue;
+            }
+            *counts.entry(sender).or_default() += 1;
+        }
+        // Mais frequente; empate pelo nome, para o resultado não depender da ordem da página.
+        let Some((name, _)) = counts
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        else {
+            return;
+        };
+        stored.title = (*name).to_owned();
+        if self.store.upsert_conversation(&stored).is_ok() {
+            round.effects.push(Effect::Persisted(conversation.clone()));
         }
     }
 
@@ -1019,6 +1072,53 @@ mod tests {
             .expect("busca")
             .expect("mensagem no cache");
         assert_eq!(stored.id, "m1");
+    }
+
+    /// 1:1 sem nome na listagem ganha o nome do outro lado depois de buscar o histórico.
+    #[tokio::test]
+    async fn one_on_one_title_is_completed_from_history() {
+        let exec = FakeExec::replying(vec![
+            ok(
+                200,
+                r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+                    "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#,
+            ),
+            ok(
+                200,
+                r#"{"messages":[
+                    {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"},
+                    {"id":"m2","content":"oi de novo","composetime":"2024-01-01T00:00:01Z","imdisplayname":"Ana"},
+                    {"id":"m3","content":"meu","composetime":"2024-01-01T00:00:02Z","imdisplayname":"Fabio Motta"}
+                ]}"#,
+            ),
+        ]);
+        let (_clock, mut driver) = driver(exec);
+
+        driver.refresh_conversations().await.expect("listagem");
+        let before = driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache");
+        assert!(before.title.starts_with("1:1 · "), "{}", before.title);
+
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+
+        let after = driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache");
+        assert_eq!(after.title, "Ana", "o outro remetente é a outra pessoa");
+        assert!(round
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Persisted(_))));
     }
 
     #[tokio::test]

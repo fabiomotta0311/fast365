@@ -11,7 +11,7 @@ pub mod history;
 pub mod realtime;
 pub mod send;
 
-pub use chats::{Conversation, ConversationKind};
+pub use chats::{Conversation, ConversationKind, Listing};
 pub use history::HistoryMessage;
 pub use realtime::RealtimeEvent;
 pub use send::{new_client_message_id, SendReceipt};
@@ -77,7 +77,7 @@ impl TeamsClient {
     }
 
     /// Conversas e canais visíveis para o usuário (no máximo `top`, na ordem da API).
-    pub async fn list_conversations(&self, top: usize) -> Result<Vec<Conversation>, TeamsError> {
+    pub async fn list_conversations(&self, top: usize) -> Result<Listing, TeamsError> {
         let resp = self.exec.execute(chats::list_op()).await?;
         if !(200..300).contains(&resp.status) {
             return Err(TeamsError::Http {
@@ -86,13 +86,19 @@ impl TeamsClient {
             });
         }
         let start = std::time::Instant::now();
-        let parsed = chats::parse(&resp.body);
+        let parsed = chats::parse_listing(&resp.body);
         if let Some(recorder) = &self.recorder {
             recorder.response_protocol(false, parsed.is_ok(), start);
         }
-        let mut all = parsed?;
-        all.truncate(top);
-        Ok(all)
+        let Listing {
+            mut conversations,
+            my_display_name,
+        } = parsed?;
+        conversations.truncate(top);
+        Ok(Listing {
+            conversations,
+            my_display_name,
+        })
     }
 
     /// Envia `text` (texto puro) para a conversa. `client_message_id` vem de quem chama
@@ -169,12 +175,34 @@ mod tests {
         let got = client.list_conversations(2).await.unwrap();
 
         assert_eq!(
-            got.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            got.conversations
+                .iter()
+                .map(|c| c.title.as_str())
+                .collect::<Vec<_>>(),
             ["A", "B"]
+        );
+        assert_eq!(
+            got.my_display_name, None,
+            "sem `isLastMessageFromMe`, nada a inferir"
         );
         let ops = exec.ops.lock().unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].resource, f365_auth::Resource::ChatSvcAgg);
+    }
+
+    /// A listagem também revela **quem sou eu**, via `isLastMessageFromMe` + `imDisplayName`.
+    #[tokio::test]
+    async fn listing_infers_my_display_name() {
+        let exec = FakeExec::replying(ok(json!({
+            "chats": [
+                {"id": "19:dm@unq.gbl.spaces", "title": null, "isLastMessageFromMe": false,
+                 "lastMessage": {"imDisplayName": "Ana"}},
+                {"id": "19:outro@unq.gbl.spaces", "title": null, "isLastMessageFromMe": true,
+                 "lastMessage": {"imDisplayName": "Fabio Motta"}}
+            ]
+        })));
+        let got = TeamsClient::new(exec).list_conversations(10).await.unwrap();
+        assert_eq!(got.my_display_name.as_deref(), Some("Fabio Motta"));
     }
 
     #[tokio::test]

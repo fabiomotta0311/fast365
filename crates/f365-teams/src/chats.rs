@@ -38,6 +38,35 @@ pub struct Conversation {
     pub kind: ConversationKind,
 }
 
+/// Resultado da listagem: as conversas e, quando inferível, **quem sou eu**.
+///
+/// Um 1:1 não traz nome do outro lado no payload (`members[]` só tem `mri`/`objectId`). Mas quando
+/// a última mensagem é minha, `lastMessage.imDisplayName` é o **meu** nome — e isso permite, junto
+/// com o histórico da conversa, descobrir quem é a outra pessoa sem endpoint novo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub conversations: Vec<Conversation>,
+    pub my_display_name: Option<String>,
+}
+
+impl Listing {
+    /// Nome de exibição do próprio usuário, quando alguma conversa mostra a última mensagem dele.
+    fn infer_my_name(value: &Value) -> Option<String> {
+        value
+            .get("chats")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|chat| {
+                chat.get("isLastMessageFromMe")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .and_then(|chat| text(chat.get("lastMessage")?, "imDisplayName"))
+            .map(str::to_owned)
+    }
+}
+
 pub(crate) fn list_op() -> AuthOp {
     AuthOp {
         resource: Resource::ChatSvcAgg,
@@ -53,9 +82,26 @@ pub(crate) fn list_op() -> AuthOp {
     }
 }
 
+/// Conveniência dos testes; a produção usa [`parse_listing`], que também infere quem sou eu.
+#[cfg(test)]
 pub(crate) fn parse(body: &[u8]) -> Result<Vec<Conversation>, TeamsError> {
-    let v: Value = serde_json::from_slice(body)
-        .map_err(|_| TeamsError::Malformed("chatsvcagg: corpo não é JSON"))?;
+    parse_value(&decode(body)?)
+}
+
+/// Listagem + quem sou eu (ver [`Listing`]).
+pub(crate) fn parse_listing(body: &[u8]) -> Result<Listing, TeamsError> {
+    let value = decode(body)?;
+    Ok(Listing {
+        conversations: parse_value(&value)?,
+        my_display_name: Listing::infer_my_name(&value),
+    })
+}
+
+fn decode(body: &[u8]) -> Result<Value, TeamsError> {
+    serde_json::from_slice(body).map_err(|_| TeamsError::Malformed("chatsvcagg: corpo não é JSON"))
+}
+
+fn parse_value(v: &Value) -> Result<Vec<Conversation>, TeamsError> {
     let chats = v.get("chats").and_then(Value::as_array);
     let teams = v.get("teams").and_then(Value::as_array);
     if chats.is_none() && teams.is_none() {

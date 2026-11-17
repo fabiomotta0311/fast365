@@ -188,6 +188,26 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Uma conversa do cache, se existir.
+    pub fn conversation(&self, id: &str) -> Result<Option<Conversation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, kind, last_activity_ms, updated_ms FROM conversations WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                kind: row.get(2)?,
+                last_activity_ms: row.get(3)?,
+                updated_ms: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// Remove a conversa e, por cascata, suas mensagens (e o índice FTS, via trigger).
     pub fn delete_conversation(&self, id: &str) -> Result<usize> {
         Ok(self

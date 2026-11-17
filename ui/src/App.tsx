@@ -78,8 +78,13 @@ export default function App() {
             effect.conversation === current.id,
         );
       if (touched && current) void reloadMessages(current);
+
+      // O motor completa o título de um 1:1 sem nome ao buscar o histórico (`persisted`).
+      if (round.effects.some((effect) => effect.kind === "persisted")) {
+        void reloadConversations();
+      }
     },
-    [reloadMessages],
+    [reloadConversations, reloadMessages],
   );
 
   // Primeiro frame: só cache. Nada de rede na montagem.
