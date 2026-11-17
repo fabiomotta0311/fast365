@@ -197,6 +197,21 @@ impl Store {
 
     // ---- mensagens ----
 
+    /// Garante a linha da conversa sem sobrescrever o que já se sabe dela.
+    ///
+    /// Uma mensagem chega antes de a conversa ser listada (ex.: invalidação de um canal que o
+    /// usuário ainda não abriu); a FK não pode recusar por causa disso, e o título real não pode
+    /// ser apagado por um placeholder.
+    pub fn ensure_conversation(&self, id: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO conversations (id, title, kind, last_activity_ms, updated_ms)
+             VALUES (?1, '', 'unknown', NULL, ?2)
+             ON CONFLICT(id) DO NOTHING",
+            params![id, now_ms],
+        )?;
+        Ok(())
+    }
+
     /// Grava um lote de forma atômica e idempotente (chave = `id`).
     ///
     /// Reaplicar o mesmo lote não duplica nada — é o que permite repetir uma sincronização

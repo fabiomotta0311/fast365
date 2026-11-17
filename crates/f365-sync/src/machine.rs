@@ -215,6 +215,14 @@ impl SyncMachine {
         self.sends.get(client_id)
     }
 
+    /// Todos os envios conhecidos, em ordem estável de `clientmessageid`.
+    ///
+    /// É o que permite ao driver/UI perceber **transições** (ex.: algo virou `Uncertain`) sem que o
+    /// motor precise emitir um evento só para isso.
+    pub fn sends(&self) -> impl Iterator<Item = (&ClientMessageId, &SendState)> {
+        self.sends.iter()
+    }
+
     pub fn conversation_state(&self, conversation: &ConversationId) -> Option<&ConversationState> {
         self.conversations.get(conversation)
     }
