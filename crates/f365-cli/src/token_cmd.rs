@@ -1,5 +1,9 @@
 //! `f365 token` (Checkpoint B): renova em silêncio e imprime **só claims/metadados** — o token não
 //! sai de `f365-auth` nem aparece no terminal (`AGENTS.md`: nenhum segredo em saída/log).
+//!
+//! Opt-in: defina `F365_PROTOCOL_PROFILE` com o caminho de um JSON de perfil confiável antes de
+//! executar o CLI. Ausente usa o perfil embutido; arquivo inválido ou inacessível aborta sem fallback.
+//! O perfil só permite versões numéricas do caminho authsvc; destinos de credenciais não mudam.
 
 use crate::session_cmd::human;
 use f365_auth::tokens::{TokenBroker, TokenInfo, TokenResource};
@@ -19,12 +23,18 @@ pub enum Resource {
     Skype,
 }
 
-pub fn broker() -> anyhow::Result<TokenBroker> {
-    let broker = TokenBroker::new(
+pub(crate) fn base_broker() -> anyhow::Result<TokenBroker> {
+    let path = std::env::var_os("F365_PROTOCOL_PROFILE").map(std::path::PathBuf::from);
+    Ok(TokenBroker::new_with_profile_path(
         Vault::keyring(),
         Arc::new(RustTransport::new()?),
         Arc::new(SystemClock),
-    );
+        path.as_deref(),
+    )?)
+}
+
+pub fn broker() -> anyhow::Result<TokenBroker> {
+    let broker = base_broker()?;
     // RT de SPA vence em ~24 h: com a WebView disponível, re-pareia sozinho (AUTH-RT-SPA-001).
     #[cfg(feature = "webview")]
     let broker = broker.with_repair(Arc::new(crate::session_cmd::SilentRepair));

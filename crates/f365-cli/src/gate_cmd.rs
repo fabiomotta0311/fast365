@@ -484,11 +484,7 @@ async fn check_realtime(client: &TeamsClient, wait: Duration) -> (Status, String
 }
 
 fn build_broker(repairs: &Arc<AtomicUsize>) -> anyhow::Result<TokenBroker> {
-    let broker = TokenBroker::new(
-        Vault::keyring(),
-        Arc::new(RustTransport::new()?),
-        Arc::new(SystemClock),
-    );
+    let broker = crate::token_cmd::base_broker()?;
     // Contador: F só é verdade se o refresh silencioso acontecer **sem** `auth` manual.
     #[cfg(feature = "webview")]
     let broker = broker.with_repair(Arc::new(CountingRepair {

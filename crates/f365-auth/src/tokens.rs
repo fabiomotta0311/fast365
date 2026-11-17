@@ -156,6 +156,28 @@ impl TokenBroker {
         }
     }
 
+    /// Seleciona um arquivo externo somente quando informado explicitamente; erro não faz fallback.
+    pub fn new_with_profile_path(
+        vault: Vault,
+        transport: Arc<dyn Transport>,
+        clock: Arc<dyn Clock>,
+        path: Option<&std::path::Path>,
+    ) -> Result<Self, crate::profile::ProfileError> {
+        let broker = Self::new(vault, transport, clock);
+        match path {
+            Some(path) => broker.with_profile(Profile::load(path)?),
+            None => Ok(broker),
+        }
+    }
+
+    /// Usa um perfil externo validado, antes de qualquer operação ou preenchimento do cache.
+    pub fn with_profile(mut self, profile: Profile) -> Result<Self, crate::profile::ProfileError> {
+        profile.validate()?;
+        self.profile = profile;
+        self.cache = Mutex::default();
+        Ok(self)
+    }
+
     /// Liga o re-pareamento automático quando o Entra recusar o RT.
     pub fn with_repair(mut self, repair: Arc<dyn SessionRepair>) -> Self {
         self.repair = Some(repair);
@@ -275,7 +297,10 @@ impl TokenBroker {
         );
         let req = HttpRequest {
             method: "POST".into(),
-            url: self.profile.token_url(&session.account.tenant_id),
+            url: self
+                .profile
+                .token_url(&session.account.tenant_id)
+                .ok_or(TokenError::Malformed("tenant"))?,
             headers: vec![
                 (
                     "Content-Type".into(),

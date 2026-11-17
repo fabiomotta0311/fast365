@@ -11,6 +11,8 @@
 
 mod socketio;
 mod trouter;
+#[cfg(test)]
+mod wiremock_e2e;
 
 use crate::{TeamsClient, TeamsError};
 use f365_auth::transport::HttpResponse;
@@ -91,7 +93,12 @@ impl TeamsClient {
         let resp = self.exec.execute(trouter::connect_op(&epid)).await?;
         ensure_2xx("Trouter (conexão)", &resp)?;
         tracing::debug!(campos = ?trouter::shape(&resp.body), "Trouter: formato da resposta de conexão");
-        let mut info = trouter::parse_connect(&resp.body)?;
+        let parse_start = Instant::now();
+        let parsed = trouter::parse_connect(&resp.body);
+        if let Some(recorder) = &self.recorder {
+            recorder.trouter_protocol(false, parsed.is_ok(), parse_start);
+        }
+        let mut info = parsed?;
         let ms = clock
             .utc_now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -105,25 +112,42 @@ impl TeamsClient {
             .execute(trouter::handshake_op(&info, &epid))
             .await?;
         ensure_2xx("Trouter (handshake)", &resp)?;
-        let hs = std::str::from_utf8(&resp.body)
+        let parse_start = Instant::now();
+        let parsed = std::str::from_utf8(&resp.body)
             .ok()
             .and_then(socketio::parse_handshake)
             .filter(|h| h.transports.iter().any(|t| t == "websocket"))
             .ok_or(TeamsError::Malformed(
                 "Trouter: handshake socket.io inesperado (TROUTER-HANDSHAKE-001)",
-            ))?;
+            ));
+        if let Some(recorder) = &self.recorder {
+            recorder.trouter_protocol(true, parsed.is_ok(), parse_start);
+        }
+        let hs = parsed?;
 
         on_event(RealtimeEvent::Step("3/4 WebSocket"));
         let ws_url = trouter::ws_url(&info, &hs.session_id, &epid);
         #[cfg(test)]
         let ws_url = self.realtime_test_url.clone().unwrap_or(ws_url);
+        let ws_start = Instant::now();
         let (mut ws, _) = tokio::select! {
             result = tokio_tungstenite::connect_async_with_config(ws_url, Some(ws_config()), false) => result.map_err(|e| {
+                if let Some(recorder) = &self.recorder { recorder.websocket_failure(crate::diagnostics::WebSocketFailure::Upgrade, ws_start); }
                 TeamsError::Realtime(format!("WebSocket recusado: {} (TROUTER-WS-001)", ws_error_kind(&e)))
             })?,
-            () = clock.sleep(WS_UPGRADE_TIMEOUT) => return Err(TeamsError::Realtime("tempo esgotado no upgrade WebSocket (TROUTER-WS-001)".into())),
+            () = clock.sleep(WS_UPGRADE_TIMEOUT) => {
+                if let Some(recorder) = &self.recorder { recorder.websocket_failure(crate::diagnostics::WebSocketFailure::UpgradeTimeout, ws_start); }
+                return Err(TeamsError::Realtime("tempo esgotado no upgrade WebSocket (TROUTER-WS-001)".into()));
+            },
         };
-        await_connect(&mut ws, clock).await?;
+        await_connect(&mut ws, clock).await.inspect_err(|_| {
+            if let Some(recorder) = &self.recorder {
+                recorder.websocket_failure(
+                    crate::diagnostics::WebSocketFailure::Confirmation,
+                    ws_start,
+                );
+            }
+        })?;
 
         on_event(RealtimeEvent::Step("4/4 registro do endpoint"));
         let resp = self
@@ -134,7 +158,14 @@ impl TeamsClient {
 
         *ever_ready = true;
         on_event(RealtimeEvent::Ready);
-        run_session(&mut ws, clock, hs.heartbeat, on_event).await
+        run_session(&mut ws, clock, hs.heartbeat, on_event)
+            .await
+            .inspect_err(|_| {
+                if let Some(recorder) = &self.recorder {
+                    recorder
+                        .websocket_failure(crate::diagnostics::WebSocketFailure::Session, ws_start);
+                }
+            })
     }
 }
 

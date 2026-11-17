@@ -6,6 +6,7 @@
 //! `history/`.
 
 pub mod chats;
+pub mod diagnostics;
 pub mod history;
 pub mod realtime;
 pub mod send;
@@ -38,6 +39,7 @@ pub enum TeamsError {
 /// Cliente do provider Teams.
 pub struct TeamsClient {
     exec: Arc<dyn AuthenticatedExecutor>,
+    recorder: Option<Arc<diagnostics::Recorder>>,
     #[cfg(test)]
     realtime_test_url: Option<String>,
 }
@@ -46,9 +48,17 @@ impl TeamsClient {
     pub fn new(exec: Arc<dyn AuthenticatedExecutor>) -> Self {
         Self {
             exec,
+            recorder: None,
             #[cfg(test)]
             realtime_test_url: None,
         }
+    }
+
+    /// Instrument HTTP and realtime failures into the same bounded bundle.
+    pub fn with_recorder(recorder: Arc<diagnostics::Recorder>) -> Self {
+        let mut client = Self::new(recorder.clone());
+        client.recorder = Some(recorder);
+        client
     }
 
     /// Conversas e canais visíveis para o usuário (no máximo `top`, na ordem da API).
@@ -60,7 +70,12 @@ impl TeamsClient {
                 status: resp.status,
             });
         }
-        let mut all = chats::parse(&resp.body)?;
+        let start = std::time::Instant::now();
+        let parsed = chats::parse(&resp.body);
+        if let Some(recorder) = &self.recorder {
+            recorder.response_protocol(false, parsed.is_ok(), start);
+        }
+        let mut all = parsed?;
         all.truncate(top);
         Ok(all)
     }
