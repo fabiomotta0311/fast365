@@ -59,6 +59,11 @@ enum Request {
         text: String,
         reply: Reply<RoundDto>,
     },
+    /// Abrir uma conversa: busca o histórico no provider (o cache é só o primeiro frame).
+    Load {
+        conversation_id: String,
+        reply: Reply<RoundDto>,
+    },
 }
 
 /// Alça que os comandos usam para falar com o ator.
@@ -99,7 +104,8 @@ fn main() {
             search,
             capabilities,
             refresh,
-            send
+            send,
+            load
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar o Fast365");
@@ -197,6 +203,16 @@ async fn serve(core: &mut App, request: Request) {
                     .map_err(|error| error.to_string()),
             );
         }
+        Request::Load {
+            conversation_id,
+            reply,
+        } => {
+            // Invalidação é o que o motor entende por "busque esta conversa".
+            let inbound = Inbound::Invalidated {
+                conversation: conversation_id,
+            };
+            let _ = reply.send(core.apply(inbound).await.map_err(|error| error.to_string()));
+        }
     }
 }
 
@@ -220,6 +236,9 @@ async fn serve_failing(requests: &mut mpsc::Receiver<Request>, why: String) {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Send { reply, .. } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::Load { reply, .. } => {
                 let _ = reply.send(Err(why.clone()));
             }
         }
@@ -338,6 +357,18 @@ async fn send(
     core.ask(|reply| Request::Send {
         conversation_id,
         text,
+        reply,
+    })
+    .await
+}
+
+#[tauri::command]
+async fn load(
+    core: tauri::State<'_, CoreHandle>,
+    conversation_id: String,
+) -> Result<RoundDto, String> {
+    core.ask(|reply| Request::Load {
+        conversation_id,
         reply,
     })
     .await

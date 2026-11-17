@@ -121,9 +121,18 @@ export default function App() {
     async (conversation: Conversation) => {
       selectedRef.current = conversation;
       setSelected(conversation);
+      // Primeiro o que já está em cache (render-before-network)…
       await reloadMessages(conversation);
+      // …depois busca o histórico no provider. Invalidação é o que o motor entende por
+      // "busque esta conversa".
+      try {
+        applyRound(await invoke<Round>("load", { conversationId: conversation.id }));
+        await reloadMessages(conversation);
+      } catch (error) {
+        setStatus(String(error));
+      }
     },
-    [reloadMessages],
+    [applyRound, reloadMessages],
   );
 
   const refresh = useCallback(async () => {
