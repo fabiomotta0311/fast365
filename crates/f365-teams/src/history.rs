@@ -7,6 +7,9 @@ use std::{collections::HashSet, time::Duration};
 #[derive(Clone, PartialEq, Eq)]
 pub struct HistoryMessage {
     pub id: String,
+    /// Raw string `clientmessageid` when present; HISTORY-SHAPE-001 is UNVERIFIED.
+    /// This field alone does not perform send reconciliation.
+    pub client_message_id: Option<String>,
     pub time: Option<String>,
     pub sender: Option<String>,
     pub message_type: Option<String>,
@@ -36,6 +39,10 @@ fn parse(body: &[u8]) -> Result<(Vec<HistoryMessage>, Option<String>), TeamsErro
         let id = field(m, "id").filter(|s| !s.is_empty()).ok_or_else(bad)?;
         out.push(HistoryMessage {
             id,
+            client_message_id: m
+                .get("clientmessageid")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             time: field(m, "composetime").or_else(|| field(m, "originalarrivaltime")),
             sender: field(m, "imdisplayname").or_else(|| field(m, "from")),
             message_type: field(m, "messagetype"),
@@ -126,9 +133,15 @@ impl TeamsClient {
         top: usize,
         clock: &dyn f365_auth::Clock,
     ) -> Result<Vec<HistoryMessage>, TeamsError> {
+        let start = std::time::Instant::now();
         tokio::select! {
             biased;
-            _ = clock.sleep(Duration::from_secs(60)) => Err(TeamsError::Malformed("HISTORY-PAGE-001 prazo total excedido")),
+            _ = clock.sleep(Duration::from_secs(60)) => {
+                if let Some(recorder) = &self.recorder {
+                    recorder.history_timeout(start);
+                }
+                Err(TeamsError::Malformed("HISTORY-PAGE-001 prazo total excedido"))
+            },
             result = self.history_pages(chat_id, top) => result,
         }
     }
@@ -200,6 +213,9 @@ impl TeamsClient {
                 None => return Ok(out),
             }
         }
+        if let Some(recorder) = &self.recorder {
+            recorder.response_protocol(true, false, std::time::Instant::now());
+        }
         Err(TeamsError::Malformed(
             "HISTORY-PAGE-001 limite de páginas (UNVERIFIED)",
         ))
@@ -253,7 +269,8 @@ mod tests {
             }
         }
         let clock = f365_auth::ManualClock::default();
-        let client = TeamsClient::new(Arc::new(Stalled));
+        let recorder = Arc::new(crate::diagnostics::Recorder::new(Arc::new(Stalled)));
+        let client = TeamsClient::with_recorder(recorder.clone());
         let task = tokio::spawn({
             let clock = clock.clone();
             async move { client.history_with_clock("48:notes", 1, &clock).await }
@@ -265,6 +282,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(result, Err(TeamsError::Malformed(s)) if s.contains("prazo")));
+        let json = recorder.bundle().export_json().unwrap();
+        let bundle: Value = serde_json::from_str(&json).unwrap();
+        assert!(bundle["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["contract"] == "HISTORY-PATH-001" && e["outcome"] == "timeout"));
+        assert!(!json.contains("48:notes"));
     }
 
     #[tokio::test]
@@ -355,9 +380,27 @@ mod tests {
             }
         }
         let exec = Arc::new(ManyPages(Mutex::new(0)));
-        let result = TeamsClient::new(exec.clone()).history("48:notes", 1).await;
+        let recorder = Arc::new(crate::diagnostics::Recorder::new(exec.clone()));
+        let result = TeamsClient::with_recorder(recorder.clone())
+            .history("48:notes", 1)
+            .await;
         assert!(matches!(result, Err(TeamsError::Malformed(s)) if s.contains("limite de páginas")));
         assert_eq!(*exec.0.lock().unwrap(), 10);
+        let json = recorder.bundle().export_json().unwrap();
+        let bundle: Value = serde_json::from_str(&json).unwrap();
+        let events = bundle["events"].as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["outcome"] == "http_success")
+                .count(),
+            10
+        );
+        assert!(events
+            .iter()
+            .any(|e| e["contract"] == "HISTORY-PATH-001" && e["outcome"] == "protocol_error"));
+        assert!(!json.contains("48:notes"));
+        assert!(!json.contains("cursor="));
     }
 
     #[tokio::test]
@@ -436,7 +479,19 @@ mod tests {
 
     async fn rejects_cycle_at_top(body: &'static str) {
         let exec = fake(&[body, body]);
-        let result = TeamsClient::new(exec.clone()).history("48:notes", 2).await;
+        let recorder = Arc::new(crate::diagnostics::Recorder::new(exec.clone()));
+        let result = TeamsClient::with_recorder(recorder.clone())
+            .history("48:notes", 2)
+            .await;
+        let json = recorder.bundle().export_json().unwrap();
+        let bundle: Value = serde_json::from_str(&json).unwrap();
+        assert!(bundle["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["contract"] == "HISTORY-PATH-001" && e["outcome"] == "protocol_error"));
+        assert!(!json.contains("syntheticsecret"));
+        assert!(!json.contains("48:notes"));
         match result {
             Err(e) => {
                 assert!(e.to_string().contains("cursor cíclico"));
@@ -516,6 +571,18 @@ mod tests {
             .is_err());
         assert_eq!(cycle.ops.lock().unwrap().len(), 2);
     }
+    #[test]
+    fn client_message_id_is_optional_and_preserves_supported_json_values() {
+        let (messages, _) = parse(br#"{"messages":[{"id":"1","clientmessageid":"SYNTHETIC-123"},{"id":"2"},{"id":"3","clientmessageid":{"unsupported":"secret"}},{"id":"4","clientmessageid":12345}]}"#).unwrap();
+        assert_eq!(
+            messages[0].client_message_id.as_deref(),
+            Some("SYNTHETIC-123")
+        );
+        assert_eq!(messages[1].client_message_id, None);
+        assert_eq!(messages[2].client_message_id, None);
+        assert_eq!(messages[3].client_message_id, None);
+    }
+
     #[test]
     fn parser_and_cursor_enforce_contract() {
         let (m, link) = parse(br#"{"messages":[{"id":"1","originalarrivaltime":"today","from":"u","content":"secret"}]}"#).unwrap();

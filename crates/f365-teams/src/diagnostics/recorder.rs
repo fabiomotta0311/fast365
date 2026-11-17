@@ -136,6 +136,10 @@ impl Recorder {
         self.record(contract, outcome, start);
     }
 
+    pub(crate) fn history_timeout(&self, start: Instant) {
+        self.record(Contract::History, Outcome::Timeout, start);
+    }
+
     pub(crate) fn response_protocol(&self, history: bool, success: bool, start: Instant) {
         let contract = if history {
             Contract::History
