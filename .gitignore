@@ -10,3 +10,9 @@ gate-reports/
 *.har
 .f365/
 session.json
+
+# App Tauri (Fase 3) — workspace próprio, artefatos não versionam
+ui/node_modules/
+ui/dist/
+ui/src-tauri/target/
+ui/src-tauri/gen/

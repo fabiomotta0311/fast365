@@ -127,6 +127,15 @@ impl App {
         Ok(round)
     }
 
+    /// Faz o motor processar prazos vencidos (reconciliação de envio, renovação de token).
+    ///
+    /// A casca pode chamar isto periodicamente enquanto o empurrão do tempo real não existe.
+    pub async fn wake(&mut self) -> Result<RoundDto, IpcError> {
+        let round = self.shell.wake().await?;
+        self.note(&round);
+        Ok(round)
+    }
+
     /// Próximo acontecimento para o frontend: um evento do tempo real **ou** o prazo que o motor
     /// pediu (reconciliação/renovação). `None` = o runtime foi encerrado.
     pub async fn next_event(&mut self) -> Option<UiEvent> {
@@ -144,9 +153,7 @@ impl App {
                 }
             }
             () = sleep_until(self.clock.clone(), wake) => {
-                let round = self.shell.wake().await.ok()?;
-                self.note(&round);
-                Some(UiEvent::Round(round))
+                Some(UiEvent::Round(self.wake().await.ok()?))
             }
         }
     }
