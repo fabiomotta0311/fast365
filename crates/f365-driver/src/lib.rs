@@ -486,9 +486,14 @@ impl Driver {
             }
             Err(error) => {
                 self.on_failure(now, Capability::Send, &error);
-                let failure = OpFailure::classify(&error);
-                // Resposta perdida: o motor vai reconciliar, não reenviar.
-                failure.outcome()
+                // HTTP throttling and server failures do not prove that a non-idempotent
+                // send was not accepted. Reconcile rather than replay the POST.
+                if matches!(&error, TeamsError::Http { status, .. } if *status == 429 || *status >= 500)
+                {
+                    Outcome::Lost
+                } else {
+                    OpFailure::classify(&error).outcome()
+                }
             }
         }
     }
@@ -837,6 +842,18 @@ mod tests {
     }
 
     // ---- testes ----
+
+    #[tokio::test]
+    async fn throttled_send_never_reposts_without_evidence() {
+        let exec = FakeExec::replying(vec![
+            ok(429, "throttled"),
+            ok(429, "throttled"),
+            ok(429, "throttled"),
+        ]);
+        let (_clock, mut driver) = driver(exec.clone());
+        driver.send_message(&conv(), "hello").await.unwrap();
+        assert_eq!(exec.methods().iter().filter(|m| *m == "POST").count(), 1);
+    }
 
     #[tokio::test]
     async fn socket_loss_wakes_reconnect_without_blocking_send() {
