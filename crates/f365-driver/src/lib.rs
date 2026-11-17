@@ -308,8 +308,16 @@ impl Driver {
                         });
                     }
                     Decision::FetchHistory { op, conversation } => {
-                        let outcome = self.fetch(&conversation, &mut round).await?;
+                        let (outcome, observed) = self.fetch(&conversation, &mut round).await?;
+                        // A fila é LIFO: empilha a operação primeiro para as observações serem
+                        // processadas antes — o fato observado vale mais que o resultado do request.
                         queue.push(Event::OperationFinished { op, outcome });
+                        for client_id in observed {
+                            queue.push(Event::MessageObserved {
+                                conversation: conversation.clone(),
+                                client_id,
+                            });
+                        }
                     }
                     Decision::AttemptSend {
                         op,
@@ -349,7 +357,7 @@ impl Driver {
         &mut self,
         conversation: &ConversationId,
         round: &mut Round,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<(Outcome, Vec<ClientMessageId>), DriverError> {
         let now = self.clock.now();
         match self.client.history(&conversation.0, self.top).await {
             Ok(messages) => {
@@ -359,6 +367,14 @@ impl Driver {
                     .iter()
                     .map(|message| stored_message(conversation, message))
                     .collect();
+                // Só interessa o `clientmessageid` de envio que este cliente ainda está devendo;
+                // o motor confirma apenas o da própria conversa (`SEND-RECONCILE-001`).
+                let observed: Vec<ClientMessageId> = batch
+                    .iter()
+                    .filter_map(|message| message.client_message_id.clone())
+                    .map(ClientMessageId)
+                    .filter(|client_id| self.machine.send_state(client_id).is_some())
+                    .collect();
                 // Atômico e idempotente: repetir uma busca interrompida não inventa mensagem.
                 self.store.upsert_messages(&batch)?;
                 self.capabilities.observe_ok(now, Capability::ReadHistory);
@@ -366,11 +382,11 @@ impl Driver {
                     conversation: conversation.clone(),
                     messages: batch.len(),
                 });
-                Ok(Outcome::Succeeded)
+                Ok((Outcome::Succeeded, observed))
             }
             Err(error) => {
                 self.on_failure(now, Capability::ReadHistory, &error);
-                Ok(OpFailure::classify(&error).outcome())
+                Ok((OpFailure::classify(&error).outcome(), Vec::new()))
             }
         }
     }
@@ -494,9 +510,9 @@ fn stored_message(conversation: &ConversationId, message: &HistoryMessage) -> St
     StoredMessage {
         id: message.id.clone(),
         conversation_id: conversation.0.clone(),
-        // `HISTORY-SHAPE-001` ainda não traz o campo: a reconciliação depende de
-        // `Driver::note_observed` (ver o doc do crate).
-        client_message_id: None,
+        // Só o que o provider afirmar: `None` quando o campo veio ausente ou num formato que ele
+        // não suporta (`HISTORY-SHAPE-001`, UNVERIFIED). O driver não deduz nada daqui.
+        client_message_id: message.client_message_id.clone(),
         sender: message.sender.clone(),
         body: message.content.clone().unwrap_or_default(),
         message_type: message
@@ -811,6 +827,58 @@ mod tests {
             Some(SendState::Delivered { .. })
         ));
         assert!(round.effects.contains(&Effect::Published(conv())));
+    }
+
+    #[tokio::test]
+    async fn history_reveals_the_client_id_and_closes_the_reconciliation() {
+        // A busca da reconciliação ainda não vê a mensagem: quem a mostra é uma busca posterior.
+        let exec = FakeExec::replying(vec![lost(), ok(200, r#"{"messages":[]}"#)]);
+        let (_clock, mut driver) = driver(exec.clone());
+
+        let round = driver.send_message(&conv(), "oi").await.expect("tenta");
+        let sent = client_id(&round);
+        assert!(matches!(
+            driver.machine().send_state(&sent),
+            Some(SendState::Reconciling { .. })
+        ));
+
+        // Agora o conteúdo traz o `clientmessageid` que o cliente gerou.
+        exec.script.lock().expect("script").push_back(ok(
+            200,
+            &format!(
+                r#"{{"messages":[{{"id":"m1","content":"oi","clientmessageid":"{}"}}]}}"#,
+                sent.0
+            ),
+        ));
+
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca de novo");
+
+        assert!(
+            matches!(
+                driver.machine().send_state(&sent),
+                Some(SendState::Delivered { .. })
+            ),
+            "o fato observado confirma a entrega"
+        );
+        assert_eq!(
+            exec.methods().iter().filter(|m| *m == "POST").count(),
+            1,
+            "reconciliou sem reenviar"
+        );
+        assert!(round.effects.contains(&Effect::Published(conv())));
+
+        // O id também fica no cache: a UI/diagnóstico acham a mensagem depois.
+        let stored = driver
+            .store()
+            .find_by_client_message_id(&sent.0)
+            .expect("busca")
+            .expect("mensagem no cache");
+        assert_eq!(stored.id, "m1");
     }
 
     #[tokio::test]
