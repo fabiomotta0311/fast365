@@ -1,0 +1,20 @@
+[package]
+name = "f365-driver"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Costura da Fase 2: o único lugar que conhece o motor E o cache. O motor continua sem I/O e o
+# storage continua sem decisão — este crate é quem compõe os dois com o executor autenticado.
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+f365-auth = { path = "../f365-auth" }
+f365-sync = { path = "../f365-sync" }
+f365-storage = { path = "../f365-storage" }
+f365-teams = { path = "../f365-teams" }
+
+[dev-dependencies]
+tokio.workspace = true

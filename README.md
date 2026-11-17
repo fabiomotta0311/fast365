@@ -90,6 +90,8 @@ Para lançar: suba `version` em `crates/f365-cli/Cargo.toml`, faça merge e `git
 ```
 crates/f365-auth    # executor autenticado: SSO, WebView (feature `webview`), keyring, troca de tokens
 crates/f365-teams   # provider Teams: REST chatsvcagg + Trouter (WS)
-crates/f365-sync    # motor de sync: FSM sem I/O (Event → Decision), Clock injetável
+crates/f365-sync    # motor de sync: FSM sem I/O (Event → Decision) + disponibilidade por capacidade
+crates/f365-storage # cache local: SQLite WAL + FTS5 (fonte da verdade, offline-first)
+crates/f365-driver  # costura motor ⇄ executor ⇄ cache (busca, envia, grava, publica)
 crates/f365-cli     # binário `f365` (gate da Fase 0)
 ```
