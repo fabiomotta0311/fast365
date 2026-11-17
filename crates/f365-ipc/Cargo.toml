@@ -1,0 +1,22 @@
+[package]
+name = "f365-ipc"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Superfície que a UI chama (Fase 3, #21). Sem toolkit: aqui mora só o contrato (DTOs + comandos)
+# e a leitura do cache. O shell Tauri embrulha isto em `#[tauri::command]` — e por isso este crate
+# pode ser testado e buildado no CI headless, sem GTK/WebKit.
+[dependencies]
+f365-auth = { path = "../f365-auth" }
+f365-driver = { path = "../f365-driver" }
+f365-storage = { path = "../f365-storage" }
+f365-sync = { path = "../f365-sync" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true

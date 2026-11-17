@@ -836,6 +836,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "f365-ipc"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "f365-auth",
+ "f365-driver",
+ "f365-storage",
+ "f365-sync",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "f365-storage"
 version = "0.0.0"
 dependencies = [
