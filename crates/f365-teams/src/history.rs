@@ -52,15 +52,16 @@ fn parse(body: &[u8]) -> Result<(Vec<HistoryMessage>, Option<String>), TeamsErro
         },
         _ => return Err(TeamsError::Malformed("HISTORY-PAGE-001 (UNVERIFIED)")),
     };
-    if link.is_none()
-        && v.get("_metadata")
-            .and_then(|m| m.get("syncState"))
-            .is_some_and(|s| !s.is_null() && s.as_str() != Some(""))
-    {
-        return Err(TeamsError::Malformed(
-            "HISTORY-PAGE-001 syncState sem continuação suportada (UNVERIFIED)",
-        ));
-    }
+    let link = if link.is_some() {
+        link
+    } else {
+        match v.get("_metadata").and_then(|m| m.get("syncState")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s.is_empty() => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => return Err(TeamsError::Malformed("HISTORY-PAGE-001 (UNVERIFIED)")),
+        }
+    };
     Ok((out, link))
 }
 
@@ -168,16 +169,16 @@ impl TeamsClient {
                 });
             }
             let (messages, link) = parse(&response.body)?;
+            if let Some(link) = &link {
+                validate_cursor(link, &path)?;
+            }
             out.extend(messages);
             if out.len() >= top {
                 out.truncate(top);
                 return Ok(out);
             }
             match link {
-                Some(link) => {
-                    validate_cursor(&link, &path)?;
-                    next = link;
-                }
+                Some(link) => next = link,
                 None => return Ok(out),
             }
         }
@@ -349,6 +350,79 @@ mod tests {
             .await
             .is_err());
         assert!(exec.ops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_state_url_fetches_multiple_pages() {
+        let exec = fake(&[
+            r#"{"messages":[{"id":"1"}],"_metadata":{"syncState":"/v1/users/ME/conversations/48:notes/messages?cursor=2"}}"#,
+            r#"{"messages":[{"id":"2"}],"_metadata":{"syncState":"https://amer.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notes/messages?cursor=3"}}"#,
+            r#"{"messages":[{"id":"3"}]}"#,
+        ]);
+        let result = TeamsClient::new(exec.clone())
+            .history("48:notes", 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+        assert_eq!(exec.ops.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sync_state_rejects_unsafe_and_ambiguous_values_without_partial_results() {
+        for value in [
+            serde_json::json!("opaque-secret"),
+            serde_json::json!({"cursor": "secret"}),
+            serde_json::json!("//evil.example/v1/users/ME/conversations/48:notes/messages"),
+            serde_json::json!(
+                "https://user@evil.example/v1/users/ME/conversations/48:notes/messages"
+            ),
+            serde_json::json!("http://evil.example/v1/users/ME/conversations/48:notes/messages"),
+            serde_json::json!("/v1/users/ME/conversations/other/messages"),
+            serde_json::json!("/v1/users/ME/conversations/48:notes/../notes/messages"),
+        ] {
+            let body =
+                serde_json::json!({"messages": [{"id": "1"}], "_metadata": {"syncState": value}})
+                    .to_string();
+            let (messages, link) = match parse(body.as_bytes()) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    assert!(!e.to_string().contains("secret"));
+                    continue;
+                }
+            };
+            assert_eq!(messages.len(), 1);
+            let error = validate_cursor(
+                link.as_deref().unwrap(),
+                "/v1/users/ME/conversations/48:notes/messages",
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_state_loop_fails_without_partial_results() {
+        let exec = fake(&[
+            r#"{"messages":[{"id":"1"}],"_metadata":{"syncState":"/v1/users/ME/conversations/48:notes/messages?cursor=2"}}"#,
+            r#"{"messages":[{"id":"2"}],"_metadata":{"syncState":"/v1/users/ME/conversations/48:notes/messages?cursor=2"}}"#,
+        ]);
+        assert!(TeamsClient::new(exec.clone())
+            .history("48:notes", 3)
+            .await
+            .is_err());
+        assert_eq!(exec.ops.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn backward_link_takes_precedence_over_sync_state() {
+        let (_, link) = parse(br#"{"messages":[],"_metadata":{"backwardLink":"/v1/users/ME/conversations/48:notes/messages?cursor=2","syncState":{"unexpected":true}}}"#).unwrap();
+        assert_eq!(
+            link.as_deref(),
+            Some("/v1/users/ME/conversations/48:notes/messages?cursor=2")
+        );
     }
 
     #[tokio::test]

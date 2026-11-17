@@ -760,6 +760,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_cursor_external_host_is_rejected_before_transport() {
+        let api = FakeApi::script(vec![]);
+        let h = harness(api.clone(), None);
+        let err = h.exec.execute(op(Resource::ChatService,
+            "https://evil.example/v1/users/ME/conversations/48:notes/messages?cursor=syntheticsecret"
+        )).await.unwrap_err();
+        assert!(matches!(err, ExecError::HostNotAllowed { .. }));
+        assert!(!err.to_string().contains("syntheticsecret"));
+        assert!(api.seen().is_empty());
+    }
+
+    #[tokio::test]
     async fn protocol_relative_or_misplaced_relative_urls_are_refused() {
         for (resource, url) in [
             (Resource::ChatService, "//evil.example/v1/x"),
