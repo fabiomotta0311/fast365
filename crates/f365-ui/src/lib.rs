@@ -11,7 +11,7 @@
 //! CLI) e entrega os eventos por [`PumpHandle`]. Assim o runtime é testável sem provider nenhum.
 
 use f365_auth::Clock;
-use f365_ipc::{ConversationDto, DerivativeDto, IpcError, MessageDto, RoundDto, Shell};
+use f365_ipc::{ConversationDto, DerivativeDto, IpcError, MessageDto, OlderDto, RoundDto, Shell};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -135,6 +135,14 @@ impl App {
         self.shell.me()
     }
 
+    pub fn draft(&self, conversation_id: &str) -> Result<Option<String>, IpcError> {
+        self.shell.draft(conversation_id)
+    }
+
+    pub fn set_draft(&self, conversation_id: &str, text: &str) -> Result<(), IpcError> {
+        self.shell.set_draft(conversation_id, text)
+    }
+
     pub fn derivatives(&self, message_id: &str) -> Result<Vec<DerivativeDto>, IpcError> {
         self.shell.derivatives(message_id)
     }
@@ -155,6 +163,13 @@ impl App {
         let round = self.shell.send(conversation_id, text).await?;
         self.note(&round);
         Ok(round)
+    }
+
+    /// "Carregar mais histórico" da conversa.
+    pub async fn older(&mut self, conversation_id: &str) -> Result<OlderDto, IpcError> {
+        let older = self.shell.load_older(conversation_id).await?;
+        self.note(&older.round);
+        Ok(older)
     }
 
     pub async fn connection_restored(&mut self) -> Result<RoundDto, IpcError> {

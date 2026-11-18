@@ -43,6 +43,9 @@ const ONE_ON_ONE_TITLE_PREFIX: &str = "1:1 · ";
 /// Teto de conversas varridas ao completar títulos a partir do cache.
 const TITLE_REPAIR_LIMIT: usize = 500;
 
+/// Teto da janela de histórico por conversa. É o limite do provider (`HISTORY-PAGE-001`).
+pub const MAX_HISTORY: usize = 1000;
+
 /// Buscas de histórico por `refresh` para descobrir o nome de um 1:1 (uma por conversa pendente).
 const NAMES_FETCH_LIMIT: usize = 25;
 
@@ -307,6 +310,9 @@ pub struct Driver {
     capabilities: Capabilities,
     generation: u64,
     top: usize,
+    /// Janela de histórico por conversa, quando o usuário rolou além do `top`. O provider só
+    /// entrega "as N mais novas", então "carregar mais" é aprofundar essa janela.
+    depth: BTreeMap<ConversationId, usize>,
     /// Texto por envio. Some no restart — e então o envio fica sem como sair (ver `send`).
     pending_text: BTreeMap<ClientMessageId, String>,
     /// Renovação silenciosa de token: o driver só agenda, quem renova é o keeper.
@@ -333,6 +339,7 @@ impl Driver {
             capabilities: Capabilities::new(now, SessionGeneration(1)),
             generation: 1,
             top: 30,
+            depth: BTreeMap::new(),
             pending_text: BTreeMap::new(),
             token_keeper: None,
             refresh_at: None,
@@ -370,6 +377,20 @@ impl Driver {
     pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
         self.middleware = Some(middleware);
         self
+    }
+
+    /// Aprofunda a janela de histórico da conversa em `step` mensagens (até [`MAX_HISTORY`]) e
+    /// devolve a nova profundidade. Não busca nada: quem pede a busca é o motor (`Invalidated`).
+    pub fn deepen(&mut self, conversation: &ConversationId, step: usize) -> usize {
+        let current = self.depth.get(conversation).copied().unwrap_or(self.top);
+        let next = current.saturating_add(step.max(1)).min(MAX_HISTORY);
+        self.depth.insert(conversation.clone(), next);
+        next
+    }
+
+    /// Janela de histórico em uso na conversa.
+    pub fn history_depth(&self, conversation: &ConversationId) -> usize {
+        self.depth.get(conversation).copied().unwrap_or(self.top)
     }
 
     pub fn with_top(mut self, top: usize) -> Self {
@@ -577,7 +598,8 @@ impl Driver {
         round: &mut Round,
     ) -> Result<(Outcome, Vec<ClientMessageId>), DriverError> {
         let now = self.clock.now();
-        match self.client.history(&conversation.0, self.top).await {
+        let top = self.history_depth(conversation);
+        match self.client.history(&conversation.0, top).await {
             Ok(messages) => {
                 let now_ms = self.now_ms();
                 self.store.ensure_conversation(&conversation.0, now_ms)?;
@@ -2192,5 +2214,36 @@ mod tests {
             .iter()
             .any(|effect| matches!(effect, Effect::Derived { .. })));
         assert!(driver.store().derivatives_for("m1").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deepening_widens_the_history_window_for_that_conversation_only() {
+        let exec = FakeExec::replying(vec![ok(200, TWO_MESSAGES), ok(200, TWO_MESSAGES)]);
+        let (_clock, driver) = driver(exec.clone());
+        let mut driver = driver.with_top(30);
+        let other = ConversationId("19:outra@thread.v2".into());
+
+        assert_eq!(driver.deepen(&conv(), 50), 80);
+        assert_eq!(driver.history_depth(&conv()), 80);
+        assert_eq!(driver.history_depth(&other), 30, "outra conversa não muda");
+
+        driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+        assert!(
+            exec.urls().iter().any(|url| url.contains("pageSize=80")),
+            "a busca usou a janela aprofundada: {:?}",
+            exec.urls()
+        );
+    }
+
+    #[test]
+    fn deepening_is_capped_at_the_provider_limit() {
+        let (_clock, mut driver) = driver(FakeExec::replying(vec![]));
+        assert_eq!(driver.deepen(&conv(), 990), MAX_HISTORY);
+        assert_eq!(driver.deepen(&conv(), 50), MAX_HISTORY, "não passa do teto");
     }
 }

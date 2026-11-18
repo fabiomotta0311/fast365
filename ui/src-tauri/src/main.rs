@@ -16,7 +16,7 @@ use f365_auth::transport::RustTransport;
 use f365_auth::vault::Vault;
 use f365_auth::{AuthenticatedExecutor, Clock, SystemClock};
 use f365_driver::Driver;
-use f365_ipc::{ConversationDto, DerivativeDto, MessageDto, RoundDto, Shell};
+use f365_ipc::{ConversationDto, DerivativeDto, MessageDto, OlderDto, RoundDto, Shell};
 use f365_storage::Store;
 use f365_ui::{channel, App, Inbound, PumpHandle, RealtimeLink};
 use serde::Serialize;
@@ -50,6 +50,22 @@ enum Request {
     },
     Capabilities {
         reply: Reply<Vec<String>>,
+    },
+    /// Rascunho salvo da conversa.
+    Draft {
+        conversation_id: String,
+        reply: Reply<Option<String>>,
+    },
+    /// Grava (ou apaga, se vazio) o rascunho da conversa.
+    SetDraft {
+        conversation_id: String,
+        text: String,
+        reply: Reply<()>,
+    },
+    /// Carregar mais histórico da conversa (aprofunda a janela e busca).
+    Older {
+        conversation_id: String,
+        reply: Reply<OlderDto>,
     },
     /// Meu nome de exibição (para alinhar as minhas mensagens).
     Me { reply: Reply<Option<String>> },
@@ -115,6 +131,9 @@ fn main() {
             messages,
             search,
             capabilities,
+            draft,
+            set_draft,
+            older,
             me,
             derivatives,
             approve_derivative,
@@ -206,6 +225,32 @@ async fn serve(core: &mut App, request: Request) {
         Request::Capabilities { reply } => {
             let _ = reply.send(Ok(core.capabilities()));
         }
+        Request::Draft {
+            conversation_id,
+            reply,
+        } => {
+            let _ = reply.send(core.draft(&conversation_id).map_err(|error| error.to_string()));
+        }
+        Request::SetDraft {
+            conversation_id,
+            text,
+            reply,
+        } => {
+            let _ = reply.send(
+                core.set_draft(&conversation_id, &text)
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        Request::Older {
+            conversation_id,
+            reply,
+        } => {
+            let _ = reply.send(
+                core.older(&conversation_id)
+                    .await
+                    .map_err(|error| error.to_string()),
+            );
+        }
         Request::Me { reply } => {
             let _ = reply.send(Ok(core.me()));
         }
@@ -269,6 +314,15 @@ async fn serve_failing(requests: &mut mpsc::Receiver<Request>, why: String) {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Capabilities { reply } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::Draft { reply, .. } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::SetDraft { reply, .. } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::Older { reply, .. } => {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Me { reply } => {
@@ -391,6 +445,44 @@ async fn search(
 #[tauri::command]
 async fn capabilities(core: tauri::State<'_, CoreHandle>) -> Result<Vec<String>, String> {
     core.ask(|reply| Request::Capabilities { reply }).await
+}
+
+#[tauri::command]
+async fn draft(
+    core: tauri::State<'_, CoreHandle>,
+    conversation_id: String,
+) -> Result<Option<String>, String> {
+    core.ask(|reply| Request::Draft {
+        conversation_id,
+        reply,
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_draft(
+    core: tauri::State<'_, CoreHandle>,
+    conversation_id: String,
+    text: String,
+) -> Result<(), String> {
+    core.ask(|reply| Request::SetDraft {
+        conversation_id,
+        text,
+        reply,
+    })
+    .await
+}
+
+#[tauri::command]
+async fn older(
+    core: tauri::State<'_, CoreHandle>,
+    conversation_id: String,
+) -> Result<OlderDto, String> {
+    core.ask(|reply| Request::Older {
+        conversation_id,
+        reply,
+    })
+    .await
 }
 
 #[tauri::command]
