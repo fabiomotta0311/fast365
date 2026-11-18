@@ -313,6 +313,33 @@ impl Vault {
         self.save(&session, stored.captured_at)
     }
 
+    /// Apaga a sessão salva (RT, cookies e conta) — o "sair" do `f365 logout`.
+    ///
+    /// Devolve o UPN removido (não é segredo) ou `None` se não havia sessão. Ordem importa: o
+    /// ponteiro da conta ativa só sai **depois** de a geração ter sumido por inteiro; se algo
+    /// falhar no meio, o ponteiro continua e rodar de novo termina o serviço. Um ponteiro ilegível
+    /// não impede o logout (é exatamente o estado que o usuário quer limpar).
+    ///
+    /// Limite conhecido: o keyring não é enumerável por aqui, então só a geração apontada é
+    /// removida; restos de uma escrita interrompida (que já são removidos na falha) não são
+    /// procurados.
+    pub fn logout(&self) -> Result<Option<String>, VaultError> {
+        let pointer = self.pointer().unwrap_or(None);
+        if let Some(ptr) = &pointer {
+            let prefix = ptr.prefix();
+            self.remove_generation(&prefix);
+            for field in FIELDS {
+                if self.store.get(&format!("{prefix}/{field}#n"))?.is_some() {
+                    return Err(VaultError::Store(
+                        "parte da sessão continua no keyring; rode `f365 logout` de novo".into(),
+                    ));
+                }
+            }
+        }
+        self.store.remove(ACTIVE_KEY)?;
+        Ok(pointer.map(|ptr| ptr.upn))
+    }
+
     /// Sessão completa (com segredos) da conta ativa — uso interno de `f365-auth`.
     pub(crate) fn load_session(&self) -> Result<Option<CapturedSession>, VaultError> {
         let Some(ptr) = self.pointer()? else {
@@ -783,5 +810,64 @@ mod tests {
             KeyringStore::new(SERVICE).put("k", b"v"),
             Err(VaultError::Store(_))
         ));
+    }
+
+    #[test]
+    fn logout_removes_the_whole_session_and_reports_the_upn() {
+        let store = TestStore::default();
+        let v = vault(&store);
+        v.save(&session('r', 5_000, 3_000), UNIX_EPOCH).unwrap();
+        assert!(v.active_account().unwrap().is_some());
+
+        let removed = v.logout().unwrap();
+
+        assert_eq!(removed.as_deref(), Some("fulano@empresa.com"));
+        assert_eq!(v.active_account().unwrap(), None);
+        assert_eq!(v.load_session().unwrap(), None);
+        assert!(
+            store.data.lock().unwrap().is_empty(),
+            "não pode sobrar nenhuma credencial no keyring"
+        );
+    }
+
+    #[test]
+    fn logout_without_session_is_a_noop() {
+        let store = TestStore::default();
+        assert_eq!(vault(&store).logout().unwrap(), None);
+    }
+
+    #[test]
+    fn failed_logout_keeps_the_pointer_so_it_can_be_retried() {
+        let store = TestStore::default();
+        let v = vault(&store);
+        v.save(&session('r', 100, 100), UNIX_EPOCH).unwrap();
+
+        *store.fail_removes.lock().unwrap() = true;
+        assert!(
+            v.logout().is_err(),
+            "remoção falhou: não pode fingir que saiu"
+        );
+        assert!(
+            store.raw(ACTIVE_KEY).is_some(),
+            "o ponteiro fica para a segunda tentativa"
+        );
+
+        *store.fail_removes.lock().unwrap() = false;
+        assert_eq!(v.logout().unwrap().as_deref(), Some("fulano@empresa.com"));
+        assert!(store.data.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn logout_clears_a_corrupt_pointer() {
+        let store = TestStore::default();
+        store
+            .data
+            .lock()
+            .unwrap()
+            .insert(ACTIVE_KEY.into(), vec![0xff, 0xfe]);
+        let v = vault(&store);
+
+        assert_eq!(v.logout().unwrap(), None);
+        assert!(store.raw(ACTIVE_KEY).is_none());
     }
 }

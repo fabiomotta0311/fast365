@@ -16,6 +16,7 @@ mod chats_cmd;
 mod gate_cmd;
 mod history_cmd;
 mod listen_cmd;
+mod logout_cmd;
 mod send_cmd;
 mod session_cmd;
 mod sync_cmd;
@@ -42,6 +43,17 @@ enum Command {
         /// Microsoft pedir login. É o que o re-pareamento automático usa.
         #[arg(long)]
         silent: bool,
+    },
+    /// Apaga a sessão local (keyring + perfil da WebView) para trocar de conta.
+    ///
+    /// Só o dono, num terminal normal. O cache de mensagens fica, a menos que `--cache`.
+    Logout {
+        /// Apaga também o cache local de mensagens (`f365-cache.db`).
+        #[arg(long)]
+        cache: bool,
+        /// Não pergunta antes de apagar (necessário fora de um terminal).
+        #[arg(long)]
+        yes: bool,
     },
     /// Lista conversas/canais (troca de tokens + GET chatsvcagg).
     Chats {
@@ -127,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Auth { silent } => session_cmd::auth(silent)?,
+        Command::Logout { cache, yes } => logout_cmd::logout(cache, yes)?,
         Command::Chats { top, fields } => chats_cmd::chats(top, fields).await?,
         Command::Gate {
             chat,
