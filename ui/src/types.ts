@@ -33,6 +33,12 @@ export type Derivative = {
   source_message_ids: string[];
 };
 
+/** Resultado de "carregar mais histórico". `reached_start` = o provider não tem mais nada. */
+export type OlderResult = {
+  round: Round;
+  reached_start: boolean;
+};
+
 export type Effect =
   | { kind: "conversations_refreshed"; count: number }
   | { kind: "fetched"; conversation: string; messages: number }

@@ -96,6 +96,18 @@ impl From<Derivative> for DerivativeDto {
     }
 }
 
+/// Resultado de "carregar mais histórico".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OlderDto {
+    pub round: RoundDto,
+    /// `true` quando o provider já entregou tudo o que tinha (ou o teto de 1000 foi atingido): a
+    /// UI para de pedir mais. `false` também quando a busca não rodou (ex.: já em andamento).
+    pub reached_start: bool,
+}
+
+/// Quantas mensagens a mais cada "carregar mais" pede ao provider.
+const OLDER_STEP: usize = 50;
+
 /// Efeito de uma rodada do motor, no dialeto da UI (tagged enum, fácil de consumir em TS).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -307,6 +319,34 @@ impl Shell {
             .collect()
     }
 
+    /// Rascunho salvo da conversa (sobrevive a reinício). `None` = não há.
+    pub fn draft(&self, conversation_id: &str) -> Result<Option<String>, IpcError> {
+        if conversation_id.trim().is_empty() {
+            return Err(IpcError::BadConversation);
+        }
+        Ok(self.driver.store().draft(conversation_id)?)
+    }
+
+    /// Grava o rascunho; texto vazio apaga. A conversa precisa existir no cache.
+    pub fn set_draft(&self, conversation_id: &str, text: &str) -> Result<(), IpcError> {
+        if conversation_id.trim().is_empty() {
+            return Err(IpcError::BadConversation);
+        }
+        let store = self.driver.store();
+        if text.trim().is_empty() {
+            store.delete_draft(conversation_id)?;
+        } else {
+            let now_ms = self
+                .clock
+                .utc_now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as i64)
+                .unwrap_or(0);
+            store.put_draft(conversation_id, text, now_ms)?;
+        }
+        Ok(())
+    }
+
     /// Meu nome de exibição, aprendido da listagem. A UI usa para alinhar as minhas mensagens.
     pub fn me(&self) -> Option<String> {
         self.driver.store().my_display_name().ok().flatten()
@@ -388,6 +428,40 @@ impl Shell {
         let conversation = ConversationId(conversation_id.to_string());
         let round = self.driver.send_message(&conversation, text).await?;
         Ok(RoundDto::new(round, self.clock.now()))
+    }
+
+    /// "Carregar mais histórico": aprofunda a janela da conversa e deixa o motor buscá-la.
+    ///
+    /// O provider só entrega "as N mais novas" (`HISTORY-PAGE-001`, UNVERIFIED); então isto pede
+    /// mais N e relê. Mensagens já em cache são regravadas sem duplicar. `reached_start` diz à UI
+    /// quando parar de pedir.
+    pub async fn load_older(&mut self, conversation_id: &str) -> Result<OlderDto, IpcError> {
+        if conversation_id.trim().is_empty() {
+            return Err(IpcError::BadConversation);
+        }
+        let conversation = ConversationId(conversation_id.to_string());
+        let depth = self.driver.deepen(&conversation, OLDER_STEP);
+        let round = self
+            .driver
+            .drive(Event::Invalidated {
+                conversation: conversation.clone(),
+            })
+            .await?;
+        let fetched = round.effects.iter().find_map(|effect| match effect {
+            Effect::Fetched {
+                conversation: fetched,
+                messages,
+            } if *fetched == conversation => Some(*messages),
+            _ => None,
+        });
+        let reached_start = match fetched {
+            Some(count) => count < depth || depth >= f365_driver::MAX_HISTORY,
+            None => false,
+        };
+        Ok(OlderDto {
+            round: RoundDto::new(round, self.clock.now()),
+            reached_start,
+        })
     }
 
     /// O tempo real avisou que algo mudou (invalidação, não dado).
@@ -774,5 +848,66 @@ mod tests {
             .set_my_display_name("Fabio Motta", 1)
             .expect("nome");
         assert_eq!(shell.me().as_deref(), Some("Fabio Motta"));
+    }
+
+    // ---- rascunho e histórico mais antigo ----
+
+    #[tokio::test]
+    async fn draft_roundtrips_and_empty_text_deletes_it() {
+        let exec = FakeExec::replying(vec![ok(200, CHATS)]);
+        let (_clock, mut shell) = shell(exec);
+        shell.refresh_conversations().await.expect("conversas");
+
+        assert_eq!(shell.draft("19:a@thread.v2").unwrap(), None);
+        shell.set_draft("19:a@thread.v2", "rascunho").unwrap();
+        assert_eq!(
+            shell.draft("19:a@thread.v2").unwrap().as_deref(),
+            Some("rascunho")
+        );
+        shell.set_draft("19:a@thread.v2", "   ").unwrap();
+        assert_eq!(shell.draft("19:a@thread.v2").unwrap(), None);
+    }
+
+    #[test]
+    fn draft_commands_validate_the_conversation() {
+        let (_clock, shell) = shell(FakeExec::replying(vec![]));
+        assert!(matches!(shell.draft(" "), Err(IpcError::BadConversation)));
+        assert!(matches!(
+            shell.set_draft("", "x"),
+            Err(IpcError::BadConversation)
+        ));
+        assert!(
+            shell.set_draft("19:desconhecida", "x").is_err(),
+            "rascunho exige a conversa em cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_older_reports_the_start_when_the_provider_has_no_more() {
+        // HISTORY traz 2 mensagens; a janela pedida (30 + 50) é maior que isso.
+        let exec = FakeExec::replying(vec![ok(200, CHATS), ok(200, HISTORY), ok(200, HISTORY)]);
+        let (_clock, mut shell) = shell(exec.clone());
+        seed(&mut shell).await;
+
+        let older = shell.load_older("19:a@thread.v2").await.expect("mais");
+
+        assert!(older.reached_start);
+        assert!(exec.calls() >= 3, "buscou de novo");
+        assert!(matches!(
+            shell.load_older("").await,
+            Err(IpcError::BadConversation)
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_older_without_a_fetch_does_not_claim_the_start() {
+        // Falha de rede na busca: não dá para afirmar que o começo foi alcançado.
+        let exec = FakeExec::replying(vec![ok(200, CHATS), ok(200, HISTORY), ok(500, "{}")]);
+        let (_clock, mut shell) = shell(exec);
+        seed(&mut shell).await;
+
+        let older = shell.load_older("19:a@thread.v2").await.expect("rodada");
+
+        assert!(!older.reached_start);
     }
 }

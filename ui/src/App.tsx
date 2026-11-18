@@ -5,11 +5,39 @@ import { ChatList } from "./components/ChatList";
 import { Rail } from "./components/Rail";
 import { Thread } from "./components/Thread";
 import { TitleBar } from "./components/TitleBar";
-import { describe, type Conversation, type Derivative, type Message, type Round } from "./types";
+import {
+  describe,
+  type Conversation,
+  type Derivative,
+  type Message,
+  type OlderResult,
+  type Round,
+} from "./types";
 import { useTheme } from "./useTheme";
 
 const LIST_LIMIT = 50;
 const PAGE_LIMIT = 100;
+/** Espera antes de gravar o rascunho (cada tecla não vira uma escrita). */
+const DRAFT_DEBOUNCE_MS = 400;
+
+/** Mais novas primeiro (como o cache devolve). */
+function byNewest(a: Message, b: Message): number {
+  return b.created_ms - a.created_ms || (a.id < b.id ? 1 : -1);
+}
+
+/** Atualiza a página mais nova sem perder as mais antigas já carregadas. */
+function mergeNewest(previous: Message[], page: Message[]): Message[] {
+  if (page.length === 0) return previous.length === 0 ? page : previous;
+  const oldestInPage = page[page.length - 1].created_ms;
+  const older = previous.filter((message) => message.created_ms < oldestInPage);
+  return [...page, ...older];
+}
+
+/** Acrescenta páginas mais antigas, sem duplicar. */
+function mergeOlder(previous: Message[], older: Message[]): Message[] {
+  const seen = new Set(previous.map((message) => message.id));
+  return [...previous, ...older.filter((message) => !seen.has(message.id))].sort(byNewest);
+}
 
 export default function App() {
   const [theme, toggleTheme] = useTheme();
@@ -24,9 +52,20 @@ export default function App() {
   const [realtime, setRealtime] = useState<boolean | null>(null);
   // Sobe quando o motor mexe em derivados: cada linha visível relê o seu do cache.
   const [derivativesVersion, setDerivativesVersion] = useState(0);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [reachedStart, setReachedStart] = useState(false);
 
   // Referência para os ouvintes de evento não capturarem estado velho.
   const selectedRef = useRef<Conversation | null>(null);
+  const messagesRef = useRef<Message[]>([]);
+  const draftRef = useRef("");
+  const savedDraftRef = useRef<{ id: string; text: string } | null>(null);
+  const olderBusyRef = useRef(false);
+  const reachedStartRef = useRef(false);
+
+  messagesRef.current = messages;
+  draftRef.current = draft;
+  reachedStartRef.current = reachedStart;
 
   const reloadMessages = useCallback(async (conversation: Conversation) => {
     try {
@@ -35,7 +74,9 @@ export default function App() {
         beforeMs: null,
         limit: PAGE_LIMIT,
       });
-      setMessages(page);
+      // A conversa pode ter mudado durante a espera: não mistura mensagens de outra.
+      if (selectedRef.current?.id !== conversation.id) return;
+      setMessages((previous) => mergeNewest(previous, page));
     } catch (error) {
       setStatus(String(error));
     }
@@ -138,11 +179,97 @@ export default function App() {
     }
   }, [conversations]);
 
+  /** Grava o rascunho (vazio apaga). Falha não atrapalha a digitação. */
+  const saveDraft = useCallback(async (conversationId: string, text: string) => {
+    if (savedDraftRef.current?.id === conversationId && savedDraftRef.current.text === text) return;
+    try {
+      await invoke("set_draft", { conversationId, text });
+      savedDraftRef.current = { id: conversationId, text };
+    } catch {
+      /* sem core/sessão: o rascunho fica só na tela */
+    }
+  }, []);
+
+  // Rascunho com atraso: grava ~400 ms depois da última tecla.
+  useEffect(() => {
+    const current = selected;
+    if (!current) return;
+    const timer = window.setTimeout(() => void saveDraft(current.id, draft), DRAFT_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [draft, selected, saveDraft]);
+
+  // Ao perder o foco da janela, grava na hora (não espera o atraso).
+  useEffect(() => {
+    const flush = () => {
+      const current = selectedRef.current;
+      if (current) void saveDraft(current.id, draftRef.current);
+    };
+    window.addEventListener("blur", flush);
+    return () => window.removeEventListener("blur", flush);
+  }, [saveDraft]);
+
+  /** Carrega mensagens mais antigas: primeiro do cache; se acabou, pede mais ao provider. */
+  const loadOlder = useCallback(async () => {
+    const current = selectedRef.current;
+    if (!current || olderBusyRef.current || reachedStartRef.current) return;
+    const oldest = messagesRef.current[messagesRef.current.length - 1];
+    if (!oldest) return;
+    olderBusyRef.current = true;
+    setLoadingOlder(true);
+    const fromCache = () =>
+      invoke<Message[]>("messages", {
+        conversationId: current.id,
+        beforeMs: oldest.created_ms,
+        limit: PAGE_LIMIT,
+      });
+    try {
+      let page = await fromCache();
+      let providerDone = false;
+      if (page.length === 0) {
+        const older = await invoke<OlderResult>("older", { conversationId: current.id });
+        applyRound(older.round);
+        providerDone = older.reached_start;
+        page = await fromCache();
+        if (page.length === 0 && !providerDone) {
+          setStatus("não foi possível carregar mais mensagens agora");
+        }
+      }
+      if (selectedRef.current?.id === current.id) {
+        if (page.length > 0) setMessages((previous) => mergeOlder(previous, page));
+        // O provider não tem mais e o cache se esgotou nesta página: acabou o histórico.
+        if (providerDone && page.length < PAGE_LIMIT) setReachedStart(true);
+      }
+    } catch (error) {
+      setStatus(String(error));
+    } finally {
+      olderBusyRef.current = false;
+      setLoadingOlder(false);
+    }
+  }, [applyRound]);
+
   const select = useCallback(
     async (conversation: Conversation) => {
+      // Rascunho da conversa que está saindo: grava antes de trocar.
+      const leaving = selectedRef.current;
+      if (leaving && leaving.id !== conversation.id) {
+        void saveDraft(leaving.id, draftRef.current);
+      }
       selectedRef.current = conversation;
       setSelected(conversation);
       setMessages([]);
+      setReachedStart(false);
+      setDraft("");
+      // O rascunho salvo desta conversa (se não digitaram nada nesse meio-tempo).
+      void invoke<string | null>("draft", { conversationId: conversation.id })
+        .then((saved) => {
+          savedDraftRef.current = { id: conversation.id, text: saved ?? "" };
+          if (saved && selectedRef.current?.id === conversation.id && draftRef.current === "") {
+            setDraft(saved);
+          }
+        })
+        .catch(() => {
+          /* sem rascunho salvo */
+        });
       // Primeiro o que já está em cache (render-before-network)…
       await reloadMessages(conversation);
       // …depois busca o histórico no provider. Invalidação é o que o motor entende por
@@ -175,11 +302,12 @@ export default function App() {
     try {
       applyRound(await invoke<Round>("send", { conversationId: current.id, text: draft }));
       setDraft("");
+      void saveDraft(current.id, ""); // enviado: o rascunho some
       await reloadMessages(current);
     } catch (error) {
       setStatus(String(error));
     }
-  }, [applyRound, draft, reloadMessages]);
+  }, [applyRound, draft, reloadMessages, saveDraft]);
 
   /** Aprova o derivado e envia **exatamente** o texto aprovado (o que o backend devolveu). */
   const approveAndSend = useCallback(
@@ -222,6 +350,9 @@ export default function App() {
           onApprove={(derivative, conversationId) =>
             void approveAndSend(derivative, conversationId)
           }
+          onReachTop={() => void loadOlder()}
+          loadingOlder={loadingOlder}
+          reachedStart={reachedStart}
         />
       </div>
 

@@ -24,7 +24,39 @@ const messages: Message[] = [
   { id: "m5", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: ME, body: "Eu reviso. Mando até as 14h.", message_type: "Text", created_ms: T0 + 900_000 },
 ];
 
+// Conversa longa para exercitar a rolagem e o "carregar mais".
+for (let i = 0; i < 45; i++) {
+  messages.push({
+    id: `long-${i}`,
+    conversation_id: "19:cliente@thread.v2",
+    client_message_id: null,
+    sender: i % 4 === 0 ? ME : "Camila Rocha",
+    body: `Mensagem sintética ${i + 1} da conversa longa.`,
+    message_type: "Text",
+    created_ms: T0 - 86_400_000 + i * 60_000,
+  });
+}
+
 let nextId = 100;
+let olderRounds = 0;
+const drafts: Record<string, string> = {};
+
+/** Gera mensagens antigas sintéticas (antes da mais antiga) para testar "carregar mais". */
+function addOlder(conversationId: string, count: number): void {
+  const mine = messages.filter((m) => m.conversation_id === conversationId);
+  const oldest = Math.min(...mine.map((m) => m.created_ms));
+  for (let i = 1; i <= count; i++) {
+    messages.push({
+      id: `old-${nextId++}`,
+      conversation_id: conversationId,
+      client_message_id: null,
+      sender: i % 3 === 0 ? ME : "Bruno Alves",
+      body: `Mensagem antiga sintética ${olderRounds}-${i}`,
+      message_type: "Text",
+      created_ms: oldest - i * 120_000,
+    });
+  }
+}
 const derivatives: Record<string, Derivative[]> = {
   m1: [
     { id: 1, kind: "translation", model: "demo@1", lang: "pt", body: "Você pode enviar o relatório trimestral até sexta?", created_ms: T0, approved_ms: null, stale: false, source_message_ids: ["m1"] },
@@ -46,10 +78,25 @@ export function startDemo(): void {
       switch (command) {
         case "conversations":
           return conversations;
-        case "messages":
+        case "messages": {
+          const before = typeof args.beforeMs === "number" ? args.beforeMs : Infinity;
+          const limit = typeof args.limit === "number" ? args.limit : 100;
           return messages
-            .filter((m) => m.conversation_id === args.conversationId)
-            .sort((a, b) => b.created_ms - a.created_ms);
+            .filter((m) => m.conversation_id === args.conversationId && m.created_ms < before)
+            .sort((a, b) => b.created_ms - a.created_ms)
+            .slice(0, limit);
+        }
+        case "older": {
+          olderRounds += 1;
+          addOlder(String(args.conversationId), olderRounds === 1 ? 40 : 10);
+          return { round: round(), reached_start: olderRounds >= 2 };
+        }
+        case "draft":
+          return drafts[String(args.conversationId)] ?? null;
+        case "set_draft":
+          if (String(args.text).trim() === "") delete drafts[String(args.conversationId)];
+          else drafts[String(args.conversationId)] = String(args.text);
+          return null;
         case "capabilities":
           return round().capabilities;
         case "me":
