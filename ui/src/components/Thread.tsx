@@ -20,6 +20,10 @@ type Props = {
   onDraft: (value: string) => void;
   onSend: () => void;
   onApprove: (derivative: Derivative, conversationId: string) => void;
+  /** Rolou até o topo: pede mensagens mais antigas. */
+  onReachTop: () => void;
+  loadingOlder: boolean;
+  reachedStart: boolean;
 };
 
 export function Thread({
@@ -31,6 +35,9 @@ export function Thread({
   onDraft,
   onSend,
   onApprove,
+  onReachTop,
+  loadingOlder,
+  reachedStart,
 }: Props) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
 
@@ -43,11 +50,30 @@ export function Thread({
     overscan: 8,
   });
 
-  // Ao abrir a conversa ou chegar mensagem nova no fim, acompanha o fim da lista.
+  // Posição da lista: ao abrir a conversa ou chegar mensagem nova no fim, vai para o fim; ao
+  // carregar mensagens mais antigas (entram no começo), mantém a que estava à vista.
+  const lastRef = useRef<{ conv: string | null; oldest: string | null; newest: string | null }>({
+    conv: null,
+    oldest: null,
+    newest: null,
+  });
   useEffect(() => {
-    if (chronological.length === 0) return;
-    virtualizer.scrollToIndex(chronological.length - 1, { align: "end" });
-  }, [conversation?.id, chronological.length, virtualizer]);
+    const conv = conversation?.id ?? null;
+    if (chronological.length === 0) {
+      lastRef.current = { conv, oldest: null, newest: null };
+      return;
+    }
+    const oldest = chronological[0].id;
+    const newest = chronological[chronological.length - 1].id;
+    const previous = lastRef.current;
+    if (previous.conv !== conv || previous.newest === null || previous.newest !== newest) {
+      virtualizer.scrollToIndex(chronological.length - 1, { align: "end" });
+    } else if (previous.oldest !== oldest) {
+      const index = chronological.findIndex((message) => message.id === previous.oldest);
+      if (index > 0) virtualizer.scrollToIndex(index, { align: "start" });
+    }
+    lastRef.current = { conv, oldest, newest };
+  }, [conversation?.id, chronological, virtualizer]);
 
   if (!conversation) {
     return (
@@ -76,7 +102,20 @@ export function Thread({
           <div className="fx-empty__sub">Ainda não há mensagens em cache aqui.</div>
         </div>
       ) : (
-        <div className="fx-thread__scroll fx-scroll" ref={scrollerRef}>
+        <div
+          className="fx-thread__scroll fx-scroll"
+          ref={scrollerRef}
+          onScroll={(event) => {
+            if (event.currentTarget.scrollTop < 80 && !loadingOlder && !reachedStart) onReachTop();
+          }}
+        >
+          <div className="fx-older" aria-live="polite">
+            {loadingOlder
+              ? "Carregando mensagens anteriores…"
+              : reachedStart
+                ? "Início da conversa"
+                : ""}
+          </div>
           <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
             {virtualizer.getVirtualItems().map((item) => {
               const message = chronological[item.index];
