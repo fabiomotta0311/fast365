@@ -25,13 +25,28 @@ Abordagem: **emular o cliente web oficial** (sem Graph API, sem aprovação de a
 
 ## Status
 
-**Fase 0 — Gate de viabilidade (em aberto).** Nada de UI, persistência ou features começa antes do
-**Go** da matriz de aceite (`docs/ARQUITETURA.md` §2.4). Esqueleto do workspace no ar e CI verde.
+**Fase 0 — gate de viabilidade: Go pendente.** O código dos checkpoints A–E existe e a **rodada 1**
+(A–F verdes) está registrada nos comentários da
+[#13](https://github.com/fabiomotta0311/fast365/issues/13), relatada pelo dono. Falta a **rodada 2**
+independente e o bloco de decisão; ela está **adiada** porque a conta de trabalho não está mais
+disponível (ver [`docs/GATE-FASE0.md`](docs/GATE-FASE0.md)). `f365 gate` roda os checkpoints
+mecanizáveis e grava o relatório sanitizado de cada rodada.
 
-A **rodada 1** da matriz (A–F) está registrada nos comentários da
-[#13](https://github.com/fabiomotta0311/fast365/issues/13); falta a **rodada 2** independente e o bloco
-de decisão. `f365 gate` roda os checkpoints mecanizáveis e grava o relatório sanitizado de cada rodada
-([protocolo](docs/GATE-FASE0.md)).
+**Já implementado nas branches de integração** (`next/fase-2`, `next/fase-3`), **ainda fora do `main`**:
+
+- **Fase 2:** cache SQLite (WAL + FTS5), motor de sync determinístico (FSM), disponibilidade por
+  capacidade, driver, refresh em background, reconexão do tempo real e `f365 sync`.
+- **Fase 3:** contrato IPC, runtime, shell Tauri e frontend React no estilo do Teams (conversa
+  virtualizada, HTML sanitizado com DOMPurify), histórico sob demanda e rascunhos.
+- **Fase 4 (parcial):** modelo de fatos × derivados (#22), seam de middleware `pre_send`/`post_receive`
+  e derivados na conversa. Ainda não há provedor de tradução.
+- **Ferramentas:** `f365 logout` (troca de conta); empacotamento MSI/NSIS e CSP configurados.
+
+**Não verificado:** o instalador e o cold start (precisam de `tauri build` num Windows) e o app com
+dados reais do Teams. A UI foi conferida só com dados sintéticos (`?demo`).
+
+**Regra do gate:** as Fases 2–4 avançaram antes do Go por decisão do dono; o merge delas no `main`
+continua bloqueado até o Go (`AGENTS.md`, "Gate primeiro").
 
 ## Roadmap (por fase → Issues)
 
@@ -50,13 +65,13 @@ para o que um agente pode pegar agora.
 - Teams: [#10](https://github.com/fabiomotta0311/fast365/issues/10) `chats` (C) · [#11](https://github.com/fabiomotta0311/fast365/issues/11) `listen` (D) · [#12](https://github.com/fabiomotta0311/fast365/issues/12) `send` (E)
 - **[#13](https://github.com/fabiomotta0311/fast365/issues/13) Rodar a matriz A–F → decisão Go/No-Go**
 
-### Fase 2 · Persistência & resiliência *(após o Go)*
+### Fase 2 · Persistência & resiliência *(após o Go — implementada em `next/fase-2`, fora do `main`)*
 - [#14](https://github.com/fabiomotta0311/fast365/issues/14) SQLite WAL + FTS5 · [#15](https://github.com/fabiomotta0311/fast365/issues/15) motor de sync reproduzível · [#16](https://github.com/fabiomotta0311/fast365/issues/16) refresh/reconexão · [#17](https://github.com/fabiomotta0311/fast365/issues/17) catálogo de evidências · [#18](https://github.com/fabiomotta0311/fast365/issues/18) disponibilidade por capacidade
 
-### Fase 3 · UI (Tauri v2 + React)
+### Fase 3 · UI (Tauri v2 + React) *(implementada em `next/fase-3`; instalador não verificado)*
 - [#19](https://github.com/fabiomotta0311/fast365/issues/19) shell Tauri + empacotamento · [#20](https://github.com/fabiomotta0311/fast365/issues/20) frontend React/Fluent UI · [#21](https://github.com/fabiomotta0311/fast365/issues/21) fronteira IPC
 
-### Fase 4 · Busca, Outlook & features de IA
+### Fase 4 · Busca, Outlook & features de IA *(#22 feito em `next/fase-3`; #23–#26 pendentes)*
 - [#22](https://github.com/fabiomotta0311/fast365/issues/22) fatos × interpretações · [#23](https://github.com/fabiomotta0311/fast365/issues/23) provider Outlook · [#24](https://github.com/fabiomotta0311/fast365/issues/24) ata automática · [#25](https://github.com/fabiomotta0311/fast365/issues/25) tradução em tempo real · [#26](https://github.com/fabiomotta0311/fast365/issues/26) FTS5→tantivy
 
 ## Para quem contribui (humano ou agente)
