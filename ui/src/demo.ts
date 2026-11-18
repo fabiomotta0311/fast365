@@ -5,17 +5,23 @@ import type { Conversation, Derivative, Message, Round } from "./types";
  * Modo demo: o frontend roda num navegador comum (`npm run dev` + `?demo`) com dados sintéticos,
  * sem core, sem rede e sem sessão. Só entra no build de desenvolvimento (ver `main.tsx`).
  */
-const T0 = 1_704_067_200_000;
+const T0 = Date.now() - 3_600_000;
+
+const NOW = Date.now();
+const ME = "Fabio (demo)";
 
 const conversations: Conversation[] = [
-  { id: "19:demo@thread.v2", title: "Time de produto (demo)", kind: "chat", last_activity_ms: T0 + 900_000 },
-  { id: "19:outra@thread.v2", title: "Ana (demo)", kind: "oneOnOne", last_activity_ms: T0 },
+  { id: "19:demo@thread.v2", title: "Time de produto (demo)", kind: "chat", last_activity_ms: NOW - 120_000, preview: "Reunião movida para as 15h.", preview_sender: "Bruno Alves" },
+  { id: "19:outra@thread.v2", title: "Ana Souza (demo)", kind: "oneOnOne", last_activity_ms: NOW - 86_400_000, preview: "Can you send the quarterly report by Thursday?", preview_sender: "Ana Souza" },
+  { id: "19:cliente@thread.v2", title: "Projeto Ábax — Implantação", kind: "chat", last_activity_ms: NOW - 3 * 86_400_000, preview: "subiu a versão com o relatório de performance", preview_sender: ME },
 ];
 
 const messages: Message[] = [
-  { id: "m1", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: "Ana", body: "Can you send the quarterly report by Friday?", message_type: "Text", created_ms: T0 },
-  { id: "m2", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: "Ana", body: "Can you send the quarterly report by Thursday?", message_type: "Text", created_ms: T0 + 300_000 },
-  { id: "m3", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: "Bruno", body: "Reunião movida para as 15h.", message_type: "Text", created_ms: T0 + 600_000 },
+  { id: "m1", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: "Ana Souza", body: "Can you send the quarterly report by Friday?", message_type: "Text", created_ms: T0 },
+  { id: "m2", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: "Ana Souza", body: "Can you send the quarterly report by Thursday?", message_type: "Text", created_ms: T0 + 300_000 },
+  { id: "m3", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: "Bruno Alves", body: "Reunião movida para as 15h.", message_type: "Text", created_ms: T0 + 600_000 },
+  { id: "m4", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: "Bruno Alves", body: "Quem consegue revisar o deck antes?", message_type: "Text", created_ms: T0 + 660_000 },
+  { id: "m5", conversation_id: "19:demo@thread.v2", client_message_id: null, sender: ME, body: "Eu reviso. Mando até as 14h.", message_type: "Text", created_ms: T0 + 900_000 },
 ];
 
 let nextId = 100;
@@ -46,6 +52,8 @@ export function startDemo(): void {
             .sort((a, b) => b.created_ms - a.created_ms);
         case "capabilities":
           return round().capabilities;
+        case "me":
+          return ME;
         case "derivatives":
           return derivatives[String(args.messageId)] ?? [];
         case "approve_derivative": {
@@ -62,7 +70,7 @@ export function startDemo(): void {
             id: `m${nextId++}`,
             conversation_id: String(args.conversationId),
             client_message_id: null,
-            sender: "Você",
+            sender: ME,
             body: String(args.text),
             message_type: "Text",
             created_ms: Date.now(),

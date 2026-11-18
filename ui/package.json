@@ -11,6 +11,7 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@fluentui/react-icons": "^2.0.346",
     "@tanstack/react-virtual": "^3.14.26",
     "@tauri-apps/api": "^2",
     "dompurify": "^3.4.18",
