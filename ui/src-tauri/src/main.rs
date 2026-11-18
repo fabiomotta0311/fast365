@@ -16,7 +16,7 @@ use f365_auth::transport::RustTransport;
 use f365_auth::vault::Vault;
 use f365_auth::{AuthenticatedExecutor, Clock, SystemClock};
 use f365_driver::Driver;
-use f365_ipc::{ConversationDto, MessageDto, RoundDto, Shell};
+use f365_ipc::{ConversationDto, DerivativeDto, MessageDto, RoundDto, Shell};
 use f365_storage::Store;
 use f365_ui::{channel, App, Inbound, PumpHandle, RealtimeLink};
 use serde::Serialize;
@@ -50,6 +50,16 @@ enum Request {
     },
     Capabilities {
         reply: Reply<Vec<String>>,
+    },
+    /// Derivados (traduções, resumos…) de uma mensagem, lidos do cache.
+    Derivatives {
+        message_id: String,
+        reply: Reply<Vec<DerivativeDto>>,
+    },
+    /// Aprova um derivado; devolve o texto exato aprovado.
+    ApproveDerivative {
+        derivative_id: i64,
+        reply: Reply<String>,
     },
     Refresh {
         reply: Reply<RoundDto>,
@@ -103,6 +113,8 @@ fn main() {
             messages,
             search,
             capabilities,
+            derivatives,
+            approve_derivative,
             refresh,
             send,
             load
@@ -191,6 +203,21 @@ async fn serve(core: &mut App, request: Request) {
         Request::Capabilities { reply } => {
             let _ = reply.send(Ok(core.capabilities()));
         }
+        Request::Derivatives { message_id, reply } => {
+            let _ = reply.send(
+                core.derivatives(&message_id)
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        Request::ApproveDerivative {
+            derivative_id,
+            reply,
+        } => {
+            let _ = reply.send(
+                core.approve_derivative(derivative_id)
+                    .map_err(|error| error.to_string()),
+            );
+        }
         Request::Refresh { reply } => {
             let _ = reply.send(
                 core.refresh_conversations()
@@ -236,6 +263,12 @@ async fn serve_failing(requests: &mut mpsc::Receiver<Request>, why: String) {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Capabilities { reply } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::Derivatives { reply, .. } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::ApproveDerivative { reply, .. } => {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Refresh { reply } => {
@@ -349,6 +382,27 @@ async fn search(
 #[tauri::command]
 async fn capabilities(core: tauri::State<'_, CoreHandle>) -> Result<Vec<String>, String> {
     core.ask(|reply| Request::Capabilities { reply }).await
+}
+
+#[tauri::command]
+async fn derivatives(
+    core: tauri::State<'_, CoreHandle>,
+    message_id: String,
+) -> Result<Vec<DerivativeDto>, String> {
+    core.ask(|reply| Request::Derivatives { message_id, reply })
+        .await
+}
+
+#[tauri::command]
+async fn approve_derivative(
+    core: tauri::State<'_, CoreHandle>,
+    derivative_id: i64,
+) -> Result<String, String> {
+    core.ask(|reply| Request::ApproveDerivative {
+        derivative_id,
+        reply,
+    })
+    .await
 }
 
 #[tauri::command]

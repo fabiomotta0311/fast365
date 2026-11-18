@@ -11,7 +11,7 @@
 //! CLI) e entrega os eventos por [`PumpHandle`]. Assim o runtime é testável sem provider nenhum.
 
 use f365_auth::Clock;
-use f365_ipc::{ConversationDto, IpcError, MessageDto, RoundDto, Shell};
+use f365_ipc::{ConversationDto, DerivativeDto, IpcError, MessageDto, RoundDto, Shell};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -129,6 +129,14 @@ impl App {
 
     pub fn capabilities(&self) -> Vec<String> {
         self.shell.capabilities()
+    }
+
+    pub fn derivatives(&self, message_id: &str) -> Result<Vec<DerivativeDto>, IpcError> {
+        self.shell.derivatives(message_id)
+    }
+
+    pub fn approve_derivative(&self, derivative_id: i64) -> Result<String, IpcError> {
+        self.shell.approve_derivative(derivative_id)
     }
 
     // ---- comandos ----

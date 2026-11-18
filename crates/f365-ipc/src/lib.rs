@@ -9,7 +9,7 @@
 
 use f365_auth::Clock;
 use f365_driver::{Driver, DriverError, Effect, Round};
-use f365_storage::{Conversation, Message, StorageError};
+use f365_storage::{Conversation, Derivative, Message, StorageError};
 use f365_sync::{ConversationId, Event};
 use serde::Serialize;
 use std::sync::Arc;
@@ -31,6 +31,8 @@ pub enum IpcError {
     EmptyQuery,
     #[error("conversa inválida")]
     BadConversation,
+    #[error("mensagem inválida")]
+    BadMessage,
 }
 
 /// Conversa como a UI desenha a lista (lida do cache, sem rede).
@@ -52,6 +54,42 @@ pub struct MessageDto {
     pub body: String,
     pub message_type: String,
     pub created_ms: i64,
+}
+
+/// Conteúdo derivado (tradução, resumo…) de uma ou mais mensagens. **Nunca** substitui o original:
+/// a UI mostra ao lado dele. `stale` = o original mudou depois que isto foi gerado; não é
+/// aprovável nem deve ser apresentado como a tradução atual.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DerivativeDto {
+    pub id: i64,
+    pub kind: String,
+    pub model: String,
+    pub lang: Option<String>,
+    pub body: String,
+    pub created_ms: i64,
+    pub approved_ms: Option<i64>,
+    pub stale: bool,
+    pub source_message_ids: Vec<String>,
+}
+
+impl From<Derivative> for DerivativeDto {
+    fn from(derivative: Derivative) -> Self {
+        Self {
+            id: derivative.id,
+            kind: derivative.kind,
+            model: derivative.model,
+            lang: derivative.lang,
+            body: derivative.body,
+            created_ms: derivative.created_ms,
+            approved_ms: derivative.approved_ms,
+            stale: derivative.stale,
+            source_message_ids: derivative
+                .sources
+                .into_iter()
+                .map(|source| source.message_id)
+                .collect(),
+        }
+    }
 }
 
 /// Efeito de uma rodada do motor, no dialeto da UI (tagged enum, fácil de consumir em TS).
@@ -257,6 +295,26 @@ impl Shell {
     /// Estado por capacidade (§2.5), para o rodapé de status.
     pub fn capabilities(&self) -> Vec<String> {
         self.driver.capabilities().summary()
+    }
+
+    /// Derivados (traduções, resumos…) que citam a mensagem, do mais novo ao mais antigo. Vem do
+    /// cache; o original continua na própria mensagem.
+    pub fn derivatives(&self, message_id: &str) -> Result<Vec<DerivativeDto>, IpcError> {
+        if message_id.trim().is_empty() {
+            return Err(IpcError::BadMessage);
+        }
+        Ok(self
+            .driver
+            .store()
+            .derivatives_for(message_id)?
+            .into_iter()
+            .map(DerivativeDto::from)
+            .collect())
+    }
+
+    /// Aprova **este** derivado e devolve o texto exato aprovado. Recusa o obsoleto.
+    pub fn approve_derivative(&self, derivative_id: i64) -> Result<String, IpcError> {
+        Ok(self.driver.approve_derivative(derivative_id)?)
     }
 
     // ---- comandos (mexem no motor) ----
@@ -514,5 +572,97 @@ mod tests {
             .effects
             .iter()
             .any(|effect| matches!(effect, EffectDto::Sent { .. })));
+    }
+
+    // ---- derivados ----
+
+    struct Translator;
+
+    #[async_trait::async_trait]
+    impl f365_driver::Middleware for Translator {
+        fn model(&self) -> &str {
+            "fake@1"
+        }
+
+        async fn post_receive(
+            &self,
+            incoming: &f365_driver::Incoming,
+        ) -> Result<Vec<f365_driver::Derived>, f365_driver::MiddlewareError> {
+            Ok(vec![f365_driver::Derived {
+                kind: "translation".into(),
+                lang: Some("en".into()),
+                body: format!("[en] {}", incoming.body),
+            }])
+        }
+    }
+
+    fn shell_with_translator(exec: Arc<FakeExec>) -> Shell {
+        let clock = ManualClock::default();
+        let store = Store::open_in_memory().expect("banco");
+        let driver =
+            Driver::new(exec, store, Arc::new(clock.clone())).with_middleware(Arc::new(Translator));
+        Shell::new(driver, Arc::new(clock))
+    }
+
+    #[tokio::test]
+    async fn derivatives_are_listed_next_to_the_untouched_original() {
+        let exec = FakeExec::replying(vec![ok(200, CHATS), ok(200, HISTORY)]);
+        let mut shell = shell_with_translator(exec);
+        seed(&mut shell).await;
+
+        let list = shell.derivatives("m1").expect("derivados");
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].body, "[en] primeira mensagem");
+        assert_eq!(list[0].kind, "translation");
+        assert_eq!(list[0].lang.as_deref(), Some("en"));
+        assert_eq!(list[0].source_message_ids, vec!["m1".to_string()]);
+        assert!(!list[0].stale && list[0].approved_ms.is_none());
+        let page = shell.messages("19:a@thread.v2", None, 10).expect("cache");
+        assert!(
+            page.iter().any(|m| m.body == "primeira mensagem"),
+            "o original segue intacto"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_returns_the_exact_text_and_marks_it() {
+        let exec = FakeExec::replying(vec![ok(200, CHATS), ok(200, HISTORY)]);
+        let mut shell = shell_with_translator(exec);
+        seed(&mut shell).await;
+        let id = shell.derivatives("m1").unwrap()[0].id;
+
+        assert_eq!(
+            shell.approve_derivative(id).expect("aprova"),
+            "[en] primeira mensagem"
+        );
+        assert!(shell.derivatives("m1").unwrap()[0].approved_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn edited_message_makes_the_derivative_stale_and_unapprovable() {
+        let edited = HISTORY.replace("primeira mensagem", "primeira editada");
+        let exec = FakeExec::replying(vec![ok(200, CHATS), ok(200, HISTORY), ok(200, &edited)]);
+        let mut shell = shell_with_translator(exec);
+        seed(&mut shell).await;
+        let old_id = shell.derivatives("m1").unwrap()[0].id;
+
+        shell.invalidated("19:a@thread.v2").await.expect("reedição");
+
+        let list = shell.derivatives("m1").unwrap();
+        assert_eq!(list.len(), 2, "o novo e o velho (histórico)");
+        assert!(!list[0].stale && list[0].body.contains("editada"));
+        assert!(list[1].stale);
+        assert!(
+            shell.approve_derivative(old_id).is_err(),
+            "obsoleto não aprova"
+        );
+    }
+
+    #[test]
+    fn derivative_commands_validate_their_input() {
+        let (_clock, shell) = shell(FakeExec::replying(vec![]));
+        assert!(matches!(shell.derivatives("  "), Err(IpcError::BadMessage)));
+        assert!(shell.approve_derivative(999).is_err());
     }
 }
