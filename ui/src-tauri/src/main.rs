@@ -16,7 +16,7 @@ use f365_auth::transport::RustTransport;
 use f365_auth::vault::Vault;
 use f365_auth::{AuthenticatedExecutor, Clock, SystemClock};
 use f365_driver::Driver;
-use f365_ipc::{ConversationDto, DerivativeDto, MessageDto, OlderDto, RoundDto, Shell};
+use f365_ipc::{ConversationDto, DerivativeDto, EventDto, MessageDto, OlderDto, RoundDto, Shell};
 use f365_storage::Store;
 use f365_ui::{channel, App, Inbound, PumpHandle, RealtimeLink};
 use serde::Serialize;
@@ -68,7 +68,20 @@ enum Request {
         reply: Reply<OlderDto>,
     },
     /// Meu nome de exibição (para alinhar as minhas mensagens).
-    Me { reply: Reply<Option<String>> },
+    Me {
+        reply: Reply<Option<String>>,
+    },
+    /// Agenda do cache na janela `[from_ms, to_ms)`.
+    Agenda {
+        from_ms: i64,
+        to_ms: i64,
+        reply: Reply<Vec<EventDto>>,
+    },
+    /// Link (https, validado) da reunião de um evento do cache.
+    JoinUrl {
+        event_id: String,
+        reply: Reply<String>,
+    },
     /// Derivados (traduções, resumos…) de uma mensagem, lidos do cache.
     Derivatives {
         message_id: String,
@@ -135,6 +148,8 @@ fn main() {
             set_draft,
             older,
             me,
+            agenda,
+            join_meeting,
             derivatives,
             approve_derivative,
             refresh,
@@ -229,7 +244,10 @@ async fn serve(core: &mut App, request: Request) {
             conversation_id,
             reply,
         } => {
-            let _ = reply.send(core.draft(&conversation_id).map_err(|error| error.to_string()));
+            let _ = reply.send(
+                core.draft(&conversation_id)
+                    .map_err(|error| error.to_string()),
+            );
         }
         Request::SetDraft {
             conversation_id,
@@ -253,6 +271,19 @@ async fn serve(core: &mut App, request: Request) {
         }
         Request::Me { reply } => {
             let _ = reply.send(Ok(core.me()));
+        }
+        Request::Agenda {
+            from_ms,
+            to_ms,
+            reply,
+        } => {
+            let _ = reply.send(
+                core.agenda(from_ms, to_ms)
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        Request::JoinUrl { event_id, reply } => {
+            let _ = reply.send(core.join_url(&event_id).map_err(|error| error.to_string()));
         }
         Request::Derivatives { message_id, reply } => {
             let _ = reply.send(
@@ -326,6 +357,12 @@ async fn serve_failing(requests: &mut mpsc::Receiver<Request>, why: String) {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Me { reply } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::Agenda { reply, .. } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::JoinUrl { reply, .. } => {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Derivatives { reply, .. } => {
@@ -409,7 +446,8 @@ async fn conversations(
     core: tauri::State<'_, CoreHandle>,
     limit: usize,
 ) -> Result<Vec<ConversationDto>, String> {
-    core.ask(|reply| Request::Conversations { limit, reply }).await
+    core.ask(|reply| Request::Conversations { limit, reply })
+        .await
 }
 
 #[tauri::command]
@@ -488,6 +526,46 @@ async fn older(
 #[tauri::command]
 async fn me(core: tauri::State<'_, CoreHandle>) -> Result<Option<String>, String> {
     core.ask(|reply| Request::Me { reply }).await
+}
+
+#[tauri::command]
+async fn agenda(
+    core: tauri::State<'_, CoreHandle>,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<EventDto>, String> {
+    core.ask(|reply| Request::Agenda {
+        from_ms,
+        to_ms,
+        reply,
+    })
+    .await
+}
+
+/// "Entrar": abre o link da reunião no navegador padrão. O destino vem **do cache, pelo id** —
+/// a UI nunca passa URL — e o link já chega validado (`https`). Sem WebRTC nativo.
+#[tauri::command]
+async fn join_meeting(core: tauri::State<'_, CoreHandle>, event_id: String) -> Result<(), String> {
+    let url = core
+        .ask(|reply| Request::JoinUrl { event_id, reply })
+        .await?;
+    open_in_default_browser(&url)
+}
+
+/// Sem passar por `cmd`/shell: o URL é um argumento, não texto interpretado (`&` num link não
+/// vira comando). No Windows o `explorer.exe` entrega o `https` ao navegador padrão.
+fn open_in_default_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("não consegui abrir o navegador: {error}"))
 }
 
 #[tauri::command]

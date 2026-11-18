@@ -98,3 +98,15 @@ export function describe(round: Round): string {
   }
   return parts.join(" · ");
 }
+
+/** Evento de agenda do cache. Não traz a URL da reunião: "Entrar" pede o link ao core pelo id. */
+export type CalEvent = {
+  id: string;
+  subject: string;
+  start_ms: number;
+  end_ms: number;
+  all_day: boolean;
+  location: string | null;
+  organizer: string | null;
+  has_join_link: boolean;
+};

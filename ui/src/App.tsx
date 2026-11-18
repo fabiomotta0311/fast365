@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Calendar } from "./components/Calendar";
 import { ChatList } from "./components/ChatList";
-import { Rail } from "./components/Rail";
+import { Rail, type Area } from "./components/Rail";
 import { Thread } from "./components/Thread";
 import { TitleBar } from "./components/TitleBar";
 import {
@@ -46,6 +47,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
+  const [area, setArea] = useState<Area>("chat");
   const [me, setMe] = useState<string | null>(null);
   const [status, setStatus] = useState("iniciando…");
   const [capabilities, setCapabilities] = useState<string[]>([]);
@@ -328,8 +330,11 @@ export default function App() {
   return (
     <div className="fx-app">
       <TitleBar query={query} onQuery={setQuery} theme={theme} onToggleTheme={toggleTheme} />
-      <Rail />
+      <Rail area={area} onArea={setArea} />
 
+      {area === "calendar" ? (
+        <Calendar onStatus={setStatus} />
+      ) : (
       <div className="fx-body-area">
         <ChatList
           conversations={conversations}
@@ -355,6 +360,7 @@ export default function App() {
           reachedStart={reachedStart}
         />
       </div>
+      )}
 
       <footer className="fx-status">
         <span>{status}</span>

@@ -11,7 +11,9 @@
 //! CLI) e entrega os eventos por [`PumpHandle`]. Assim o runtime é testável sem provider nenhum.
 
 use f365_auth::Clock;
-use f365_ipc::{ConversationDto, DerivativeDto, IpcError, MessageDto, OlderDto, RoundDto, Shell};
+use f365_ipc::{
+    ConversationDto, DerivativeDto, EventDto, IpcError, MessageDto, OlderDto, RoundDto, Shell,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -133,6 +135,14 @@ impl App {
 
     pub fn me(&self) -> Option<String> {
         self.shell.me()
+    }
+
+    pub fn agenda(&self, from_ms: i64, to_ms: i64) -> Result<Vec<EventDto>, IpcError> {
+        self.shell.agenda(from_ms, to_ms)
+    }
+
+    pub fn join_url(&self, event_id: &str) -> Result<String, IpcError> {
+        self.shell.join_url(event_id)
     }
 
     pub fn draft(&self, conversation_id: &str) -> Result<Option<String>, IpcError> {
