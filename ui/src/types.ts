@@ -70,6 +70,9 @@ export function describe(round: Round): string {
       case "sent":
         parts.push("enviado");
         break;
+      case "derived":
+        parts.push(`${effect.derivative_kind} gerado`);
+        break;
       case "uncertain":
         // Nunca dizer "enviado" quando o motor não provou entrega.
         parts.push("incerto — confira no Teams");

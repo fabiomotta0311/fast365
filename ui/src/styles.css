@@ -264,3 +264,79 @@ code {
   border-radius: 4px;
   padding: 0 0.25rem;
 }
+
+/* Derivados: sempre abaixo do original, visualmente subordinados a ele. */
+.derivatives {
+  display: grid;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--border);
+}
+
+.derivative {
+  display: grid;
+  gap: 0.1rem;
+}
+
+.derivative-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.derivative-body {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.derivative-body.struck {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.derivative-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.derivative .hint {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.derivative.stale summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
+.badge {
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.72rem;
+}
+
+.badge.warning {
+  border-color: #c9a227;
+  color: #8a6d00;
+}
+
+.badge.approved {
+  border-color: #2e8b57;
+  color: #1f6b41;
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge.warning {
+    color: #e6c34a;
+  }
+  .badge.approved {
+    color: #5fd08f;
+  }
+}
