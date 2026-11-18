@@ -1,0 +1,21 @@
+[package]
+name = "f365-ui"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Runtime do app de UI (Fase 3, #19): o processo que possui o core e entrega eventos para o
+# frontend. Sem toolkit aqui — o shell Tauri fica numa camada acima (workspace separado), porque
+# `tauri` puxa GTK/WebKit e derrubaria o job Linux headless do CI.
+[dependencies]
+async-trait.workspace = true
+f365-auth = { path = "../f365-auth" }
+f365-driver = { path = "../f365-driver" }
+f365-ipc = { path = "../f365-ipc" }
+f365-storage = { path = "../f365-storage" }
+f365-sync = { path = "../f365-sync" }
+f365-teams = { path = "../f365-teams" }
+thiserror.workspace = true
+tokio.workspace = true

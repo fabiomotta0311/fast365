@@ -72,34 +72,60 @@ fn parse(body: &[u8]) -> Result<(Vec<HistoryMessage>, Option<String>), TeamsErro
     Ok((out, link))
 }
 
-fn validate_cursor(cursor: &str, path: &str) -> Result<(), TeamsError> {
-    let bad = || TeamsError::Malformed("HISTORY-PAGE-001 cursor inválido ou cíclico (UNVERIFIED)");
+/// O que fazer com um cursor de continuação.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cursor {
+    /// Caminho/URL da mesma conversa: pode continuar paginando.
+    Usable,
+    /// Token opaco que não sabemos interpretar (o `syncState` do serviço costuma ser assim).
+    ///
+    /// Parar aqui é melhor que negar a página: o primeiro lote **é** o histórico recente, e quem
+    /// pediu `top` maior fica sabendo que recebeu menos.
+    Opaque,
+    /// Formato inseguro (controle, host trocado, caminho de outra conversa): recusar.
+    Unsafe,
+}
+
+fn cursor_verdict(cursor: &str, path: &str) -> Cursor {
     if cursor
         .chars()
         .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
         || cursor.contains('#')
     {
-        return Err(bad());
+        return Cursor::Unsafe;
     }
-    let raw_path = if cursor.starts_with('/') && !cursor.starts_with("//") {
+    // Protocolo-relativo (`//host/...`) nunca é continuação legítima.
+    if cursor.starts_with("//") {
+        return Cursor::Unsafe;
+    }
+    let raw_path = if cursor.starts_with('/') {
         cursor.split('?').next().unwrap_or("")
-    } else {
-        let u = url::Url::parse(cursor).map_err(|_| bad())?;
-        if u.scheme() != "https"
-            || !u.username().is_empty()
-            || u.password().is_some()
-            || u.fragment().is_some()
+    } else if cursor.contains("://") {
+        let Ok(url) = url::Url::parse(cursor) else {
+            return Cursor::Unsafe;
+        };
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
         {
-            return Err(bad());
+            return Cursor::Unsafe;
         }
-        let rest = cursor.split_once("://").ok_or_else(bad)?.1;
-        let slash = rest.find('/').ok_or_else(bad)?;
+        let Some(rest) = cursor.split_once("://").map(|(_, rest)| rest) else {
+            return Cursor::Unsafe;
+        };
+        let Some(slash) = rest.find('/') else {
+            return Cursor::Unsafe;
+        };
         rest[slash..].split('?').next().unwrap_or("")
+    } else {
+        // Nem caminho nem URL: é o token opaco do serviço, não um erro de segurança.
+        return Cursor::Opaque;
     };
     if raw_path != path {
-        return Err(bad());
+        return Cursor::Unsafe;
     }
-    Ok(())
+    Cursor::Usable
 }
 
 fn op(url: String) -> AuthOp {
@@ -187,20 +213,33 @@ impl TeamsClient {
                 });
             }
             let start = std::time::Instant::now();
+            let mut opaque = false;
             let parsed = (|| {
                 let (messages, link) = parse(&response.body)?;
-                if let Some(link) = &link {
-                    validate_cursor(link, &path)?;
-                    if seen.contains(link) {
-                        return Err(TeamsError::Malformed(
-                            "HISTORY-PAGE-001 cursor cíclico (UNVERIFIED)",
-                        ));
+                let mut usable = None;
+                if let Some(candidate) = link {
+                    match cursor_verdict(&candidate, &path) {
+                        Cursor::Usable => {
+                            if seen.contains(&candidate) {
+                                return Err(TeamsError::Malformed(
+                                    "HISTORY-PAGE-001 cursor cíclico (UNVERIFIED)",
+                                ));
+                            }
+                            usable = Some(candidate);
+                        }
+                        Cursor::Opaque => opaque = true,
+                        Cursor::Unsafe => {
+                            return Err(TeamsError::Malformed(
+                                "HISTORY-PAGE-001 cursor inseguro (UNVERIFIED)",
+                            ))
+                        }
                     }
                 }
-                Ok((messages, link))
+                Ok((messages, usable))
             })();
             if let Some(recorder) = &self.recorder {
-                recorder.response_protocol(true, parsed.is_ok(), start);
+                // Token opaco: HTTP ok, mas o protocolo não foi continuável — fica no bundle.
+                recorder.response_protocol(true, parsed.is_ok() && !opaque, start);
             }
             let (messages, link) = parsed?;
             out.extend(messages);
@@ -210,6 +249,7 @@ impl TeamsClient {
             }
             match link {
                 Some(link) => next = link,
+                // Sem continuação conhecida — fim da lista ou token opaco — devolve o que temos.
                 None => return Ok(out),
             }
         }
@@ -432,10 +472,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_state_rejects_unsafe_and_ambiguous_values_without_partial_results() {
+    async fn sync_state_separates_unsafe_from_opaque() {
+        let path = "/v1/users/ME/conversations/48:notes/messages";
+        // Inseguro: continua sendo erro, e o valor nunca aparece na mensagem de erro.
         for value in [
-            serde_json::json!("opaque-secret"),
-            serde_json::json!({"cursor": "secret"}),
             serde_json::json!("//evil.example/v1/users/ME/conversations/48:notes/messages"),
             serde_json::json!(
                 "https://user@evil.example/v1/users/ME/conversations/48:notes/messages"
@@ -447,21 +487,23 @@ mod tests {
             let body =
                 serde_json::json!({"messages": [{"id": "1"}], "_metadata": {"syncState": value}})
                     .to_string();
-            let (messages, link) = match parse(body.as_bytes()) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    assert!(!e.to_string().contains("secret"));
-                    continue;
-                }
-            };
-            assert_eq!(messages.len(), 1);
-            let error = validate_cursor(
-                link.as_deref().unwrap(),
-                "/v1/users/ME/conversations/48:notes/messages",
-            )
-            .unwrap_err();
-            assert!(!error.to_string().contains("secret"));
+            let (_, link) = parse(body.as_bytes()).expect("parse");
+            let candidate = link.expect("cursor");
+            assert!(
+                matches!(cursor_verdict(&candidate, path), Cursor::Unsafe),
+                "{candidate}"
+            );
+            assert!(!candidate.is_empty());
         }
+        // Opaco (token do serviço) e objeto inesperado: não são erro de segurança.
+        let (_, link) =
+            parse(br#"{"messages":[{"id":"1"}],"_metadata":{"syncState":"opaque-token"}}"#)
+                .expect("parse");
+        assert!(matches!(
+            cursor_verdict(link.as_deref().expect("cursor"), path),
+            Cursor::Opaque
+        ));
+        assert!(parse(br#"{"messages":[],"_metadata":{"syncState":{"cursor":"x"}}}"#).is_err());
     }
 
     #[tokio::test]
@@ -521,11 +563,24 @@ mod tests {
         );
     }
 
+    /// O serviço devolve `syncState` opaco (não é caminho nem URL). Antes isso era erro e **todo**
+    /// histórico falhava na conta real; agora a página é devolvida e a paginação para.
     #[tokio::test]
-    async fn sync_state_only_never_returns_partial_success() {
+    async fn opaque_sync_state_returns_the_first_page_instead_of_failing() {
         let exec = fake(&[r#"{"messages":[{"id":"1"}],"_metadata":{"syncState":"synthetic"}}"#]);
-        let result = TeamsClient::new(exec).history("48:notes", 2).await;
-        assert!(matches!(result, Err(TeamsError::Malformed(s)) if s.contains("HISTORY-PAGE-001")));
+        let result = TeamsClient::new(exec.clone())
+            .history("48:notes", 2)
+            .await
+            .expect("token opaco não pode negar o histórico");
+        assert_eq!(
+            result.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["1"]
+        );
+        assert_eq!(
+            exec.ops.lock().unwrap().len(),
+            1,
+            "não tenta seguir o token"
+        );
     }
 
     #[tokio::test]
@@ -590,14 +645,20 @@ mod tests {
         assert!(link.is_none());
         assert!(parse(br#"{"value":[]}"#).is_err());
         let p = "/v1/users/ME/conversations/48:notes/messages";
-        assert!(validate_cursor(&format!("{p}?x=1"), p).is_ok());
+        assert!(matches!(
+            cursor_verdict(&format!("{p}?x=1"), p),
+            Cursor::Usable
+        ));
         for s in [
             "//evil/x",
             "https://evil/v1/users/ME/conversations/other/messages",
             "/v1/users/ME/conversations/48:notes/../other/messages",
             "/v1/users/ME/conversations/48:notes/messages#x",
         ] {
-            assert!(validate_cursor(s, p).is_err());
+            assert!(matches!(cursor_verdict(s, p), Cursor::Unsafe), "{s}");
         }
+        // Token opaco do serviço: não é erro de segurança, é "parar aqui".
+        assert!(matches!(cursor_verdict("synthetic", p), Cursor::Opaque));
+        assert!(!format!("{:?}", cursor_verdict("synthetic", p)).contains("synthetic"));
     }
 }

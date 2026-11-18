@@ -1,0 +1,23 @@
+[package]
+name = "f365-desktop"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+
+# Workspace **próprio** de propósito: `tauri` puxa GTK/WebKit no Linux e derrubaria o job
+# "Linux headless" do CI, que builda só o workspace raiz. Este app é construído à parte.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+f365-auth = { path = "../../crates/f365-auth" }
+f365-driver = { path = "../../crates/f365-driver" }
+f365-ipc = { path = "../../crates/f365-ipc" }
+f365-storage = { path = "../../crates/f365-storage" }
+f365-ui = { path = "../../crates/f365-ui" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

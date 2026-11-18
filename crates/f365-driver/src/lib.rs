@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// Quantas transições o driver aceita executar num único `drive` (guarda contra laço infinito).
+/// Profundidade máxima de uma cadeia causal; operações independentes não consomem o orçamento umas das outras.
 const MAX_STEPS: usize = 64;
 
 /// Primeira renovação silenciosa: o access token dura ~1 h, então renovamos com folga.
@@ -36,6 +36,38 @@ const REFRESH_FIRST: Duration = Duration::from_secs(30 * 60);
 /// Backoff de renovação que falhou (dobra até o teto) — nunca fica martelando o login.
 const REFRESH_BACKOFF_MIN: Duration = Duration::from_secs(5);
 const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// Prefixo do título provisório de 1:1 (o provider usa `1:1 · <sufixo>` quando não há nome).
+const ONE_ON_ONE_TITLE_PREFIX: &str = "1:1 · ";
+
+/// Teto de conversas varridas ao completar títulos a partir do cache.
+const TITLE_REPAIR_LIMIT: usize = 500;
+
+/// Buscas de histórico por `refresh` para descobrir o nome de um 1:1 (uma por conversa pendente).
+const NAMES_FETCH_LIMIT: usize = 25;
+
+/// Piso de mensagens lidas ao descobrir o nome do outro lado.
+///
+/// Tem de acompanhar o `top` do driver: com janela menor que a da conversa aberta, um 1:1 em que as
+/// últimas N mensagens são todas minhas fica sem nome no `refresh` e só se resolve ao clicar.
+const NAMES_FETCH_TOP: usize = 20;
+
+/// O outro lado de um 1:1: o remetente mais frequente que **não** sou eu.
+///
+/// Empate resolvido pelo nome, para o resultado não depender da ordem da página.
+fn counterpart<'a>(senders: impl Iterator<Item = &'a str>, mine: &str) -> Option<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for sender in senders {
+        if sender == mine {
+            continue;
+        }
+        *counts.entry(sender).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(name, _)| name.to_string())
+}
 
 /// Falha de uma operação, já classificada para o motor e para o modelo de capacidade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +96,9 @@ impl OpFailure {
             TeamsError::Exec(ExecError::Transport(_) | ExecError::TimedOut(_)) => OpFailure::Lost,
             TeamsError::Exec(ExecError::NotPaired | ExecError::Auth(_)) => OpFailure::Auth,
             TeamsError::Exec(_) => OpFailure::Refused,
-            TeamsError::Http { status, .. } if *status >= 500 => OpFailure::Retryable,
+            TeamsError::Http { status, .. } if *status >= 500 || *status == 429 => {
+                OpFailure::Retryable
+            }
             TeamsError::Http { .. } => OpFailure::Refused,
             TeamsError::Realtime(_) => OpFailure::Retryable,
             TeamsError::Malformed(_) | TeamsError::InvalidInput(_) => OpFailure::Refused,
@@ -208,11 +242,16 @@ pub struct Driver {
     token_keeper: Option<Arc<dyn TokenKeeper>>,
     refresh_at: Option<Instant>,
     refresh_backoff: Duration,
+    /// Meu nome de exibição, inferido da listagem (`f365_teams::Listing`): é o que permite
+    /// descobrir a outra pessoa de um 1:1 cruzando com os remetentes do histórico.
+    my_display_name: Option<String>,
 }
 
 impl Driver {
     pub fn new(exec: Arc<dyn AuthenticatedExecutor>, store: Store, clock: Arc<dyn Clock>) -> Self {
         let now = clock.now();
+        // Nome aprendido numa execução anterior: sem isso o 1:1 volta a ficar sem nome.
+        let my_display_name = store.my_display_name().ok().flatten();
         Self {
             machine: SyncMachine::new(),
             store,
@@ -226,6 +265,7 @@ impl Driver {
             token_keeper: None,
             refresh_at: None,
             refresh_backoff: REFRESH_BACKOFF_MIN,
+            my_display_name,
             clock,
         }
     }
@@ -308,18 +348,39 @@ impl Driver {
     pub async fn refresh_conversations(&mut self) -> Result<Round, DriverError> {
         let now = self.clock.now();
         let mut round = Round::default();
-        match self.client.list_conversations(self.top).await {
-            Ok(list) => {
+        // `top` limita mensagens, não a lista retornada pelo provider (sem paginação aqui).
+        match self.client.list_conversations(usize::MAX).await {
+            Ok(listing) => {
                 let now_ms = self.now_ms();
-                for conversation in &list {
-                    self.store
-                        .upsert_conversation(&stored_conversation(conversation, now_ms))?;
+                if let Some(name) = listing.my_display_name.clone() {
+                    self.store.set_my_display_name(&name, now_ms)?;
+                    self.my_display_name = Some(name);
                 }
+                for conversation in &listing.conversations {
+                    let mut stored = stored_conversation(conversation, now_ms);
+                    // Não rebaixar: um nome aprendido do histórico sobrevive ao `Atualizar`.
+                    if stored.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+                        if let Ok(Some(existing)) = self.store.conversation(&stored.id) {
+                            if !existing.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+                                stored.title = existing.title;
+                            }
+                        }
+                    }
+                    self.store.upsert_conversation(&stored)?;
+                    self.machine
+                        .register_conversation(ConversationId(conversation.id.clone()));
+                }
+                // Completa o que o cache já permite saber, sem esperar alguém abrir a conversa.
+                self.repair_titles()?;
+                // Para os que ainda estão sem nome, busca o histórico agora: o `Atualizar` já
+                // devolve a lista com nome, não só na próxima vez.
+                let filled = self.fill_missing_names().await;
+                round.effects.extend(filled);
                 self.capabilities
                     .observe_ok(now, Capability::ListConversations);
                 round
                     .effects
-                    .push(Effect::ConversationsRefreshed(list.len()));
+                    .push(Effect::ConversationsRefreshed(listing.conversations.len()));
             }
             Err(error) => {
                 self.on_failure(now, Capability::ListConversations, &error);
@@ -334,17 +395,15 @@ impl Driver {
     /// Alimenta o motor e executa as decisões até estabilizar.
     pub async fn drive(&mut self, event: Event) -> Result<Round, DriverError> {
         let mut round = Round::default();
-        let mut queue = vec![event];
-        let mut steps = 0;
+        let mut queue = vec![(event, 0usize)];
         let uncertain_before: Vec<ClientMessageId> = self
             .uncertain_sends()
             .into_iter()
             .map(|(_, client_id)| client_id)
             .collect();
 
-        while let Some(event) = queue.pop() {
-            steps += 1;
-            if steps > MAX_STEPS {
+        while let Some((event, depth)) = queue.pop() {
+            if depth > MAX_STEPS {
                 return Err(DriverError::NotConverged);
             }
             let decisions = self.machine.handle(self.clock.now(), event);
@@ -368,12 +427,15 @@ impl Driver {
                         let (outcome, observed) = self.fetch(&conversation, &mut round).await?;
                         // A fila é LIFO: empilha a operação primeiro para as observações serem
                         // processadas antes — o fato observado vale mais que o resultado do request.
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                         for client_id in observed {
-                            queue.push(Event::MessageObserved {
-                                conversation: conversation.clone(),
-                                client_id,
-                            });
+                            queue.push((
+                                Event::MessageObserved {
+                                    conversation: conversation.clone(),
+                                    client_id,
+                                },
+                                depth + 1,
+                            ));
                         }
                     }
                     Decision::AttemptSend {
@@ -382,11 +444,11 @@ impl Driver {
                         client_id,
                     } => {
                         let outcome = self.send(&conversation, &client_id, &mut round).await;
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                     }
                     Decision::Reconnect { op } => {
                         let outcome = self.reconnect(&mut round).await;
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                     }
                 }
             }
@@ -436,6 +498,7 @@ impl Driver {
                     .collect();
                 // Atômico e idempotente: repetir uma busca interrompida não inventa mensagem.
                 self.store.upsert_messages(&batch)?;
+                self.refine_one_on_one_title(conversation, &batch, round);
                 self.capabilities.observe_ok(now, Capability::ReadHistory);
                 round.effects.push(Effect::Fetched {
                     conversation: conversation.clone(),
@@ -447,6 +510,120 @@ impl Driver {
                 self.on_failure(now, Capability::ReadHistory, &error);
                 Ok((OpFailure::classify(&error).outcome(), Vec::new()))
             }
+        }
+    }
+
+    /// Completa títulos provisórios de 1:1 usando **o que já está no cache**.
+    ///
+    /// Roda na carga (a casca chama antes do primeiro frame), depois de cada `refresh` e depois de
+    /// cada busca. Sem isso o nome só aparecia na conversa recém-aberta — e o `Atualizar` apagava o
+    /// que tinha sido aprendido.
+    pub fn repair_titles(&self) -> Result<usize, DriverError> {
+        let Some(mine) = self.store.my_display_name()? else {
+            return Ok(0);
+        };
+        let mut repaired = 0;
+        for mut conversation in self.store.list_conversations(TITLE_REPAIR_LIMIT)? {
+            if !conversation.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+                continue;
+            }
+            let senders = self.store.senders(&conversation.id)?;
+            let Some(name) = counterpart(senders.iter().map(|(sender, _)| sender.as_str()), &mine)
+            else {
+                continue;
+            };
+            conversation.title = name;
+            self.store.upsert_conversation(&conversation)?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    /// Busca o histórico dos 1:1 que **ainda** estão sem nome, para o `Atualizar` já trazer tudo.
+    ///
+    /// Limitado de propósito: é uma requisição por conversa pendente e a lista tende a ser curta.
+    /// Falha de uma conversa não derruba o refresh.
+    async fn fill_missing_names(&mut self) -> Vec<Effect> {
+        let Some(mine) = self.store.my_display_name().ok().flatten() else {
+            return Vec::new();
+        };
+        let Ok(conversations) = self.store.list_conversations(TITLE_REPAIR_LIMIT) else {
+            return Vec::new();
+        };
+        let pending: Vec<String> = conversations
+            .into_iter()
+            .filter(|conversation| conversation.title.starts_with(ONE_ON_ONE_TITLE_PREFIX))
+            .map(|conversation| conversation.id)
+            .take(NAMES_FETCH_LIMIT)
+            .collect();
+
+        let now = self.clock.now();
+        let mut effects = Vec::new();
+        // Mesma janela da conversa aberta (`top`): o resultado não pode depender de quem clicou
+        // primeiro. Se as últimas N mensagens forem todas minhas, o nome sai na próxima vez que a
+        // janela alcançar a outra pessoa.
+        let top = self.top.max(NAMES_FETCH_TOP);
+        for id in pending {
+            let Ok(messages) = self.client.history(&id, top).await else {
+                continue;
+            };
+            let Some(name) = counterpart(
+                messages
+                    .iter()
+                    .filter_map(|message| message.sender.as_deref()),
+                &mine,
+            ) else {
+                continue;
+            };
+            let Ok(Some(mut stored)) = self.store.conversation(&id) else {
+                continue;
+            };
+            stored.title = name;
+            if self.store.upsert_conversation(&stored).is_ok() {
+                effects.push(Effect::Persisted(ConversationId(id)));
+            }
+        }
+        if !effects.is_empty() {
+            self.capabilities.observe_ok(now, Capability::ReadHistory);
+        }
+        effects
+    }
+
+    /// Completa o título de um 1:1 sem nome usando o histórico.
+    ///
+    /// A listagem não traz o nome do outro lado (`members[]` só tem `mri`/`objectId`), mas revela
+    /// **quem sou eu** quando alguma conversa mostra a última mensagem minha. Cruzando isso com os
+    /// remetentes do histórico, o outro remetente é a outra pessoa — sem endpoint novo.
+    fn refine_one_on_one_title(
+        &self,
+        conversation: &ConversationId,
+        batch: &[StoredMessage],
+        round: &mut Round,
+    ) {
+        // O nome pode ter vindo da listagem nesta execução ou de uma execução anterior (cache).
+        let mine = match self.my_display_name.clone() {
+            Some(name) => name,
+            None => match self.store.my_display_name() {
+                Ok(Some(name)) => name,
+                _ => return,
+            },
+        };
+        let Ok(Some(mut stored)) = self.store.conversation(&conversation.0) else {
+            return;
+        };
+        // Só completa o que ficou no sufixo; título real não é sobrescrito.
+        if !stored.title.starts_with(ONE_ON_ONE_TITLE_PREFIX) {
+            return;
+        }
+        let Some(name) = counterpart(
+            batch.iter().filter_map(|message| message.sender.as_deref()),
+            &mine,
+        ) else {
+            return;
+        };
+        stored.title = name;
+        if self.store.upsert_conversation(&stored).is_ok() {
+            round.effects.push(Effect::Persisted(conversation.clone()));
         }
     }
 
@@ -480,9 +657,14 @@ impl Driver {
             }
             Err(error) => {
                 self.on_failure(now, Capability::Send, &error);
-                let failure = OpFailure::classify(&error);
-                // Resposta perdida: o motor vai reconciliar, não reenviar.
-                failure.outcome()
+                // HTTP throttling and server failures do not prove that a non-idempotent
+                // send was not accepted. Reconcile rather than replay the POST.
+                if matches!(&error, TeamsError::Http { status, .. } if *status == 429 || *status >= 500)
+                {
+                    Outcome::Lost
+                } else {
+                    OpFailure::classify(&error).outcome()
+                }
             }
         }
     }
@@ -725,6 +907,15 @@ mod tests {
                 .map(|op| op.request.method.clone())
                 .collect()
         }
+
+        fn urls(&self) -> Vec<String> {
+            self.ops
+                .lock()
+                .expect("ops")
+                .iter()
+                .map(|op| op.request.url.clone())
+                .collect()
+        }
     }
 
     #[async_trait::async_trait]
@@ -832,6 +1023,103 @@ mod tests {
 
     // ---- testes ----
 
+    #[tokio::test]
+    async fn throttled_send_never_reposts_without_evidence() {
+        let exec = FakeExec::replying(vec![
+            ok(429, "throttled"),
+            ok(429, "throttled"),
+            ok(429, "throttled"),
+        ]);
+        let (_clock, mut driver) = driver(exec.clone());
+        driver.send_message(&conv(), "hello").await.unwrap();
+        assert_eq!(exec.methods().iter().filter(|m| *m == "POST").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn socket_loss_wakes_reconnect_without_blocking_send() {
+        let exec = FakeExec::replying(vec![ok(201, "{}")]);
+        let (clock, mut driver) = driver(exec.clone());
+        let realtime = Arc::new(FakeRealtime {
+            result: Err("offline".into()),
+            calls: Mutex::new(0),
+        });
+        driver.realtime = realtime.clone();
+        let round = driver.drive(Event::RealtimeLost).await.unwrap();
+        assert!(round.wake_at.is_some());
+        let sent = driver.send_message(&conv(), "hello").await.unwrap();
+        assert!(sent
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendAttempted { .. })));
+        clock.advance(Duration::from_secs(2));
+        driver.drive(Event::WakeUp).await.unwrap();
+        assert_eq!(*realtime.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_limit_does_not_truncate_conversations() {
+        let exec = FakeExec::replying(vec![ok(
+            200,
+            r#"{"chats":[{"id":"chat-a"},{"id":"chat-b"}]}"#,
+        )]);
+        let (_, driver) = driver(exec);
+        let mut driver = driver.with_top(1);
+        let round = driver.refresh_conversations().await.unwrap();
+        assert!(round.effects.contains(&Effect::ConversationsRefreshed(2)));
+    }
+
+    #[tokio::test]
+    async fn replay_of_more_than_64_conversations_converges() {
+        let exec = FakeExec::replying((0..70).map(|_| ok(200, r#"{"messages":[]}"#)).collect());
+        let (_, mut driver) = driver(exec.clone());
+        driver.realtime = Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        });
+        for i in 0..70 {
+            driver
+                .machine
+                .register_conversation(ConversationId(format!("chat-{i}")));
+        }
+        let round = driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("replay must converge");
+        assert_eq!(
+            round
+                .effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Fetched { .. }))
+                .count(),
+            70
+        );
+        assert_eq!(exec.calls(), 70);
+    }
+
+    #[tokio::test]
+    async fn throttled_history_is_retried_not_fresh() {
+        let exec = FakeExec::replying(vec![ok(429, "throttled"), ok(200, r#"{"messages":[]}"#)]);
+        let (clock, mut driver) = driver(exec.clone());
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .unwrap();
+        assert!(round.wake_at.is_some());
+        assert_eq!(
+            driver.machine().conversation_state(&conv()),
+            Some(&f365_sync::ConversationState::Dirty)
+        );
+        clock.advance(Duration::from_secs(5));
+        driver.drive(Event::WakeUp).await.unwrap();
+        assert_eq!(exec.calls(), 2);
+        assert_eq!(
+            driver.machine().conversation_state(&conv()),
+            Some(&f365_sync::ConversationState::Fresh)
+        );
+    }
+
     #[test]
     fn rfc3339_is_converted_to_epoch_millis() {
         assert_eq!(epoch_ms_from_rfc3339("1970-01-01T00:00:00.000Z"), Some(0));
@@ -853,6 +1141,91 @@ mod tests {
         );
         assert_eq!(epoch_ms_from_rfc3339("ontem"), None);
         assert_eq!(epoch_ms_from_rfc3339("2024-13-01T00:00:00Z"), None);
+    }
+
+    #[tokio::test]
+    async fn startup_conversations_are_known_without_fetching_history() {
+        let exec = FakeExec::replying(vec![ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#)]);
+        let (_clock, mut driver) = driver(exec.clone());
+        driver.refresh_conversations().await.expect("lista");
+        assert!(driver.machine().conversation_state(&conv()).is_some());
+        assert_eq!(exec.calls(), 1, "registrar não busca histórico");
+    }
+
+    #[tokio::test]
+    async fn duplicate_list_entries_do_not_reset_a_fresh_conversation() {
+        let exec = FakeExec::replying(vec![
+            ok(
+                200,
+                r#"{"chats":[{"id":"19:abc@thread.v2"},{"id":"19:abc@thread.v2"},{"id":""}]}"#,
+            ),
+            ok(200, r#"{"messages":[]}"#),
+            ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#),
+        ]);
+        let (_, driver) = driver(exec.clone());
+        let mut driver = driver.with_realtime(Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        }));
+        driver.refresh_conversations().await.unwrap();
+        assert!(driver
+            .machine()
+            .conversation_state(&ConversationId(String::new()))
+            .is_none());
+        driver.drive(Event::ConnectionRestored).await.unwrap();
+        assert!(matches!(
+            driver.machine().conversation_state(&conv()),
+            Some(f365_sync::ConversationState::Fresh)
+        ));
+        driver.refresh_conversations().await.unwrap();
+        assert!(matches!(
+            driver.machine().conversation_state(&conv()),
+            Some(f365_sync::ConversationState::Fresh)
+        ));
+        assert_eq!(exec.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn startup_then_reconnect_replays_gap_and_retries_rest() {
+        let exec = FakeExec::replying(vec![
+            ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#),
+            ok(200, r#"{"messages":[]}"#),
+            ok(503, ""),
+            ok(200, r#"{"messages":[{"id":"m1","content":"gap"}]}"#),
+        ]);
+        let (clock, driver) = driver(exec.clone());
+        let realtime = Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        });
+        let mut driver = driver.with_realtime(realtime);
+        driver.refresh_conversations().await.expect("lista");
+        driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("ready");
+        assert!(driver
+            .store()
+            .page_messages(&conv().0, None, 10)
+            .unwrap()
+            .is_empty());
+        driver.drive(Event::ConnectionLost).await.expect("queda");
+        let retry = driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("volta");
+        assert!(retry.wake_at.is_some());
+        assert!(driver
+            .store()
+            .page_messages(&conv().0, None, 10)
+            .unwrap()
+            .is_empty());
+        clock.advance(Duration::from_secs(60));
+        driver.drive(Event::WakeUp).await.expect("retry");
+        let messages = driver.store().page_messages(&conv().0, None, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "m1");
+        assert_eq!(exec.calls(), 4);
     }
 
     #[tokio::test]
@@ -1019,6 +1392,166 @@ mod tests {
             .expect("busca")
             .expect("mensagem no cache");
         assert_eq!(stored.id, "m1");
+    }
+
+    /// Aprender o nome não pode ser desfeito pelo `Atualizar` (que traz o título provisório).
+    #[tokio::test]
+    async fn refresh_does_not_downgrade_a_learned_name() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        const HISTORY: &str = r#"{"messages":[
+            {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
+        ]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, HISTORY), ok(200, LISTING)]);
+        let (_clock, mut driver) = driver(exec);
+
+        driver.refresh_conversations().await.expect("listagem");
+        assert_eq!(title(&driver), "Ana", "o refresh já traz o nome");
+
+        // `Atualizar` de novo: o provider volta a mandar `1:1 · …`.
+        driver.refresh_conversations().await.expect("listagem");
+        assert_eq!(
+            title(&driver),
+            "Ana",
+            "o nome aprendido sobrevive ao refresh"
+        );
+    }
+
+    /// Na carga, o nome sai do cache — sem abrir a conversa e sem rede.
+    #[tokio::test]
+    async fn repair_titles_completes_from_the_cache_alone() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        // O refresh não consegue o nome (histórico vazio); a busca depois traz as mensagens.
+        const EMPTY: &str = r#"{"messages":[]}"#;
+        const HISTORY: &str = r#"{"messages":[
+            {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
+        ]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, EMPTY), ok(200, HISTORY)]);
+        let (_clock, mut driver) = driver(exec);
+        driver.refresh_conversations().await.expect("listagem");
+        assert!(
+            title(&driver).starts_with("1:1 · "),
+            "sem histórico, sem nome"
+        );
+        driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+
+        // Simula o cache de uma sessão anterior, quando o título ainda era provisório.
+        let mut stale = driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache");
+        stale.title = "1:1 · abc123".into();
+        driver.store().upsert_conversation(&stale).expect("grava");
+
+        assert_eq!(driver.repair_titles().expect("repara"), 1);
+        assert_eq!(title(&driver), "Ana");
+    }
+
+    /// O `Atualizar` já traz o nome: busca o histórico dos 1:1 ainda sem nome, sem ninguém abrir.
+    #[tokio::test]
+    async fn refresh_fetches_history_of_an_unnamed_one_on_one() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        const HISTORY: &str = r#"{"messages":[
+            {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"}
+        ]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, HISTORY)]);
+        let (_clock, mut driver) = driver(exec);
+
+        driver.refresh_conversations().await.expect("refresh");
+
+        assert_eq!(
+            title(&driver),
+            "Ana",
+            "o Atualizar completa o nome sem abrir a conversa"
+        );
+    }
+
+    /// A busca de nome lê a **mesma** janela da conversa aberta (`top`).
+    ///
+    /// Com uma janela menor, um 1:1 cujas últimas mensagens são todas minhas ficaria sem nome no
+    /// `Atualizar` e só se resolveria ao clicar.
+    #[tokio::test]
+    async fn name_fetch_uses_the_same_window_as_the_open_chat() {
+        const LISTING: &str = r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+            "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#;
+        let exec = FakeExec::replying(vec![ok(200, LISTING), ok(200, r#"{"messages":[]}"#)]);
+        let clock = ManualClock::default();
+        let store = Store::open_in_memory().expect("banco em memória");
+        let mut driver = Driver::new(exec.clone(), store, Arc::new(clock)).with_top(50);
+
+        driver.refresh_conversations().await.expect("refresh");
+
+        let urls = exec.urls();
+        assert!(
+            urls.iter().any(|url| url.contains("pageSize=50")),
+            "esperava a busca de nome com pageSize=50, veio {urls:?}"
+        );
+    }
+
+    fn title(driver: &Driver) -> String {
+        driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache")
+            .title
+    }
+
+    /// 1:1 sem nome na listagem ganha o nome do outro lado depois de buscar o histórico.
+    #[tokio::test]
+    async fn one_on_one_title_is_completed_from_history() {
+        let exec = FakeExec::replying(vec![
+            ok(
+                200,
+                r#"{"chats":[{"id":"19:abc@thread.v2","title":null,"isOneOnOne":true,
+                    "isLastMessageFromMe":true,"lastMessage":{"imDisplayName":"Fabio Motta"}}]}"#,
+            ),
+            // O refresh não resolve (histórico vazio no primeiro momento).
+            ok(200, r#"{"messages":[]}"#),
+            ok(
+                200,
+                r#"{"messages":[
+                    {"id":"m1","content":"oi","composetime":"2024-01-01T00:00:00Z","imdisplayname":"Ana"},
+                    {"id":"m2","content":"oi de novo","composetime":"2024-01-01T00:00:01Z","imdisplayname":"Ana"},
+                    {"id":"m3","content":"meu","composetime":"2024-01-01T00:00:02Z","imdisplayname":"Fabio Motta"}
+                ]}"#,
+            ),
+        ]);
+        let (_clock, mut driver) = driver(exec);
+
+        driver.refresh_conversations().await.expect("listagem");
+        let before = driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache");
+        assert!(before.title.starts_with("1:1 · "), "{}", before.title);
+
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+
+        let after = driver
+            .store()
+            .conversation("19:abc@thread.v2")
+            .expect("busca")
+            .expect("no cache");
+        assert_eq!(after.title, "Ana", "o outro remetente é a outra pessoa");
+        assert!(round
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Persisted(_))));
     }
 
     #[tokio::test]

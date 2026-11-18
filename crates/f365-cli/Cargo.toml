@@ -18,6 +18,9 @@ webview = ["f365-auth/webview"]
 async-trait.workspace = true
 f365-auth  = { path = "../f365-auth" }
 f365-teams = { path = "../f365-teams" }
+f365-sync = { path = "../f365-sync" }
+f365-storage = { path = "../f365-storage" }
+f365-driver = { path = "../f365-driver" }
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
