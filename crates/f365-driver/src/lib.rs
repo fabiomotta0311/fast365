@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// Quantas transições o driver aceita executar num único `drive` (guarda contra laço infinito).
+/// Profundidade máxima de uma cadeia causal; operações independentes não consomem o orçamento umas das outras.
 const MAX_STEPS: usize = 64;
 
 /// Primeira renovação silenciosa: o access token dura ~1 h, então renovamos com folga.
@@ -96,7 +96,9 @@ impl OpFailure {
             TeamsError::Exec(ExecError::Transport(_) | ExecError::TimedOut(_)) => OpFailure::Lost,
             TeamsError::Exec(ExecError::NotPaired | ExecError::Auth(_)) => OpFailure::Auth,
             TeamsError::Exec(_) => OpFailure::Refused,
-            TeamsError::Http { status, .. } if *status >= 500 => OpFailure::Retryable,
+            TeamsError::Http { status, .. } if *status >= 500 || *status == 429 => {
+                OpFailure::Retryable
+            }
             TeamsError::Http { .. } => OpFailure::Refused,
             TeamsError::Realtime(_) => OpFailure::Retryable,
             TeamsError::Malformed(_) | TeamsError::InvalidInput(_) => OpFailure::Refused,
@@ -346,7 +348,8 @@ impl Driver {
     pub async fn refresh_conversations(&mut self) -> Result<Round, DriverError> {
         let now = self.clock.now();
         let mut round = Round::default();
-        match self.client.list_conversations(self.top).await {
+        // `top` limita mensagens, não a lista retornada pelo provider (sem paginação aqui).
+        match self.client.list_conversations(usize::MAX).await {
             Ok(listing) => {
                 let now_ms = self.now_ms();
                 if let Some(name) = listing.my_display_name.clone() {
@@ -364,6 +367,8 @@ impl Driver {
                         }
                     }
                     self.store.upsert_conversation(&stored)?;
+                    self.machine
+                        .register_conversation(ConversationId(conversation.id.clone()));
                 }
                 // Completa o que o cache já permite saber, sem esperar alguém abrir a conversa.
                 self.repair_titles()?;
@@ -390,17 +395,15 @@ impl Driver {
     /// Alimenta o motor e executa as decisões até estabilizar.
     pub async fn drive(&mut self, event: Event) -> Result<Round, DriverError> {
         let mut round = Round::default();
-        let mut queue = vec![event];
-        let mut steps = 0;
+        let mut queue = vec![(event, 0usize)];
         let uncertain_before: Vec<ClientMessageId> = self
             .uncertain_sends()
             .into_iter()
             .map(|(_, client_id)| client_id)
             .collect();
 
-        while let Some(event) = queue.pop() {
-            steps += 1;
-            if steps > MAX_STEPS {
+        while let Some((event, depth)) = queue.pop() {
+            if depth > MAX_STEPS {
                 return Err(DriverError::NotConverged);
             }
             let decisions = self.machine.handle(self.clock.now(), event);
@@ -424,12 +427,15 @@ impl Driver {
                         let (outcome, observed) = self.fetch(&conversation, &mut round).await?;
                         // A fila é LIFO: empilha a operação primeiro para as observações serem
                         // processadas antes — o fato observado vale mais que o resultado do request.
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                         for client_id in observed {
-                            queue.push(Event::MessageObserved {
-                                conversation: conversation.clone(),
-                                client_id,
-                            });
+                            queue.push((
+                                Event::MessageObserved {
+                                    conversation: conversation.clone(),
+                                    client_id,
+                                },
+                                depth + 1,
+                            ));
                         }
                     }
                     Decision::AttemptSend {
@@ -438,11 +444,11 @@ impl Driver {
                         client_id,
                     } => {
                         let outcome = self.send(&conversation, &client_id, &mut round).await;
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                     }
                     Decision::Reconnect { op } => {
                         let outcome = self.reconnect(&mut round).await;
-                        queue.push(Event::OperationFinished { op, outcome });
+                        queue.push((Event::OperationFinished { op, outcome }, depth + 1));
                     }
                 }
             }
@@ -651,9 +657,14 @@ impl Driver {
             }
             Err(error) => {
                 self.on_failure(now, Capability::Send, &error);
-                let failure = OpFailure::classify(&error);
-                // Resposta perdida: o motor vai reconciliar, não reenviar.
-                failure.outcome()
+                // HTTP throttling and server failures do not prove that a non-idempotent
+                // send was not accepted. Reconcile rather than replay the POST.
+                if matches!(&error, TeamsError::Http { status, .. } if *status == 429 || *status >= 500)
+                {
+                    Outcome::Lost
+                } else {
+                    OpFailure::classify(&error).outcome()
+                }
             }
         }
     }
@@ -1012,6 +1023,103 @@ mod tests {
 
     // ---- testes ----
 
+    #[tokio::test]
+    async fn throttled_send_never_reposts_without_evidence() {
+        let exec = FakeExec::replying(vec![
+            ok(429, "throttled"),
+            ok(429, "throttled"),
+            ok(429, "throttled"),
+        ]);
+        let (_clock, mut driver) = driver(exec.clone());
+        driver.send_message(&conv(), "hello").await.unwrap();
+        assert_eq!(exec.methods().iter().filter(|m| *m == "POST").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn socket_loss_wakes_reconnect_without_blocking_send() {
+        let exec = FakeExec::replying(vec![ok(201, "{}")]);
+        let (clock, mut driver) = driver(exec.clone());
+        let realtime = Arc::new(FakeRealtime {
+            result: Err("offline".into()),
+            calls: Mutex::new(0),
+        });
+        driver.realtime = realtime.clone();
+        let round = driver.drive(Event::RealtimeLost).await.unwrap();
+        assert!(round.wake_at.is_some());
+        let sent = driver.send_message(&conv(), "hello").await.unwrap();
+        assert!(sent
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendAttempted { .. })));
+        clock.advance(Duration::from_secs(2));
+        driver.drive(Event::WakeUp).await.unwrap();
+        assert_eq!(*realtime.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_limit_does_not_truncate_conversations() {
+        let exec = FakeExec::replying(vec![ok(
+            200,
+            r#"{"chats":[{"id":"chat-a"},{"id":"chat-b"}]}"#,
+        )]);
+        let (_, driver) = driver(exec);
+        let mut driver = driver.with_top(1);
+        let round = driver.refresh_conversations().await.unwrap();
+        assert!(round.effects.contains(&Effect::ConversationsRefreshed(2)));
+    }
+
+    #[tokio::test]
+    async fn replay_of_more_than_64_conversations_converges() {
+        let exec = FakeExec::replying((0..70).map(|_| ok(200, r#"{"messages":[]}"#)).collect());
+        let (_, mut driver) = driver(exec.clone());
+        driver.realtime = Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        });
+        for i in 0..70 {
+            driver
+                .machine
+                .register_conversation(ConversationId(format!("chat-{i}")));
+        }
+        let round = driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("replay must converge");
+        assert_eq!(
+            round
+                .effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Fetched { .. }))
+                .count(),
+            70
+        );
+        assert_eq!(exec.calls(), 70);
+    }
+
+    #[tokio::test]
+    async fn throttled_history_is_retried_not_fresh() {
+        let exec = FakeExec::replying(vec![ok(429, "throttled"), ok(200, r#"{"messages":[]}"#)]);
+        let (clock, mut driver) = driver(exec.clone());
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .unwrap();
+        assert!(round.wake_at.is_some());
+        assert_eq!(
+            driver.machine().conversation_state(&conv()),
+            Some(&f365_sync::ConversationState::Dirty)
+        );
+        clock.advance(Duration::from_secs(5));
+        driver.drive(Event::WakeUp).await.unwrap();
+        assert_eq!(exec.calls(), 2);
+        assert_eq!(
+            driver.machine().conversation_state(&conv()),
+            Some(&f365_sync::ConversationState::Fresh)
+        );
+    }
+
     #[test]
     fn rfc3339_is_converted_to_epoch_millis() {
         assert_eq!(epoch_ms_from_rfc3339("1970-01-01T00:00:00.000Z"), Some(0));
@@ -1033,6 +1141,91 @@ mod tests {
         );
         assert_eq!(epoch_ms_from_rfc3339("ontem"), None);
         assert_eq!(epoch_ms_from_rfc3339("2024-13-01T00:00:00Z"), None);
+    }
+
+    #[tokio::test]
+    async fn startup_conversations_are_known_without_fetching_history() {
+        let exec = FakeExec::replying(vec![ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#)]);
+        let (_clock, mut driver) = driver(exec.clone());
+        driver.refresh_conversations().await.expect("lista");
+        assert!(driver.machine().conversation_state(&conv()).is_some());
+        assert_eq!(exec.calls(), 1, "registrar não busca histórico");
+    }
+
+    #[tokio::test]
+    async fn duplicate_list_entries_do_not_reset_a_fresh_conversation() {
+        let exec = FakeExec::replying(vec![
+            ok(
+                200,
+                r#"{"chats":[{"id":"19:abc@thread.v2"},{"id":"19:abc@thread.v2"},{"id":""}]}"#,
+            ),
+            ok(200, r#"{"messages":[]}"#),
+            ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#),
+        ]);
+        let (_, driver) = driver(exec.clone());
+        let mut driver = driver.with_realtime(Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        }));
+        driver.refresh_conversations().await.unwrap();
+        assert!(driver
+            .machine()
+            .conversation_state(&ConversationId(String::new()))
+            .is_none());
+        driver.drive(Event::ConnectionRestored).await.unwrap();
+        assert!(matches!(
+            driver.machine().conversation_state(&conv()),
+            Some(f365_sync::ConversationState::Fresh)
+        ));
+        driver.refresh_conversations().await.unwrap();
+        assert!(matches!(
+            driver.machine().conversation_state(&conv()),
+            Some(f365_sync::ConversationState::Fresh)
+        ));
+        assert_eq!(exec.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn startup_then_reconnect_replays_gap_and_retries_rest() {
+        let exec = FakeExec::replying(vec![
+            ok(200, r#"{"chats":[{"id":"19:abc@thread.v2"}]}"#),
+            ok(200, r#"{"messages":[]}"#),
+            ok(503, ""),
+            ok(200, r#"{"messages":[{"id":"m1","content":"gap"}]}"#),
+        ]);
+        let (clock, driver) = driver(exec.clone());
+        let realtime = Arc::new(FakeRealtime {
+            result: Ok(()),
+            calls: Mutex::new(0),
+        });
+        let mut driver = driver.with_realtime(realtime);
+        driver.refresh_conversations().await.expect("lista");
+        driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("ready");
+        assert!(driver
+            .store()
+            .page_messages(&conv().0, None, 10)
+            .unwrap()
+            .is_empty());
+        driver.drive(Event::ConnectionLost).await.expect("queda");
+        let retry = driver
+            .drive(Event::ConnectionRestored)
+            .await
+            .expect("volta");
+        assert!(retry.wake_at.is_some());
+        assert!(driver
+            .store()
+            .page_messages(&conv().0, None, 10)
+            .unwrap()
+            .is_empty());
+        clock.advance(Duration::from_secs(60));
+        driver.drive(Event::WakeUp).await.expect("retry");
+        let messages = driver.store().page_messages(&conv().0, None, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "m1");
+        assert_eq!(exec.calls(), 4);
     }
 
     #[tokio::test]

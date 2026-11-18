@@ -9,6 +9,8 @@
 //!
 //! `f365 gate` roda os checkpoints mecanizáveis e grava o registro sanitizado da matriz (§2.4), para
 //! as duas rodadas do Go serem auditáveis (Issue #13).
+//!
+//! `f365 sync` é a composição da Fase 2: cache local + motor + tempo real num laço só (#16).
 
 mod chats_cmd;
 mod gate_cmd;
@@ -16,6 +18,7 @@ mod history_cmd;
 mod listen_cmd;
 mod send_cmd;
 mod session_cmd;
+mod sync_cmd;
 mod token_cmd;
 
 use clap::{Parser, Subcommand};
@@ -70,6 +73,20 @@ enum Command {
         /// Commit citado no relatório — `--commit $(git rev-parse --short HEAD)`.
         #[arg(long)]
         commit: Option<String>,
+    },
+    /// Mantém cache local + tempo real ativos, renovando a sessão em silêncio (Fase 2).
+    ///
+    /// Não abre WebView: quem roda é o dono. Ctrl+C encerra.
+    Sync {
+        /// Banco do cache (padrão: `%LOCALAPPDATA%\fast365\f365-cache.db`).
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
+        /// Quantas mensagens buscar por conversa.
+        #[arg(long, default_value_t = 30)]
+        top: usize,
+        /// Só atualiza o cache de conversas e sai.
+        #[arg(long)]
+        once: bool,
     },
     /// Conecta no Trouter (WS) e imprime eventos de novas mensagens.
     Listen {
@@ -131,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
                 // Saída não-zero deixa o runner (ou o CI futuro) reprovar a rodada sem parsear texto.
                 std::process::exit(1);
             }
+        }
+        Command::Sync { db, top, once } => {
+            sync_cmd::sync(sync_cmd::Options { db, top, once }).await?
         }
         Command::Listen {
             fetch,
