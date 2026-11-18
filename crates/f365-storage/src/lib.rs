@@ -91,6 +91,30 @@ impl Message {
     }
 }
 
+/// Fato citado por um derivado: a mensagem **e a revisão** que o derivado interpretou.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRef {
+    pub message_id: String,
+    pub message_revision: i64,
+}
+
+/// Conteúdo derivado (tradução, resumo, ata, ação proposta). Nunca substitui a mensagem original.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Derivative {
+    pub id: i64,
+    pub kind: String,
+    /// Modelo/versão que produziu o texto — permite trocar de modelo sem reescrever histórico.
+    pub model: String,
+    pub lang: Option<String>,
+    pub body: String,
+    pub created_ms: i64,
+    pub approved_ms: Option<i64>,
+    pub sources: Vec<SourceRef>,
+    /// `true` quando alguma fonte mudou de revisão ou foi apagada: não vale mais como tradução/ata
+    /// daquele texto e não pode ser aprovado nem enviado.
+    pub stale: bool,
+}
+
 /// Cache local. Um `Store` = uma conexão SQLite já migrada.
 pub struct Store {
     conn: Connection,
@@ -131,7 +155,12 @@ impl Store {
         if current >= schema::VERSION {
             return Ok(());
         }
-        self.conn.execute_batch(schema::DDL_V1)?;
+        if current < 1 {
+            self.conn.execute_batch(schema::DDL_V1)?;
+        }
+        if current < 2 {
+            self.conn.execute_batch(schema::DDL_V2)?;
+        }
         self.conn
             .pragma_update(None, "user_version", schema::VERSION)?;
         Ok(())
@@ -245,17 +274,33 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut written = 0;
         {
+            let mut previous = tx.prepare("SELECT body, revision FROM messages WHERE id = ?1")?;
+            let mut keep_revision = tx.prepare(
+                "INSERT OR IGNORE INTO message_revisions (message_id, revision, body)
+                 VALUES (?1, ?2, ?3)",
+            )?;
             let mut stmt = tx.prepare(
                 "INSERT INTO messages
                      (id, conversation_id, client_message_id, sender, body, message_type, created_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
+                     revision = CASE WHEN excluded.body <> messages.body
+                                     THEN messages.revision + 1 ELSE messages.revision END,
                      body = excluded.body,
                      message_type = excluded.message_type,
                      client_message_id = COALESCE(excluded.client_message_id, messages.client_message_id),
                      sender = COALESCE(excluded.sender, messages.sender)",
             )?;
             for message in messages {
+                // Corpo que muda = nova revisão do fato; a anterior fica guardada.
+                let existing: Option<(String, i64)> = previous
+                    .query_row(params![message.id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()?;
+                if let Some((old_body, old_revision)) = existing {
+                    if old_body != message.body {
+                        keep_revision.execute(params![message.id, old_revision, old_body])?;
+                    }
+                }
                 written += stmt.execute(params![
                     message.id,
                     message.conversation_id,
@@ -465,6 +510,180 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    // ---- fatos × interpretações (#22) ----
+
+    /// Revisão corrente do fato (1 = como chegou). `None` se a mensagem não existe.
+    pub fn message_revision(&self, message_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT revision FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Revisões **anteriores** do corpo (a corrente está em `messages`), da mais antiga à mais nova.
+    pub fn message_history(&self, message_id: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT revision, body FROM message_revisions WHERE message_id = ?1 ORDER BY revision",
+        )?;
+        let rows = stmt.query_map(params![message_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Grava um derivado novo, preso às revisões **atuais** das mensagens-fonte.
+    ///
+    /// Derivado é imutável: refazer a tradução/ata é gravar outro (o anterior fica de histórico).
+    /// Recusa fonte inexistente ou lista vazia — derivado sem fato não é rastreável.
+    pub fn add_derivative(
+        &mut self,
+        kind: &str,
+        model: &str,
+        lang: Option<&str>,
+        body: &str,
+        source_message_ids: &[&str],
+        now_ms: i64,
+    ) -> Result<i64> {
+        if kind.is_empty() || model.is_empty() {
+            return Err(StorageError::Invalid("derivado sem kind/modelo"));
+        }
+        if source_message_ids.is_empty() {
+            return Err(StorageError::Invalid("derivado sem mensagem-fonte"));
+        }
+        let tx = self.conn.transaction()?;
+        let mut sources = Vec::with_capacity(source_message_ids.len());
+        for message_id in source_message_ids {
+            let revision: Option<i64> = tx
+                .query_row(
+                    "SELECT revision FROM messages WHERE id = ?1",
+                    params![message_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let revision = revision.ok_or(StorageError::Invalid("mensagem-fonte inexistente"))?;
+            sources.push((*message_id, revision));
+        }
+        tx.execute(
+            "INSERT INTO derivatives (kind, model, lang, body, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kind, model, lang, body, now_ms],
+        )?;
+        let id = tx.last_insert_rowid();
+        for (message_id, revision) in sources {
+            tx.execute(
+                "INSERT OR REPLACE INTO derivative_sources
+                     (derivative_id, message_id, message_revision) VALUES (?1, ?2, ?3)",
+                params![id, message_id, revision],
+            )?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Derivados que citam a mensagem (do mais novo ao mais antigo), com a marca de obsolescência.
+    pub fn derivatives_for(&self, message_id: &str) -> Result<Vec<Derivative>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id FROM derivatives d
+               JOIN derivative_sources s ON s.derivative_id = d.id
+              WHERE s.message_id = ?1
+              ORDER BY d.id DESC",
+        )?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![message_id], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .filter_map(|id| self.derivative(id).transpose())
+            .collect()
+    }
+
+    /// Um derivado pelo id, com fontes e obsolescência calculadas agora.
+    pub fn derivative(&self, id: i64) -> Result<Option<Derivative>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT kind, model, lang, body, created_ms, approved_ms
+                   FROM derivatives WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((kind, model, lang, body, created_ms, approved_ms)) = row else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT s.message_id, s.message_revision, m.revision
+               FROM derivative_sources s LEFT JOIN messages m ON m.id = s.message_id
+              WHERE s.derivative_id = ?1 ORDER BY s.message_id",
+        )?;
+        let mut sources = Vec::new();
+        let mut stale = false;
+        let rows = stmt.query_map(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (message_id, message_revision, current) = row?;
+            stale |= current != Some(message_revision);
+            sources.push(SourceRef {
+                message_id,
+                message_revision,
+            });
+        }
+        Ok(Some(Derivative {
+            id,
+            kind,
+            model,
+            lang,
+            body,
+            created_ms,
+            approved_ms,
+            sources,
+            stale,
+        }))
+    }
+
+    /// O usuário aprova **este** texto. Devolve exatamente o que foi aprovado.
+    ///
+    /// Recusa derivado inexistente ou obsoleto (o fato mudou desde que foi gerado). Aprovar de novo
+    /// um já aprovado é idempotente e não muda o carimbo.
+    pub fn approve_derivative(&self, id: i64, now_ms: i64) -> Result<String> {
+        let derivative = self
+            .derivative(id)?
+            .ok_or(StorageError::Invalid("derivado inexistente"))?;
+        if derivative.stale {
+            return Err(StorageError::Invalid("derivado obsoleto: o original mudou"));
+        }
+        if derivative.approved_ms.is_none() {
+            self.conn.execute(
+                "UPDATE derivatives SET approved_ms = ?2 WHERE id = ?1",
+                params![id, now_ms],
+            )?;
+        }
+        Ok(derivative.body)
+    }
+
+    /// Texto que **pode** ser enviado: aprovado e ainda válido. Qualquer outra coisa é `None`.
+    pub fn approved_text(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .derivative(id)?
+            .filter(|d| d.approved_ms.is_some() && !d.stale)
+            .map(|d| d.body))
     }
 
     // ---- contas ----
@@ -794,5 +1013,198 @@ mod tests {
             .find_by_client_message_id("inexistente")
             .expect("busca")
             .is_none());
+    }
+
+    // ---- fatos × interpretações (#22) ----
+
+    fn with_message(body: &str) -> Store {
+        let mut store = store();
+        seed(&store, "19:a@thread.v2");
+        store
+            .upsert_messages(&[Message::text("19:a@thread.v2", "m1", body, 10)])
+            .expect("lote");
+        store
+    }
+
+    #[test]
+    fn edited_body_bumps_revision_and_keeps_the_previous_one() {
+        let mut store = with_message("versão 1");
+        assert_eq!(store.message_revision("m1").unwrap(), Some(1));
+
+        store
+            .upsert_messages(&[Message::text("19:a@thread.v2", "m1", "versão 2", 10)])
+            .expect("edição");
+        assert_eq!(store.message_revision("m1").unwrap(), Some(2));
+        assert_eq!(
+            store.message_history("m1").unwrap(),
+            vec![(1, "versão 1".to_string())]
+        );
+
+        // Reaplicar o mesmo corpo não cria revisão (idempotência da sincronização).
+        store
+            .upsert_messages(&[Message::text("19:a@thread.v2", "m1", "versão 2", 10)])
+            .expect("repetição");
+        assert_eq!(store.message_revision("m1").unwrap(), Some(2));
+        assert_eq!(store.message_history("m1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn derivative_is_traceable_and_never_touches_the_original() {
+        let mut store = with_message("bom dia");
+        let id = store
+            .add_derivative(
+                "translation",
+                "modelo-x@1",
+                Some("en"),
+                "good morning",
+                &["m1"],
+                50,
+            )
+            .expect("derivado");
+
+        let derivative = store.derivative(id).unwrap().expect("existe");
+        assert_eq!(derivative.body, "good morning");
+        assert_eq!(derivative.lang.as_deref(), Some("en"));
+        assert_eq!(derivative.model, "modelo-x@1");
+        assert_eq!(
+            derivative.sources,
+            vec![SourceRef {
+                message_id: "m1".into(),
+                message_revision: 1
+            }]
+        );
+        assert!(!derivative.stale);
+        assert_eq!(store.derivatives_for("m1").unwrap().len(), 1);
+
+        // O fato segue idêntico: a tradução não entrou em `messages` nem no FTS.
+        let page = store.page_messages("19:a@thread.v2", None, 10).unwrap();
+        assert_eq!(page[0].body, "bom dia");
+        assert!(store.search("morning", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_refuses_to_rewrite_a_derivative() {
+        let mut store = with_message("oi");
+        let id = store
+            .add_derivative("summary", "m@1", None, "resumo", &["m1"], 1)
+            .unwrap();
+        let error = store
+            .conn
+            .execute(
+                "UPDATE derivatives SET body = 'outro' WHERE id = ?1",
+                params![id],
+            )
+            .expect_err("imutável");
+        assert!(error.to_string().contains("imutável"));
+        assert_eq!(store.derivative(id).unwrap().unwrap().body, "resumo");
+    }
+
+    #[test]
+    fn editing_the_fact_makes_derivatives_stale_and_blocks_approval() {
+        let mut store = with_message("preço: 10");
+        let id = store
+            .add_derivative("translation", "m@1", Some("en"), "price: 10", &["m1"], 1)
+            .unwrap();
+
+        store
+            .upsert_messages(&[Message::text("19:a@thread.v2", "m1", "preço: 20", 10)])
+            .unwrap();
+        assert!(store.derivative(id).unwrap().unwrap().stale);
+        assert!(store.approve_derivative(id, 2).is_err());
+        assert_eq!(store.approved_text(id).unwrap(), None);
+
+        // Nova versão sobre a revisão corrente é aprovável; a antiga continua de histórico.
+        let fresh = store
+            .add_derivative("translation", "m@1", Some("en"), "price: 20", &["m1"], 3)
+            .unwrap();
+        assert_eq!(store.approve_derivative(fresh, 4).unwrap(), "price: 20");
+        assert_eq!(store.derivatives_for("m1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn approval_pins_the_exact_text_and_is_idempotent() {
+        let mut store = with_message("oi");
+        let id = store
+            .add_derivative("proposed_action", "m@1", None, "responder: ok", &["m1"], 1)
+            .unwrap();
+        assert_eq!(store.approved_text(id).unwrap(), None, "não aprovado ainda");
+
+        assert_eq!(store.approve_derivative(id, 5).unwrap(), "responder: ok");
+        assert_eq!(store.approve_derivative(id, 9).unwrap(), "responder: ok");
+        let derivative = store.derivative(id).unwrap().unwrap();
+        assert_eq!(derivative.approved_ms, Some(5), "carimbo não muda");
+        assert_eq!(
+            store.approved_text(id).unwrap().as_deref(),
+            Some("responder: ok")
+        );
+    }
+
+    #[test]
+    fn deleted_source_makes_the_derivative_stale_instead_of_losing_it() {
+        let mut store = with_message("ata base");
+        let id = store
+            .add_derivative("minutes", "m@1", None, "ata", &["m1"], 1)
+            .unwrap();
+        store.delete_conversation("19:a@thread.v2").unwrap();
+        let derivative = store.derivative(id).unwrap().expect("não some em silêncio");
+        assert!(derivative.stale);
+    }
+
+    #[test]
+    fn derivative_needs_an_existing_source() {
+        let mut store = with_message("oi");
+        assert!(store
+            .add_derivative("summary", "m@1", None, "x", &[], 1)
+            .is_err());
+        assert!(store
+            .add_derivative("summary", "m@1", None, "x", &["nao-existe"], 1)
+            .is_err());
+        assert!(store
+            .add_derivative("", "m@1", None, "x", &["m1"], 1)
+            .is_err());
+    }
+
+    #[test]
+    fn summary_can_cite_several_messages() {
+        let mut store = with_message("a");
+        store
+            .upsert_messages(&[Message::text("19:a@thread.v2", "m2", "b", 11)])
+            .unwrap();
+        let id = store
+            .add_derivative("summary", "m@1", None, "a+b", &["m1", "m2"], 1)
+            .unwrap();
+        assert_eq!(store.derivative(id).unwrap().unwrap().sources.len(), 2);
+        assert_eq!(store.derivatives_for("m2").unwrap().len(), 1);
+
+        store
+            .upsert_messages(&[Message::text("19:a@thread.v2", "m2", "b editado", 11)])
+            .unwrap();
+        assert!(
+            store.derivative(id).unwrap().unwrap().stale,
+            "qualquer fonte editada invalida"
+        );
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2_keeping_messages() {
+        let conn = Connection::open_in_memory().unwrap();
+        {
+            conn.execute_batch(schema::DDL_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, kind, updated_ms) VALUES ('c','t','chat',0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, body, message_type, created_ms)
+                 VALUES ('m','c','antiga','Text',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::init(conn).expect("migra");
+        assert_eq!(store.schema_version().unwrap(), schema::VERSION);
+        assert_eq!(store.message_revision("m").unwrap(), Some(1));
     }
 }

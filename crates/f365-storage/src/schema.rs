@@ -10,7 +10,7 @@
 //!   resposta se perdeu (`SEND-RECONCILE-001`) — a busca tem de ser barata, não um scan.
 
 /// Versão do esquema. Subir junto com um bloco novo em `Store::migrate`.
-pub const VERSION: i64 = 1;
+pub const VERSION: i64 = 2;
 
 /// DDL da versão 1. Idempotente (`IF NOT EXISTS`) para poder rodar em bancos já criados.
 pub const DDL_V1: &str = r#"
@@ -83,5 +83,58 @@ END;
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
     INSERT INTO messages_fts(rowid, body) VALUES (new.rowid, new.body);
+END;
+"#;
+
+/// DDL da versão 2 (#22): fatos × interpretações (`docs/ARQUITETURA.md` §6).
+///
+/// - **Fato:** `messages` guarda a revisão corrente; a anterior vai para `message_revisions` quando
+///   o corpo muda. O original nunca é perdido nem substituído por conteúdo derivado.
+/// - **Derivado:** `derivatives` é imutável (triggers) e referencia o fato por
+///   `derivative_sources(message_id, message_revision)`. Não há FK para `messages`: se a mensagem
+///   some ou muda, o derivado fica **obsoleto** em vez de ser apagado em silêncio.
+/// - Aprovar fixa o texto exato (`approved_ms` só sai de `NULL` uma vez).
+///
+/// Não é idempotente (`ALTER TABLE`): só roda quando `user_version < 2`.
+pub const DDL_V2: &str = r#"
+ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS message_revisions (
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    revision   INTEGER NOT NULL,
+    body       TEXT NOT NULL,
+    PRIMARY KEY (message_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS derivatives (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    lang        TEXT,
+    body        TEXT NOT NULL,
+    created_ms  INTEGER NOT NULL,
+    approved_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS derivative_sources (
+    derivative_id    INTEGER NOT NULL REFERENCES derivatives(id) ON DELETE CASCADE,
+    message_id       TEXT NOT NULL,
+    message_revision INTEGER NOT NULL,
+    PRIMARY KEY (derivative_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS derivative_sources_by_message
+    ON derivative_sources(message_id);
+
+CREATE TRIGGER IF NOT EXISTS derivatives_immutable
+BEFORE UPDATE OF kind, model, lang, body, created_ms ON derivatives
+BEGIN
+    SELECT RAISE(ABORT, 'derivado é imutável: grave uma nova versão');
+END;
+
+CREATE TRIGGER IF NOT EXISTS derivatives_approve_once
+BEFORE UPDATE OF approved_ms ON derivatives
+WHEN old.approved_ms IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'derivado já aprovado');
 END;
 "#;
