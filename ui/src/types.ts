@@ -4,6 +4,9 @@ export type Conversation = {
   title: string;
   kind: string;
   last_activity_ms: number | null;
+  /** Texto da última mensagem em cache (sem marcação), para a linha da lista. */
+  preview: string | null;
+  preview_sender: string | null;
 };
 
 export type Message = {

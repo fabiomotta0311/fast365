@@ -1,22 +1,47 @@
+/*
+  Fast365 — visual no estilo do Teams (Fluent). Medidas de referência: viewport 1440x900.
+  CSS próprio; nenhum asset, ícone ou texto copiado do cliente de referência.
+  Escuro é o padrão; `data-theme="light"` no <html> troca os tokens.
+*/
+
 :root {
-  color-scheme: light dark;
-  --bg: #f7f7f8;
-  --panel: #ffffff;
-  --text: #1d1d1f;
-  --muted: #6b6b70;
-  --border: #e2e2e6;
-  --accent: #5b5bd6;
+  --fx-app-bg: #0a0a0a;
+  --fx-pane: #292929;
+  --fx-hover: rgba(255, 255, 255, 0.06);
+  --fx-active: rgba(255, 255, 255, 0.1);
+  --fx-search-bg: rgba(31, 31, 31, 0.7);
+  --fx-stroke: #666666;
+  --fx-stroke-soft: #3d3d3d;
+  --fx-text: #ffffff;
+  --fx-text-2: #d6d6d6;
+  --fx-text-3: #adadad;
+  --fx-brand: #7f85f5;
+  --fx-bubble: #444791;
+  --fx-warn: #e6c34a;
+  --fx-ok: #5fd08f;
+  --fx-shadow: 0 0 2px rgba(0, 0, 0, 0.24), 0 2px 4px rgba(0, 0, 0, 0.28);
+  --fx-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple Color Emoji", "Segoe UI Emoji",
+    "Segoe UI Web", sans-serif;
+  color-scheme: dark;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #17171a;
-    --panel: #1f1f23;
-    --text: #f2f2f4;
-    --muted: #9a9aa2;
-    --border: #2e2e34;
-    --accent: #8b8bf0;
-  }
+[data-theme="light"] {
+  --fx-app-bg: #f5f5f5;
+  --fx-pane: #ffffff;
+  --fx-hover: rgba(0, 0, 0, 0.04);
+  --fx-active: rgba(0, 0, 0, 0.07);
+  --fx-search-bg: rgba(255, 255, 255, 0.7);
+  --fx-stroke: #d1d1d1;
+  --fx-stroke-soft: #e0e0e0;
+  --fx-text: #242424;
+  --fx-text-2: #424242;
+  --fx-text-3: #616161;
+  --fx-brand: #5b5fc7;
+  --fx-bubble: #e8ebfa;
+  --fx-warn: #8a6d00;
+  --fx-ok: #1f6b41;
+  --fx-shadow: 0 0 2px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.14);
+  color-scheme: light;
 }
 
 * {
@@ -31,247 +56,566 @@ body,
 }
 
 body {
-  background: var(--bg);
-  color: var(--text);
-  font: 14px/1.45 "Segoe UI", system-ui, sans-serif;
+  font-family: var(--fx-font);
+  font-size: 14px;
+  line-height: 20px;
+  color: var(--fx-text);
+  background: var(--fx-app-bg);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
 }
 
-.app {
+button {
+  font-family: inherit;
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--fx-brand);
+  outline-offset: 1px;
+}
+
+.fx-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ layout */
+
+.fx-app {
   display: grid;
-  /* `minmax(0, 1fr)`: item de grid tem `min-width: auto`, então um título longo (UPN sem espaço,
-     id de canal) esticaria a coluna e o body passaria a rolar na horizontal. */
-  grid-template-columns: 300px minmax(0, 1fr);
-  grid-template-rows: 1fr auto;
-  height: 100%;
+  grid-template-columns: 68px 1fr;
+  grid-template-rows: 48px 1fr 24px;
+  grid-template-areas:
+    "logo title"
+    "rail body"
+    "status status";
+  height: 100vh;
+}
+
+.fx-body-area {
+  grid-area: body;
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) 1fr;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ----------------------------------------------------------------- titlebar */
+
+.fx-titlebar {
+  display: contents;
+}
+
+.fx-titlebar__logo {
+  grid-area: logo;
+  display: grid;
+  place-items: center;
+  color: var(--fx-brand);
+}
+
+.fx-search {
+  grid-area: title;
+  justify-self: center;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: min(772px, calc(100% - 120px));
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--fx-stroke-soft);
+  border-radius: 8px;
+  background: var(--fx-search-bg);
+  color: var(--fx-text-2);
+}
+
+.fx-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--fx-text);
+  font: inherit;
+}
+
+.fx-search:focus-within {
+  border-color: var(--fx-stroke);
+}
+
+.fx-search input::placeholder {
+  color: var(--fx-text-2);
+}
+
+.fx-titlebar__end {
+  grid-area: title;
+  justify-self: end;
+  align-self: center;
+  padding-right: 12px;
+}
+
+.fx-iconbtn {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fx-text-2);
+  cursor: pointer;
+}
+
+.fx-iconbtn:hover {
+  background: var(--fx-hover);
+  color: var(--fx-text);
+}
+
+/* --------------------------------------------------------------------- rail */
+
+.fx-rail {
+  grid-area: rail;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.fx-rail__item {
+  display: grid;
+  place-items: center;
+  width: 68px;
+  height: 44px;
+  border: 0;
+  background: transparent;
+  color: var(--fx-text-2);
+  cursor: pointer;
+}
+
+.fx-rail__item:hover:not(:disabled) {
+  color: var(--fx-text);
+}
+
+.fx-rail__item--active {
+  color: var(--fx-brand);
+}
+
+.fx-rail__item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ---------------------------------------------------------------------- list */
+
+.fx-list {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding-bottom: 8px;
+}
+
+.fx-list__head {
+  display: flex;
+  align-items: center;
+  height: 61px;
+  flex: 0 0 auto;
+  padding: 8px 8px 8px 20px;
+}
+
+.fx-list__title {
+  margin: 0 auto 0 0;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 28px;
+}
+
+.fx-list__scroll {
+  flex: 1;
+  min-height: 0;
+  padding: 0 12px 8px 12px;
+}
+
+.fx-note {
+  margin: 8px;
+  color: var(--fx-text-3);
+  font-size: 13px;
+}
+
+.fx-row {
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  min-height: 52px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fx-row:hover {
+  background: var(--fx-hover);
+}
+
+.fx-row--active {
+  background: var(--fx-active);
+}
+
+.fx-row__main {
   min-width: 0;
   overflow: hidden;
 }
 
-.sidebar {
-  border-right: 1px solid var(--border);
-  background: var(--panel);
-  overflow-y: auto;
-  overflow-x: hidden;
-  min-width: 0;
-  padding: 0.75rem;
-}
-
-.sidebar header,
-.chat header {
+.fx-row__top {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-}
-
-h1 {
-  font-size: 1rem;
-  margin: 0;
-}
-
-h2 {
-  font-size: 1rem;
-  margin: 0;
-}
-
-.sidebar ul {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 0.25rem;
-}
-
-.conversation {
-  width: 100%;
+  align-items: baseline;
+  gap: 6px;
   min-width: 0;
-  text-align: left;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  color: inherit;
-  padding: 0.5rem;
-  cursor: pointer;
-  display: grid;
-  gap: 0.15rem;
 }
 
-/* Título de conversa é longo (UPN, canal): corta com reticências em vez de vazar. */
-.conversation .title {
-  display: block;
+.fx-row__name {
+  font-size: 14px;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.conversation:hover {
-  border-color: var(--border);
+.fx-row__time {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--fx-text-3);
+  white-space: nowrap;
 }
 
-.conversation.selected {
-  border-color: var(--accent);
-}
-
-.conversation .kind,
-.chat .kind {
-  color: var(--muted);
-  font-size: 0.75rem;
-}
-
-.chat {
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-  padding: 0.75rem 1rem;
-  min-height: 0;
+.fx-row__preview {
+  display: block;
   min-width: 0;
+  min-height: 18px;
+  font-size: 12px;
+  color: var(--fx-text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fx-row--active .fx-row__preview {
+  color: var(--fx-text-2);
+}
+
+.fx-avatar {
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  font-weight: 600;
+  flex: 0 0 auto;
+  user-select: none;
+}
+
+/* -------------------------------------------------------------------- thread */
+
+.fx-thread {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  margin: 0 8px 8px 0;
+  border-radius: 10px;
+  background: var(--fx-pane);
+  box-shadow: var(--fx-shadow);
   overflow: hidden;
 }
 
-.messages {
-  position: relative;
-  overflow-y: auto;
-  overflow-x: hidden;
-  min-height: 0;
-  min-width: 0;
-  padding-right: 0.25rem;
+.fx-thread__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 61px;
+  flex: 0 0 auto;
+  padding: 0 12px 0 20px;
+  border-bottom: 1px solid var(--fx-stroke-soft);
 }
 
-/* Virtualizado: cada linha é posicionada por `transform` pelo virtualizador. */
-.row {
+.fx-thread__name {
+  margin: 0;
+  min-width: 0;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 28px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fx-thread__scroll {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 8px 24px 4px;
+}
+
+.fx-empty {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  flex: 1 1 auto;
+  gap: 12px;
+  text-align: center;
+}
+
+.fx-empty__title {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.fx-empty__sub {
+  color: var(--fx-text-2);
+}
+
+/* Linha virtualizada: o virtualizador posiciona por transform e mede a altura real. */
+.fx-slot {
   position: absolute;
   top: 0;
   left: 0;
   width: 100%;
-  padding-bottom: 0.5rem;
 }
 
-.bubble {
+.fx-divider {
+  display: flex;
+  justify-content: center;
+  margin: 12px 0 8px;
+  font-size: 12px;
+  color: var(--fx-text-3);
+}
+
+.fx-msg {
   display: grid;
-  gap: 0.1rem;
-  padding: 0.45rem 0.65rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 10px;
+  padding: 4px 8px;
+  margin: 0 -8px;
+  border-radius: 4px;
 }
 
-.bubble .sender {
-  color: var(--muted);
-  font-size: 0.75rem;
+.fx-msg:hover {
+  background: var(--fx-hover);
 }
 
-.body {
-  word-break: break-word;
-  overflow-wrap: anywhere;
+.fx-msg--cont {
+  padding-top: 0;
 }
 
-.body p,
-.body ul,
-.body ol,
-.body blockquote,
-.body pre {
-  margin: 0 0 0.4rem;
+.fx-msg__gutter {
+  display: block;
+  width: 32px;
 }
 
-.body p:last-child,
-.body ul:last-child,
-.body ol:last-child {
-  margin-bottom: 0;
-}
-
-.body pre {
-  overflow-x: auto;
-  padding: 0.4rem;
-  background: var(--bg);
-  border-radius: 6px;
-}
-
-.body code {
-  font-family: Consolas, monospace;
-}
-
-.body blockquote {
-  border-left: 3px solid var(--border);
-  padding-left: 0.5rem;
-  color: var(--muted);
-}
-
-.composer {
-  display: flex;
-  gap: 0.5rem;
-  padding-top: 0.75rem;
-}
-
-.composer input {
-  flex: 1;
-  padding: 0.5rem 0.65rem;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: inherit;
-}
-
-button {
-  padding: 0.45rem 0.8rem;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: inherit;
-  cursor: pointer;
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-button:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-
-.status {
-  grid-column: 1 / -1;
-  display: flex;
-  gap: 1rem;
-  justify-content: space-between;
-  padding: 0.4rem 0.75rem;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 0.75rem;
+.fx-msg__col {
   min-width: 0;
 }
 
-/* O resumo de capacidades é longo: uma linha, cortando com reticências. */
-.status-line,
-.caps {
+.fx-msg__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.fx-msg__author {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.fx-msg__time,
+.fx-msg__meta {
+  font-size: 12px;
+  color: var(--fx-text-3);
+}
+
+.fx-body {
+  font-size: 14px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.fx-body p,
+.fx-body ul,
+.fx-body ol,
+.fx-body blockquote,
+.fx-body pre {
+  margin: 0 0 6px;
+}
+
+.fx-body p:last-child,
+.fx-body ul:last-child,
+.fx-body ol:last-child,
+.fx-body blockquote:last-child,
+.fx-body pre:last-child {
+  margin-bottom: 0;
+}
+
+.fx-body pre {
+  overflow-x: auto;
+  padding: 8px;
+  border-radius: 4px;
+  background: var(--fx-app-bg);
+}
+
+.fx-body code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.fx-body blockquote {
+  padding-left: 10px;
+  border-left: 3px solid var(--fx-stroke);
+  color: var(--fx-text-2);
+}
+
+.fx-body a {
+  color: var(--fx-brand);
+}
+
+/* Minhas mensagens: à direita, em bolha. */
+.fx-msg--mine {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: end;
+}
+
+.fx-msg--mine .fx-msg__col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  max-width: 70%;
+}
+
+.fx-msg--mine .fx-msg__bubble {
+  width: max-content;
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--fx-bubble);
+}
+
+.fx-msg--mine .fx-msg__meta {
+  margin-top: 2px;
+}
+
+/* ------------------------------------------------------------------ composer */
+
+.fx-composer {
+  flex: 0 0 auto;
+  width: 100%;
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 24px 8px;
+}
+
+.fx-composer__box {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 40px;
+  padding-right: 6px;
+  border: 1px solid var(--fx-stroke-soft);
+  border-radius: 6px;
+  background: var(--fx-pane);
+}
+
+.fx-composer__box:focus-within {
+  border-color: var(--fx-stroke);
+}
+
+.fx-composer__input {
+  flex: 1;
+  min-width: 0;
+  min-height: 38px;
+  max-height: 160px;
+  padding: 9px 12px;
+  border: 0;
+  outline: 0;
+  resize: none;
+  background: transparent;
+  color: var(--fx-text);
+  font: inherit;
+  line-height: 20px;
+}
+
+.fx-composer__input::placeholder {
+  color: var(--fx-text-3);
+}
+
+.fx-composer__send {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fx-brand);
+  cursor: pointer;
+}
+
+.fx-composer__send:hover:not(:disabled) {
+  background: var(--fx-hover);
+}
+
+.fx-composer__send:disabled {
+  color: var(--fx-text-3);
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* -------------------------------------------------------------------- status */
+
+.fx-status {
+  grid-area: status;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px;
+  font-size: 12px;
+  color: var(--fx-text-3);
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.caps {
-  text-align: right;
+.fx-status span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.empty {
-  color: var(--muted);
-  padding: 0.5rem 0;
+/* ----------------------------------------------------------------- scrollbar */
+
+.fx-scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--fx-stroke-soft) transparent;
 }
 
-code {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 0 0.25rem;
-}
+/* ------------------------------------------------------------------ derivados */
 
-/* Derivados: sempre abaixo do original, visualmente subordinados a ele. */
 .derivatives {
   display: grid;
   gap: 0.4rem;
   margin-top: 0.35rem;
   padding-top: 0.4rem;
-  border-top: 1px dashed var(--border);
+  border-top: 1px dashed var(--fx-stroke-soft);
 }
 
 .derivative {
@@ -280,8 +624,8 @@ code {
 }
 
 .derivative-label {
-  color: var(--muted);
-  font-size: 0.72rem;
+  color: var(--fx-text-3);
+  font-size: 12px;
 }
 
 .derivative-body {
@@ -291,7 +635,7 @@ code {
 }
 
 .derivative-body.struck {
-  color: var(--muted);
+  color: var(--fx-text-3);
   text-decoration: line-through;
 }
 
@@ -303,9 +647,24 @@ code {
   margin-top: 0.25rem;
 }
 
+.derivative-actions button,
+.derivatives button {
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--fx-stroke);
+  border-radius: 4px;
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.derivative-actions button:hover {
+  background: var(--fx-hover);
+}
+
 .derivative .hint {
-  color: var(--muted);
-  font-size: 0.72rem;
+  color: var(--fx-text-3);
+  font-size: 12px;
 }
 
 .derivative.stale summary {
@@ -316,27 +675,18 @@ code {
 }
 
 .badge {
-  padding: 0.05rem 0.45rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 0.72rem;
+  padding: 0 8px;
+  border: 1px solid var(--fx-stroke);
+  border-radius: 10000px;
+  font-size: 12px;
 }
 
 .badge.warning {
-  border-color: #c9a227;
-  color: #8a6d00;
+  border-color: var(--fx-warn);
+  color: var(--fx-warn);
 }
 
 .badge.approved {
-  border-color: #2e8b57;
-  color: #1f6b41;
-}
-
-@media (prefers-color-scheme: dark) {
-  .badge.warning {
-    color: #e6c34a;
-  }
-  .badge.approved {
-    color: #5fd08f;
-  }
+  border-color: var(--fx-ok);
+  color: var(--fx-ok);
 }
