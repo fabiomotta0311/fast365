@@ -5,7 +5,8 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import DOMPurify from "dompurify";
-import { describe, type Conversation, type Message, type Round } from "./types";
+import { Derivatives } from "./Derivatives";
+import { describe, type Conversation, type Derivative, type Message, type Round } from "./types";
 
 const LIST_LIMIT = 50;
 const PAGE_LIMIT = 100;
@@ -33,6 +34,8 @@ export default function App() {
   const [status, setStatus] = useState("iniciando…");
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [realtime, setRealtime] = useState<boolean | null>(null);
+  // Sobe quando o motor mexe em derivados: cada linha visível relê o seu do cache.
+  const [derivativesVersion, setDerivativesVersion] = useState(0);
 
   // Referência para os ouvintes de evento não capturarem estado velho.
   const selectedRef = useRef<Conversation | null>(null);
@@ -68,6 +71,9 @@ export default function App() {
       const text = describe(round);
       if (text) setStatus(text);
       if (round.capabilities.length > 0) setCapabilities(round.capabilities);
+      if (round.effects.some((effect) => effect.kind === "derived" || effect.kind === "fetched")) {
+        setDerivativesVersion((version) => version + 1);
+      }
 
       const current = selectedRef.current;
       const touched =
@@ -175,6 +181,22 @@ export default function App() {
     }
   }, [applyRound, draft, reloadMessages]);
 
+  /** Aprova o derivado e envia **exatamente** o texto aprovado (o que o backend devolveu). */
+  const approveAndSend = useCallback(
+    async (derivative: Derivative, conversationId: string) => {
+      try {
+        const text = await invoke<string>("approve_derivative", { derivativeId: derivative.id });
+        applyRound(await invoke<Round>("send", { conversationId, text }));
+        setDerivativesVersion((version) => version + 1);
+        const current = selectedRef.current;
+        if (current) await reloadMessages(current);
+      } catch (error) {
+        setStatus(String(error));
+      }
+    },
+    [applyRound, reloadMessages],
+  );
+
   // Cronológico (o cache devolve do mais novo para o mais antigo) e virtualizado.
   const chronological = useMemo(() => [...messages].reverse(), [messages]);
   const virtualizer = useVirtualizer({
@@ -238,11 +260,20 @@ export default function App() {
                     <div
                       key={message.id}
                       className="row"
+                      data-index={item.index}
+                      ref={virtualizer.measureElement}
                       style={{ transform: `translateY(${item.start}px)` }}
                     >
                       <div className="bubble">
                         <span className="sender">{message.sender ?? "?"}</span>
                         <MessageBody message={message} />
+                        <Derivatives
+                          message={message}
+                          version={derivativesVersion}
+                          onApprove={(derivative, conversationId) =>
+                            void approveAndSend(derivative, conversationId)
+                          }
+                        />
                       </div>
                     </div>
                   );
