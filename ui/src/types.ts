@@ -16,6 +16,20 @@ export type Message = {
   created_ms: number;
 };
 
+/** Tradução/resumo/ata de uma mensagem. Nunca substitui o original: aparece ao lado dele. */
+export type Derivative = {
+  id: number;
+  kind: string;
+  model: string;
+  lang: string | null;
+  body: string;
+  created_ms: number;
+  approved_ms: number | null;
+  /** O original mudou depois que isto foi gerado: não é a tradução atual nem pode ser aprovado. */
+  stale: boolean;
+  source_message_ids: string[];
+};
+
 export type Effect =
   | { kind: "conversations_refreshed"; count: number }
   | { kind: "fetched"; conversation: string; messages: number }

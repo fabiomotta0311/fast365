@@ -932,6 +932,12 @@ impl Driver {
         }
     }
 
+    /// O usuário aprova **este** derivado (§6: aprovar exatamente o texto que será enviado).
+    /// Devolve o texto aprovado; recusa derivado inexistente ou obsoleto.
+    pub fn approve_derivative(&self, id: i64) -> Result<String, DriverError> {
+        Ok(self.store.approve_derivative(id, self.now_ms())?)
+    }
+
     fn now_ms(&self) -> i64 {
         self.clock
             .utc_now()
