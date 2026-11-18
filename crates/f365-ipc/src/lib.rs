@@ -42,6 +42,10 @@ pub struct ConversationDto {
     pub title: String,
     pub kind: String,
     pub last_activity_ms: Option<i64>,
+    /// Texto da última mensagem em cache (sem marcação), para a linha da lista. `None` = vazio.
+    pub preview: Option<String>,
+    /// Quem mandou a última mensagem, quando o cache sabe.
+    pub preview_sender: Option<String>,
 }
 
 /// Mensagem como a UI desenha a bolha (texto puro; HTML só com sanitização na Fase 3).
@@ -213,8 +217,47 @@ impl From<Conversation> for ConversationDto {
             title: conversation.title,
             kind: conversation.kind,
             last_activity_ms: conversation.last_activity_ms,
+            preview: None,
+            preview_sender: None,
         }
     }
+}
+
+/// Máximo de caracteres da prévia na lista.
+const PREVIEW_CHARS: usize = 140;
+
+/// Texto puro para a prévia: remove marcação HTML, decodifica o básico, junta espaços e corta.
+/// A UI o exibe como texto (escapado), então isto é só legibilidade, não sanitização.
+fn preview_text(body: &str) -> Option<String> {
+    let mut plain = String::with_capacity(body.len());
+    let mut in_tag = false;
+    for ch in body.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                plain.push(' ');
+            }
+            _ if in_tag => {}
+            _ => plain.push(ch),
+        }
+    }
+    let plain = plain
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    let collapsed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= PREVIEW_CHARS {
+        return Some(collapsed);
+    }
+    let cut: String = collapsed.chars().take(PREVIEW_CHARS).collect();
+    Some(format!("{}…", cut.trim_end()))
 }
 
 impl From<Message> for MessageDto {
@@ -248,13 +291,25 @@ impl Shell {
     /// Lista de conversas já em cache. É o que a UI desenha no primeiro frame.
     pub fn conversations(&self, limit: usize) -> Result<Vec<ConversationDto>, IpcError> {
         let limit = checked_limit(limit)?;
-        Ok(self
-            .driver
-            .store()
+        let store = self.driver.store();
+        store
             .list_conversations(limit)?
             .into_iter()
-            .map(ConversationDto::from)
-            .collect())
+            .map(|conversation| {
+                let id = conversation.id.clone();
+                let mut dto = ConversationDto::from(conversation);
+                if let Some(last) = store.page_messages(&id, None, 1)?.into_iter().next() {
+                    dto.preview = preview_text(&last.body);
+                    dto.preview_sender = last.sender;
+                }
+                Ok(dto)
+            })
+            .collect()
+    }
+
+    /// Meu nome de exibição, aprendido da listagem. A UI usa para alinhar as minhas mensagens.
+    pub fn me(&self) -> Option<String> {
+        self.driver.store().my_display_name().ok().flatten()
     }
 
     /// Página de histórico (keyset: `before_ms` = a mensagem mais antiga já exibida).
@@ -664,5 +719,60 @@ mod tests {
         let (_clock, shell) = shell(FakeExec::replying(vec![]));
         assert!(matches!(shell.derivatives("  "), Err(IpcError::BadMessage)));
         assert!(shell.approve_derivative(999).is_err());
+    }
+
+    // ---- prévia e meu nome ----
+
+    #[test]
+    fn preview_strips_markup_collapses_space_and_truncates() {
+        assert_eq!(
+            preview_text("<p>Olá&nbsp;<b>mundo</b></p>\n<p>tudo   bem &amp; você?</p>").as_deref(),
+            Some("Olá mundo tudo bem & você?")
+        );
+        assert_eq!(preview_text("  <br/> "), None);
+        let long = "a".repeat(500);
+        let cut = preview_text(&long).expect("prévia");
+        assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
+        assert!(cut.ends_with('…'));
+        // Corte em fronteira de caractere, não de byte.
+        assert!(preview_text(&"ção ".repeat(100)).is_some());
+    }
+
+    #[tokio::test]
+    async fn conversation_list_carries_the_last_message_preview() {
+        let exec = FakeExec::replying(vec![ok(200, CHATS), ok(200, HISTORY)]);
+        let (_clock, mut shell) = shell(exec);
+        seed(&mut shell).await;
+
+        let list = shell.conversations(10).expect("lista");
+
+        assert_eq!(list[0].preview.as_deref(), Some("relatório trimestral"));
+    }
+
+    #[test]
+    fn conversation_without_messages_has_no_preview() {
+        let (_clock, shell) = shell(FakeExec::replying(vec![]));
+        shell
+            .driver
+            .store()
+            .upsert_conversation(&Conversation::new("19:vazia@thread.v2", "Vazia", "chat"))
+            .expect("conversa");
+
+        let list = shell.conversations(10).expect("lista");
+
+        assert_eq!(list[0].preview, None);
+        assert_eq!(list[0].preview_sender, None);
+    }
+
+    #[test]
+    fn me_comes_from_the_learned_display_name() {
+        let (_clock, shell) = shell(FakeExec::replying(vec![]));
+        assert_eq!(shell.me(), None);
+        shell
+            .driver
+            .store()
+            .set_my_display_name("Fabio Motta", 1)
+            .expect("nome");
+        assert_eq!(shell.me().as_deref(), Some("Fabio Motta"));
     }
 }

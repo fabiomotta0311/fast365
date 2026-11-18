@@ -131,6 +131,10 @@ impl App {
         self.shell.capabilities()
     }
 
+    pub fn me(&self) -> Option<String> {
+        self.shell.me()
+    }
+
     pub fn derivatives(&self, message_id: &str) -> Result<Vec<DerivativeDto>, IpcError> {
         self.shell.derivatives(message_id)
     }

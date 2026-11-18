@@ -51,6 +51,8 @@ enum Request {
     Capabilities {
         reply: Reply<Vec<String>>,
     },
+    /// Meu nome de exibição (para alinhar as minhas mensagens).
+    Me { reply: Reply<Option<String>> },
     /// Derivados (traduções, resumos…) de uma mensagem, lidos do cache.
     Derivatives {
         message_id: String,
@@ -113,6 +115,7 @@ fn main() {
             messages,
             search,
             capabilities,
+            me,
             derivatives,
             approve_derivative,
             refresh,
@@ -203,6 +206,9 @@ async fn serve(core: &mut App, request: Request) {
         Request::Capabilities { reply } => {
             let _ = reply.send(Ok(core.capabilities()));
         }
+        Request::Me { reply } => {
+            let _ = reply.send(Ok(core.me()));
+        }
         Request::Derivatives { message_id, reply } => {
             let _ = reply.send(
                 core.derivatives(&message_id)
@@ -263,6 +269,9 @@ async fn serve_failing(requests: &mut mpsc::Receiver<Request>, why: String) {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Capabilities { reply } => {
+                let _ = reply.send(Err(why.clone()));
+            }
+            Request::Me { reply } => {
                 let _ = reply.send(Err(why.clone()));
             }
             Request::Derivatives { reply, .. } => {
@@ -382,6 +391,11 @@ async fn search(
 #[tauri::command]
 async fn capabilities(core: tauri::State<'_, CoreHandle>) -> Result<Vec<String>, String> {
     core.ask(|reply| Request::Capabilities { reply }).await
+}
+
+#[tauri::command]
+async fn me(core: tauri::State<'_, CoreHandle>) -> Result<Option<String>, String> {
+    core.ask(|reply| Request::Me { reply }).await
 }
 
 #[tauri::command]
