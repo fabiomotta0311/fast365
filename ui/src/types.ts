@@ -25,6 +25,13 @@ export type Effect =
   | { kind: "sent"; client_id: string }
   | { kind: "uncertain"; client_id: string }
   | { kind: "reconnect_attempt" }
+  | {
+      kind: "derived";
+      message_id: string;
+      derivative_kind: string;
+      derivative_id: number;
+    }
+  | { kind: "middleware_failed"; message_id: string }
   | { kind: "token_refreshed" }
   | { kind: "token_refresh_failed"; retry_in_ms: number }
   | { kind: "session_expired" };
