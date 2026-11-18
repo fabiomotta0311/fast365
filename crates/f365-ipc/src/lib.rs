@@ -82,6 +82,16 @@ pub enum EffectDto {
         client_id: String,
     },
     ReconnectAttempt,
+    /// O middleware gravou um derivado (tradução, resumo…); o original não mudou.
+    Derived {
+        message_id: String,
+        derivative_kind: String,
+        derivative_id: i64,
+    },
+    /// O `post_receive` falhou nesta mensagem; o resto da busca seguiu.
+    MiddlewareFailed {
+        message_id: String,
+    },
     TokenRefreshed,
     TokenRefreshFailed {
         retry_in_ms: u64,
@@ -139,6 +149,16 @@ impl From<Effect> for EffectDto {
                 client_id: client_id.0,
             },
             Effect::ReconnectAttempt => EffectDto::ReconnectAttempt,
+            Effect::Derived {
+                message_id,
+                kind,
+                derivative_id,
+            } => EffectDto::Derived {
+                message_id,
+                derivative_kind: kind,
+                derivative_id,
+            },
+            Effect::MiddlewareFailed { message_id } => EffectDto::MiddlewareFailed { message_id },
             Effect::TokenRefreshed => EffectDto::TokenRefreshed,
             Effect::TokenRefreshFailed { retry_in } => EffectDto::TokenRefreshFailed {
                 retry_in_ms: retry_in.as_millis() as u64,

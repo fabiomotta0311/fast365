@@ -117,6 +117,10 @@ pub enum DriverError {
     NotConverged,
     #[error("nada a enviar: o texto está vazio")]
     EmptyText,
+    /// O middleware recusou o envio (ex.: tradução indisponível). Nada foi enviado nem registrado:
+    /// não se manda em silêncio o texto original quando o usuário pediu a versão transformada.
+    #[error("middleware pre_send: {0}")]
+    Middleware(String),
 }
 
 /// O que aconteceu de observável nesta rodada. A UI/IPC da Fase 3 consome isto.
@@ -150,6 +154,14 @@ pub enum Effect {
     ReconnectAttempt,
     /// Lista de conversas atualizada no cache.
     ConversationsRefreshed(usize),
+    /// O middleware gravou um derivado (tradução, resumo…) de uma mensagem. O original não mudou.
+    Derived {
+        message_id: String,
+        kind: String,
+        derivative_id: i64,
+    },
+    /// O `post_receive` falhou numa mensagem. É isolado: a busca e as demais mensagens seguem.
+    MiddlewareFailed { message_id: String },
     /// Token renovado em silêncio (sem WebView).
     TokenRefreshed,
     /// Renovação falhou de forma retentável; o driver reagendou.
@@ -225,6 +237,65 @@ impl Notifier for NoNotifier {
     fn published(&self, _conversation: &ConversationId) {}
 }
 
+/// Texto prestes a sair, entregue ao `pre_send`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outgoing {
+    pub conversation: ConversationId,
+    pub text: String,
+}
+
+/// Mensagem **já gravada** no cache, entregue ao `post_receive`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incoming {
+    pub conversation: ConversationId,
+    pub message_id: String,
+    pub sender: Option<String>,
+    pub body: String,
+    pub message_type: String,
+    /// Revisão do fato (1 = como chegou). O derivado fica preso a ela.
+    pub revision: i64,
+}
+
+/// Conteúdo derivado produzido pelo `post_receive`. Vira linha em `derivatives`
+/// (`docs/ARQUITETURA.md` §6): nunca substitui a mensagem original.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Derived {
+    /// `translation`, `summary`, `minutes`, `proposed_action`…
+    pub kind: String,
+    pub lang: Option<String>,
+    pub body: String,
+}
+
+/// Falha de um middleware. O texto **não** pode carregar conteúdo de mensagem (vai a log/UI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiddlewareError(pub String);
+
+/// Seam de middleware (§6): lógica própria no pipeline de mensagens, sem tocar no core.
+///
+/// - `pre_send` roda **uma vez**, em [`Driver::send_message`], antes de o envio existir. O texto
+///   devolvido é o que fica registrado e é o que reenvios/reconciliação usam — nunca é recalculado,
+///   então "o texto aprovado" e "o texto enviado" são o mesmo.
+/// - `post_receive` roda depois de a mensagem estar no cache e devolve **derivados**. Não existe
+///   caminho para trocar o corpo da mensagem: o fato é imutável por aqui (#22).
+///
+/// O que este seam **não** faz: escolher motor de tradução, chamar rede por conta própria no
+/// driver, nem impor timeout — quem implementa responde por latência (a busca espera o
+/// `post_receive`).
+#[async_trait::async_trait]
+pub trait Middleware: Send + Sync {
+    /// Identificador estável do modelo/versão (ex.: `deepl@2026-01`). Vai em `derivatives.model` e
+    /// é a chave para não reprocessar: mensagem que já tem derivado válido deste modelo é pulada.
+    fn model(&self) -> &str;
+
+    async fn pre_send(&self, outgoing: Outgoing) -> Result<Outgoing, MiddlewareError> {
+        Ok(outgoing)
+    }
+
+    async fn post_receive(&self, _incoming: &Incoming) -> Result<Vec<Derived>, MiddlewareError> {
+        Ok(Vec::new())
+    }
+}
+
 /// Costura motor ⇄ executor ⇄ cache.
 pub struct Driver {
     clock: Arc<dyn Clock>,
@@ -245,6 +316,7 @@ pub struct Driver {
     /// Meu nome de exibição, inferido da listagem (`f365_teams::Listing`): é o que permite
     /// descobrir a outra pessoa de um 1:1 cruzando com os remetentes do histórico.
     my_display_name: Option<String>,
+    middleware: Option<Arc<dyn Middleware>>,
 }
 
 impl Driver {
@@ -266,6 +338,7 @@ impl Driver {
             refresh_at: None,
             refresh_backoff: REFRESH_BACKOFF_MIN,
             my_display_name,
+            middleware: None,
             clock,
         }
     }
@@ -290,6 +363,12 @@ impl Driver {
 
     pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = notifier;
+        self
+    }
+
+    /// Liga o seam de middleware (`pre_send`/`post_receive`).
+    pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
+        self.middleware = Some(middleware);
         self
     }
 
@@ -320,9 +399,27 @@ impl Driver {
         if text.trim().is_empty() {
             return Err(DriverError::EmptyText);
         }
+        // O texto final é decidido **uma vez**, antes de existir envio: reenvio e reconciliação
+        // reusam `pending_text`, nunca chamam o middleware de novo.
+        let text = match self.middleware.clone() {
+            Some(middleware) => {
+                let outgoing = Outgoing {
+                    conversation: conversation.clone(),
+                    text: text.to_string(),
+                };
+                middleware
+                    .pre_send(outgoing)
+                    .await
+                    .map_err(|error| DriverError::Middleware(error.0))?
+                    .text
+            }
+            None => text.to_string(),
+        };
+        if text.trim().is_empty() {
+            return Err(DriverError::EmptyText);
+        }
         let client_id = ClientMessageId(f365_teams::new_client_message_id());
-        self.pending_text
-            .insert(client_id.clone(), text.to_string());
+        self.pending_text.insert(client_id.clone(), text);
         self.drive(Event::SendRequested {
             conversation: conversation.clone(),
             client_id,
@@ -498,6 +595,7 @@ impl Driver {
                     .collect();
                 // Atômico e idempotente: repetir uma busca interrompida não inventa mensagem.
                 self.store.upsert_messages(&batch)?;
+                self.run_post_receive(conversation, &batch, round).await;
                 self.refine_one_on_one_title(conversation, &batch, round);
                 self.capabilities.observe_ok(now, Capability::ReadHistory);
                 round.effects.push(Effect::Fetched {
@@ -509,6 +607,73 @@ impl Driver {
             Err(error) => {
                 self.on_failure(now, Capability::ReadHistory, &error);
                 Ok((OpFailure::classify(&error).outcome(), Vec::new()))
+            }
+        }
+    }
+
+    /// Roda o `post_receive` nas mensagens do lote que ainda não têm derivado **válido** deste
+    /// modelo. Falha é isolada por mensagem: vira [`Effect::MiddlewareFailed`], nunca derruba a
+    /// busca nem deixa de gravar as outras.
+    async fn run_post_receive(
+        &mut self,
+        conversation: &ConversationId,
+        batch: &[StoredMessage],
+        round: &mut Round,
+    ) {
+        let Some(middleware) = self.middleware.clone() else {
+            return;
+        };
+        let now_ms = self.now_ms();
+        for message in batch {
+            let Ok(Some(revision)) = self.store.message_revision(&message.id) else {
+                continue;
+            };
+            let already = self
+                .store
+                .derivatives_for(&message.id)
+                .map(|list| {
+                    list.iter()
+                        .any(|d| !d.stale && d.model == middleware.model())
+                })
+                .unwrap_or(false);
+            if already {
+                continue;
+            }
+            let incoming = Incoming {
+                conversation: conversation.clone(),
+                message_id: message.id.clone(),
+                sender: message.sender.clone(),
+                body: message.body.clone(),
+                message_type: message.message_type.clone(),
+                revision,
+            };
+            let derived = match middleware.post_receive(&incoming).await {
+                Ok(derived) => derived,
+                Err(_) => {
+                    round.effects.push(Effect::MiddlewareFailed {
+                        message_id: message.id.clone(),
+                    });
+                    continue;
+                }
+            };
+            for item in derived {
+                match self.store.add_derivative(
+                    &item.kind,
+                    middleware.model(),
+                    item.lang.as_deref(),
+                    &item.body,
+                    &[message.id.as_str()],
+                    now_ms,
+                ) {
+                    Ok(derivative_id) => round.effects.push(Effect::Derived {
+                        message_id: message.id.clone(),
+                        kind: item.kind,
+                        derivative_id,
+                    }),
+                    Err(_) => round.effects.push(Effect::MiddlewareFailed {
+                        message_id: message.id.clone(),
+                    }),
+                }
             }
         }
     }
@@ -1780,5 +1945,246 @@ mod tests {
         let round = driver.drive(Event::WakeUp).await.expect("acorda");
         assert!(round.effects.is_empty());
         assert_eq!(keeper.calls(), 1);
+    }
+
+    // ---- seam de middleware ----
+
+    struct FakeTranslator {
+        fail_send: bool,
+        fail_receive_on: Option<&'static str>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeTranslator {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                fail_send: false,
+                fail_receive_on: None,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn received(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Middleware for FakeTranslator {
+        fn model(&self) -> &str {
+            "fake@1"
+        }
+
+        async fn pre_send(&self, outgoing: Outgoing) -> Result<Outgoing, MiddlewareError> {
+            if self.fail_send {
+                return Err(MiddlewareError("tradutor indisponível".into()));
+            }
+            Ok(Outgoing {
+                text: format!("[en] {}", outgoing.text),
+                ..outgoing
+            })
+        }
+
+        async fn post_receive(&self, incoming: &Incoming) -> Result<Vec<Derived>, MiddlewareError> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(incoming.message_id.clone());
+            if self.fail_receive_on == Some(incoming.message_id.as_str()) {
+                return Err(MiddlewareError("falhou".into()));
+            }
+            Ok(vec![Derived {
+                kind: "translation".into(),
+                lang: Some("pt".into()),
+                body: format!("[pt] {}", incoming.body),
+            }])
+        }
+    }
+
+    const TWO_MESSAGES: &str = r#"{"messages":[
+        {"id":"m1","content":"hello","composetime":"2024-01-01T00:00:00Z"},
+        {"id":"m2","content":"world","composetime":"2024-01-01T00:00:05Z"}
+    ]}"#;
+
+    #[tokio::test]
+    async fn pre_send_text_is_what_goes_out_and_is_not_recomputed() {
+        let exec = FakeExec::replying(vec![ok(201, r#"{"OriginalArrivalTime":42}"#)]);
+        let (_clock, driver) = driver(exec.clone());
+        let mut driver = driver.with_middleware(FakeTranslator::new());
+
+        let round = driver.send_message(&conv(), "oi").await.expect("envia");
+
+        assert!(round
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Sent { .. })));
+        let body = exec.ops.lock().expect("ops")[0]
+            .request
+            .body
+            .clone()
+            .expect("corpo");
+        assert!(
+            String::from_utf8(body).unwrap().contains("[en] oi"),
+            "saiu o texto transformado"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_pre_send_sends_nothing_and_registers_nothing() {
+        let exec = FakeExec::replying(vec![]);
+        let (_clock, driver) = driver(exec.clone());
+        let middleware = Arc::new(FakeTranslator {
+            fail_send: true,
+            fail_receive_on: None,
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut driver = driver.with_middleware(middleware);
+
+        let error = driver
+            .send_message(&conv(), "oi")
+            .await
+            .expect_err("recusado");
+
+        assert!(matches!(error, DriverError::Middleware(_)));
+        assert_eq!(
+            exec.calls(),
+            0,
+            "nada saiu em silêncio com o texto original"
+        );
+        assert!(driver.uncertain_sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_receive_stores_derivatives_and_keeps_the_original() {
+        let exec = FakeExec::replying(vec![ok(200, TWO_MESSAGES)]);
+        let (_clock, driver) = driver(exec);
+        let mut driver = driver.with_middleware(FakeTranslator::new());
+
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+
+        let derived = round
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Derived { .. }))
+            .count();
+        assert_eq!(derived, 2);
+        let page = driver
+            .store()
+            .page_messages("19:abc@thread.v2", None, 10)
+            .expect("cache");
+        assert_eq!(
+            page[1].body, "hello",
+            "o fato não foi trocado pela tradução"
+        );
+        let derivatives = driver.store().derivatives_for("m1").expect("derivados");
+        assert_eq!(derivatives.len(), 1);
+        assert_eq!(derivatives[0].body, "[pt] hello");
+        assert_eq!(derivatives[0].model, "fake@1");
+        assert!(!derivatives[0].stale);
+    }
+
+    #[tokio::test]
+    async fn already_derived_messages_are_not_reprocessed() {
+        let exec = FakeExec::replying(vec![ok(200, TWO_MESSAGES), ok(200, TWO_MESSAGES)]);
+        let (_clock, driver) = driver(exec);
+        let middleware = FakeTranslator::new();
+        let mut driver = driver.with_middleware(middleware.clone());
+
+        for _ in 0..2 {
+            driver
+                .drive(Event::Invalidated {
+                    conversation: conv(),
+                })
+                .await
+                .expect("busca");
+        }
+
+        assert_eq!(
+            middleware.received().len(),
+            2,
+            "só a primeira busca traduziu"
+        );
+        assert_eq!(driver.store().derivatives_for("m1").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edited_message_is_derived_again_for_the_new_revision() {
+        let edited = TWO_MESSAGES.replace("hello", "hello there");
+        let exec = FakeExec::replying(vec![ok(200, TWO_MESSAGES), ok(200, &edited)]);
+        let (_clock, driver) = driver(exec);
+        let middleware = FakeTranslator::new();
+        let mut driver = driver.with_middleware(middleware.clone());
+
+        for _ in 0..2 {
+            driver
+                .drive(Event::Invalidated {
+                    conversation: conv(),
+                })
+                .await
+                .expect("busca");
+        }
+
+        let list = driver.store().derivatives_for("m1").unwrap();
+        assert_eq!(list.len(), 2, "o velho fica de histórico");
+        assert!(list[0].body.contains("hello there") && !list[0].stale);
+        assert!(list[1].stale, "o derivado da revisão antiga ficou obsoleto");
+        assert_eq!(
+            middleware.received(),
+            vec!["m1", "m2", "m1"],
+            "m2 não mudou e não foi reprocessada"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_receive_failure_is_isolated_to_that_message() {
+        let exec = FakeExec::replying(vec![ok(200, TWO_MESSAGES)]);
+        let (_clock, driver) = driver(exec);
+        let middleware = Arc::new(FakeTranslator {
+            fail_send: false,
+            fail_receive_on: Some("m1"),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut driver = driver.with_middleware(middleware);
+
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("a busca não falha por causa do middleware");
+
+        assert!(round.effects.contains(&Effect::MiddlewareFailed {
+            message_id: "m1".into()
+        }));
+        assert!(round.effects.contains(&Effect::Fetched {
+            conversation: conv(),
+            messages: 2
+        }));
+        assert!(driver.store().derivatives_for("m1").unwrap().is_empty());
+        assert_eq!(driver.store().derivatives_for("m2").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_middleware_nothing_changes() {
+        let exec = FakeExec::replying(vec![ok(200, TWO_MESSAGES)]);
+        let (_clock, mut driver) = driver(exec);
+
+        let round = driver
+            .drive(Event::Invalidated {
+                conversation: conv(),
+            })
+            .await
+            .expect("busca");
+
+        assert!(!round
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Derived { .. })));
+        assert!(driver.store().derivatives_for("m1").unwrap().is_empty());
     }
 }

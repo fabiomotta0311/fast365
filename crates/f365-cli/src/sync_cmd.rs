@@ -127,6 +127,8 @@ fn print_round(round: &Round, last_caps: &mut Vec<String>) {
                 println!("  INCERTO {client_id:?} — confira no Teams antes de reenviar")
             }
             Effect::ReconnectAttempt => println!("  reabrindo o tempo real"),
+            Effect::Derived { kind, .. } => println!("  derivado ({kind}) gravado"),
+            Effect::MiddlewareFailed { .. } => println!("  middleware falhou numa mensagem"),
             Effect::TokenRefreshed => println!("  token renovado em silêncio"),
             Effect::TokenRefreshFailed { retry_in } => {
                 println!(
