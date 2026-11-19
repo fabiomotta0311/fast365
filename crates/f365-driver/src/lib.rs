@@ -15,7 +15,8 @@
 
 use f365_auth::{AuthenticatedExecutor, Clock, ExecError};
 use f365_storage::{
-    Conversation as StoredConversation, Message as StoredMessage, StorageError, Store,
+    CalendarEvent, Conversation as StoredConversation, Message as StoredMessage, StorageError,
+    Store,
 };
 use f365_sync::capability::{Capabilities, Capability, DegradedReason, SessionGeneration};
 use f365_sync::{
@@ -408,6 +409,13 @@ impl Driver {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Grava eventos de calendário no cache (quem os traz é um provider de agenda, ainda por vir;
+    /// o carimbo de tempo vem do `Clock` injetado).
+    pub fn cache_events(&mut self, events: &[CalendarEvent]) -> Result<usize, DriverError> {
+        let now_ms = self.now_ms();
+        Ok(self.store.upsert_events(events, now_ms)?)
     }
 
     /// Envia texto: gera o `clientmessageid` **antes** e registra o texto (é a chave de

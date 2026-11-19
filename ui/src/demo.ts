@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { Conversation, Derivative, Message, Round } from "./types";
+import type { CalEvent, Conversation, Derivative, Message, Round } from "./types";
 
 /**
  * Modo demo: o frontend roda num navegador comum (`npm run dev` + `?demo`) com dados sintéticos,
@@ -69,6 +69,28 @@ const derivatives: Record<string, Derivative[]> = {
   m3: [],
 };
 
+/** Agenda sintética ancorada em "hoje" (semana corrente), com sobreposição, dia inteiro e sem link. */
+function at(dayOffset: number, hour: number, minutes = 0): number {
+  const d = new Date();
+  d.setDate(d.getDate() + dayOffset);
+  d.setHours(hour, minutes, 0, 0);
+  return d.getTime();
+}
+const ev = (id: string, subject: string, start: number, end: number, extra: Partial<CalEvent> = {}): CalEvent => ({
+  id, subject, start_ms: start, end_ms: end, all_day: false, location: null, organizer: null, has_join_link: false, ...extra,
+});
+const mon = -((new Date().getDay() + 6) % 7);
+const agenda: CalEvent[] = [
+  ev("e1", "Daily do time de produto", at(0, 9), at(0, 9, 30), { organizer: "Bruno Alves", has_join_link: true }),
+  ev("e2", "Revisão do relatório trimestral", at(0, 10), at(0, 11, 30), { organizer: "Ana Souza", location: "Sala 3", has_join_link: true }),
+  ev("e3", "1:1 com Camila", at(0, 10, 30), at(0, 11), { organizer: "Camila Rocha", has_join_link: true }),
+  ev("e4", "Almoço com o cliente Ábax", at(0, 12, 30), at(0, 14), { location: "Restaurante Central" }),
+  ev("e5", "Planejamento da sprint", at(1, 14), at(1, 15, 30), { organizer: "Bruno Alves", has_join_link: true }),
+  ev("e6", "Workshop de arquitetura", at(2, 9), at(2, 12), { organizer: "Fabio (demo)", has_join_link: true }),
+  ev("e7", "Retrospectiva", at(mon + 4, 16), at(mon + 4, 17), { has_join_link: true }),
+  ev("e8", "Feriado (demo)", at(mon + 2, 0), at(mon + 3, 0), { all_day: true }),
+];
+
 const round = (): Round => ({ effects: [], wake_in_ms: null, capabilities: ["Histórico: ok", "Envio: ok"] });
 
 export function startDemo(): void {
@@ -101,6 +123,17 @@ export function startDemo(): void {
           return round().capabilities;
         case "me":
           return ME;
+        case "agenda": {
+          const fromMs = Number(args.fromMs);
+          const toMs = Number(args.toMs);
+          return agenda.filter((e) => e.start_ms < toMs && e.end_ms > fromMs);
+        }
+        case "join_meeting": {
+          const found = agenda.find((e) => e.id === args.eventId);
+          if (!found?.has_join_link) throw "evento sem link de reunião";
+          console.info("[demo] abriria o navegador para o evento", found.id);
+          return null;
+        }
         case "derivatives":
           return derivatives[String(args.messageId)] ?? [];
         case "approve_derivative": {

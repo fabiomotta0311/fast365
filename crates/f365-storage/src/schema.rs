@@ -10,7 +10,7 @@
 //!   resposta se perdeu (`SEND-RECONCILE-001`) — a busca tem de ser barata, não um scan.
 
 /// Versão do esquema. Subir junto com um bloco novo em `Store::migrate`.
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 
 /// DDL da versão 1. Idempotente (`IF NOT EXISTS`) para poder rodar em bancos já criados.
 pub const DDL_V1: &str = r#"
@@ -137,4 +137,24 @@ WHEN old.approved_ms IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'derivado já aprovado');
 END;
+"#;
+
+/// DDL da versão 3 (#23, calendário): eventos como **fato** do cache, lidos sem rede.
+///
+/// Tempo em época Unix (ms, UTC); fuso e recorrência são problema de quem escreve (o provider
+/// expande as ocorrências), então a tela só consulta uma janela `[from, to)`. `join_url` fica no
+/// cache para a UI nunca receber URL de reunião de fora do banco (o clique passa pelo id).
+pub const DDL_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS calendar_events (
+    id         TEXT PRIMARY KEY,
+    subject    TEXT NOT NULL,
+    start_ms   INTEGER NOT NULL,
+    end_ms     INTEGER NOT NULL CHECK (end_ms >= start_ms),
+    all_day    INTEGER NOT NULL DEFAULT 0,
+    location   TEXT,
+    organizer  TEXT,
+    join_url   TEXT,
+    updated_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS calendar_events_by_start ON calendar_events(start_ms);
 "#;

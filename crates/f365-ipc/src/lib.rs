@@ -9,7 +9,7 @@
 
 use f365_auth::Clock;
 use f365_driver::{Driver, DriverError, Effect, Round};
-use f365_storage::{Conversation, Derivative, Message, StorageError};
+use f365_storage::{CalendarEvent, Conversation, Derivative, Message, StorageError};
 use f365_sync::{ConversationId, Event};
 use serde::Serialize;
 use std::sync::Arc;
@@ -33,7 +33,14 @@ pub enum IpcError {
     BadConversation,
     #[error("mensagem inválida")]
     BadMessage,
+    #[error("janela de agenda inválida")]
+    BadWindow,
+    #[error("evento sem link de reunião")]
+    NoJoinLink,
 }
+
+/// Maior janela de agenda aceita numa chamada (35 dias cobre a visão de mês com folga).
+pub const MAX_AGENDA_SPAN_MS: i64 = 35 * 86_400_000;
 
 /// Conversa como a UI desenha a lista (lida do cache, sem rede).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -94,6 +101,51 @@ impl From<Derivative> for DerivativeDto {
                 .collect(),
         }
     }
+}
+
+/// Evento de calendário como a UI o desenha. **Não leva a URL da reunião**: só `has_join_link`.
+/// O clique em "Entrar" pede o link pelo id (`Shell::join_url`), então a UI nunca decide o destino.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventDto {
+    pub id: String,
+    pub subject: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub all_day: bool,
+    pub location: Option<String>,
+    pub organizer: Option<String>,
+    pub has_join_link: bool,
+}
+
+impl From<CalendarEvent> for EventDto {
+    fn from(event: CalendarEvent) -> Self {
+        let has_join_link = event
+            .join_url
+            .as_deref()
+            .is_some_and(|url| safe_join_url(url).is_some());
+        Self {
+            id: event.id,
+            subject: event.subject,
+            start_ms: event.start_ms,
+            end_ms: event.end_ms,
+            all_day: event.all_day,
+            location: event.location,
+            organizer: event.organizer,
+            has_join_link,
+        }
+    }
+}
+
+/// Só `https://` sem espaço, aspas ou controle: o que vai para o navegador padrão. Qualquer outra
+/// coisa (`file:`, `javascript:`, `ms-teams:` arbitrário, texto com aspas) é descartada.
+fn safe_join_url(url: &str) -> Option<&str> {
+    let url = url.trim();
+    let rest = url.strip_prefix("https://")?;
+    let ok = !rest.is_empty()
+        && rest.chars().all(|c| {
+            !c.is_whitespace() && !c.is_control() && !matches!(c, '"' | '\'' | '<' | '>' | '`')
+        });
+    ok.then_some(url)
 }
 
 /// Resultado de "carregar mais histórico".
@@ -345,6 +397,30 @@ impl Shell {
             store.put_draft(conversation_id, text, now_ms)?;
         }
         Ok(())
+    }
+
+    /// Agenda do cache na janela `[from_ms, to_ms)` (época Unix, ms). Sem rede.
+    pub fn agenda(&self, from_ms: i64, to_ms: i64) -> Result<Vec<EventDto>, IpcError> {
+        if to_ms <= from_ms || to_ms - from_ms > MAX_AGENDA_SPAN_MS {
+            return Err(IpcError::BadWindow);
+        }
+        Ok(self
+            .driver
+            .store()
+            .events_between(from_ms, to_ms)?
+            .into_iter()
+            .map(EventDto::from)
+            .collect())
+    }
+
+    /// Link da reunião de um evento, validado (`https`). A UI abre no navegador padrão; este
+    /// crate não abre nada (sem WebRTC nativo, sem janela própria de chamada).
+    pub fn join_url(&self, event_id: &str) -> Result<String, IpcError> {
+        let event = self.driver.store().event(event_id)?;
+        event
+            .and_then(|event| event.join_url)
+            .and_then(|url| safe_join_url(&url).map(str::to_owned))
+            .ok_or(IpcError::NoJoinLink)
     }
 
     /// Meu nome de exibição, aprendido da listagem. A UI usa para alinhar as minhas mensagens.
@@ -909,5 +985,80 @@ mod tests {
         let older = shell.load_older("19:a@thread.v2").await.expect("rodada");
 
         assert!(!older.reached_start);
+    }
+
+    fn ev(id: &str, start: i64, end: i64, url: Option<&str>) -> CalendarEvent {
+        CalendarEvent {
+            id: id.into(),
+            subject: format!("reunião {id}"),
+            start_ms: start,
+            end_ms: end,
+            all_day: false,
+            location: None,
+            organizer: Some("Ana".into()),
+            join_url: url.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn agenda_never_exposes_the_url_and_flags_only_safe_links() {
+        let (_clock, mut shell) = shell(FakeExec::replying(vec![]));
+        shell
+            .driver
+            .cache_events(&[
+                ev(
+                    "ok",
+                    1_000,
+                    2_000,
+                    Some("https://teams.microsoft.com/l/meetup-join/abc"),
+                ),
+                ev("js", 1_100, 2_000, Some("javascript:alert(1)")),
+                ev("aspas", 1_200, 2_000, Some("https://x.test/a\"b")),
+                ev("sem", 1_300, 2_000, None),
+            ])
+            .unwrap();
+
+        let agenda = shell.agenda(0, 10_000).unwrap();
+        let flags: Vec<_> = agenda
+            .iter()
+            .map(|e| (e.id.as_str(), e.has_join_link))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("ok", true),
+                ("js", false),
+                ("aspas", false),
+                ("sem", false)
+            ]
+        );
+        let json = serde_json::to_string(&agenda).unwrap();
+        assert!(
+            !json.contains("https://"),
+            "a URL não cruza para a UI: {json}"
+        );
+
+        assert_eq!(
+            shell.join_url("ok").unwrap(),
+            "https://teams.microsoft.com/l/meetup-join/abc"
+        );
+        for id in ["js", "aspas", "sem", "inexistente"] {
+            assert!(
+                matches!(shell.join_url(id), Err(IpcError::NoJoinLink)),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn agenda_validates_the_window() {
+        let (_clock, shell) = shell(FakeExec::replying(vec![]));
+        assert!(matches!(shell.agenda(10, 10), Err(IpcError::BadWindow)));
+        assert!(matches!(shell.agenda(10, 5), Err(IpcError::BadWindow)));
+        assert!(matches!(
+            shell.agenda(0, MAX_AGENDA_SPAN_MS + 1),
+            Err(IpcError::BadWindow)
+        ));
+        assert!(shell.agenda(0, MAX_AGENDA_SPAN_MS).unwrap().is_empty());
     }
 }

@@ -115,9 +115,37 @@ pub struct Derivative {
     pub stale: bool,
 }
 
+/// Evento de calendário como o cache o guarda (já expandido pelo provider; sem recorrência).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarEvent {
+    pub id: String,
+    pub subject: String,
+    /// Início/fim em época Unix (ms, UTC). `end_ms >= start_ms`.
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub all_day: bool,
+    pub location: Option<String>,
+    pub organizer: Option<String>,
+    /// Link da reunião online. Abre no navegador padrão (sem WebRTC nativo).
+    pub join_url: Option<String>,
+}
+
 /// Cache local. Um `Store` = uma conexão SQLite já migrada.
 pub struct Store {
     conn: Connection,
+}
+
+fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
+    Ok(CalendarEvent {
+        id: row.get(0)?,
+        subject: row.get(1)?,
+        start_ms: row.get(2)?,
+        end_ms: row.get(3)?,
+        all_day: row.get(4)?,
+        location: row.get(5)?,
+        organizer: row.get(6)?,
+        join_url: row.get(7)?,
+    })
 }
 
 /// Escopo reservado em `sync_state` para o nome do próprio usuário.
@@ -161,9 +189,73 @@ impl Store {
         if current < 2 {
             self.conn.execute_batch(schema::DDL_V2)?;
         }
+        if current < 3 {
+            self.conn.execute_batch(schema::DDL_V3)?;
+        }
         self.conn
             .pragma_update(None, "user_version", schema::VERSION)?;
         Ok(())
+    }
+
+    /// Grava eventos (id novo insere, id existente atualiza). Fim antes do início é recusado.
+    pub fn upsert_events(&mut self, events: &[CalendarEvent], now_ms: i64) -> Result<usize> {
+        if events.iter().any(|event| event.end_ms < event.start_ms) {
+            return Err(StorageError::Invalid("evento termina antes de começar"));
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO calendar_events
+                    (id, subject, start_ms, end_ms, all_day, location, organizer, join_url, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    subject = excluded.subject, start_ms = excluded.start_ms,
+                    end_ms = excluded.end_ms, all_day = excluded.all_day,
+                    location = excluded.location, organizer = excluded.organizer,
+                    join_url = excluded.join_url, updated_ms = excluded.updated_ms",
+            )?;
+            for event in events {
+                stmt.execute(params![
+                    event.id,
+                    event.subject,
+                    event.start_ms,
+                    event.end_ms,
+                    event.all_day,
+                    event.location,
+                    event.organizer,
+                    event.join_url,
+                    now_ms
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(events.len())
+    }
+
+    /// Eventos que tocam a janela `[from_ms, to_ms)`, em ordem de início. Um evento que termina
+    /// exatamente em `from_ms` não entra; um de duração zero entra se começar dentro da janela.
+    pub fn events_between(&self, from_ms: i64, to_ms: i64) -> Result<Vec<CalendarEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject, start_ms, end_ms, all_day, location, organizer, join_url
+             FROM calendar_events
+             WHERE start_ms < ?2 AND (end_ms > ?1 OR (end_ms = start_ms AND start_ms >= ?1))
+             ORDER BY start_ms, end_ms, id",
+        )?;
+        let rows = stmt.query_map(params![from_ms, to_ms], event_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Um evento pelo id (a UI pede o link da reunião por aqui, nunca manda URL).
+    pub fn event(&self, id: &str) -> Result<Option<CalendarEvent>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, subject, start_ms, end_ms, all_day, location, organizer, join_url
+                 FROM calendar_events WHERE id = ?1",
+                params![id],
+                event_from_row,
+            )
+            .optional()?)
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -1206,5 +1298,63 @@ mod tests {
         let store = Store::init(conn).expect("migra");
         assert_eq!(store.schema_version().unwrap(), schema::VERSION);
         assert_eq!(store.message_revision("m").unwrap(), Some(1));
+    }
+
+    fn event(id: &str, start: i64, end: i64) -> CalendarEvent {
+        CalendarEvent {
+            id: id.into(),
+            subject: format!("evento {id}"),
+            start_ms: start,
+            end_ms: end,
+            all_day: false,
+            location: None,
+            organizer: None,
+            join_url: None,
+        }
+    }
+
+    #[test]
+    fn events_between_uses_a_half_open_window_ordered_by_start() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_events(
+                &[
+                    event("tarde", 300, 400),
+                    event("antes", 0, 100),
+                    event("cedo", 100, 200),
+                    event("pontual", 150, 150),
+                    event("depois", 500, 600),
+                    event("atravessa", 50, 250),
+                ],
+                1,
+            )
+            .unwrap();
+        let ids: Vec<_> = store
+            .events_between(100, 500)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["atravessa", "cedo", "pontual", "tarde"]);
+    }
+
+    #[test]
+    fn upsert_events_updates_by_id_and_rejects_inverted_ranges() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.upsert_events(&[event("a", 10, 20)], 1).unwrap();
+        let mut changed = event("a", 30, 40);
+        changed.join_url = Some("https://teams.example/join/1".into());
+        store.upsert_events(&[changed], 2).unwrap();
+        let got = store.event("a").unwrap().unwrap();
+        assert_eq!((got.start_ms, got.end_ms), (30, 40));
+        assert_eq!(
+            got.join_url.as_deref(),
+            Some("https://teams.example/join/1")
+        );
+        assert_eq!(store.events_between(0, 100).unwrap().len(), 1);
+
+        assert!(store.upsert_events(&[event("b", 9, 1)], 3).is_err());
+        assert!(store.event("b").unwrap().is_none());
+        assert!(store.event("nao-existe").unwrap().is_none());
     }
 }
